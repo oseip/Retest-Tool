@@ -13,33 +13,61 @@
       <div class="logo" style="margin-bottom:4px">⚡ NEMESIS</div>
       <h3>Welcome — let's set up your account</h3>
       <p class="modal-subtitle">
-        This runs once. Your Jira and jump-server credentials stay on this machine,
-        in your own config.yaml — nobody else sees them.
+        This runs once. Everything you enter is saved only to your own
+        config.yaml on this machine — nobody else sees it.
       </p>
 
-      <div id="setupCatalogError" class="report-error" style="display:none;margin-bottom:16px"></div>
-
       <form id="setupForm">
-        <div class="form-group">
-          <label>Jira Email</label>
-          <input type="email" id="jiraEmail" class="text-input" placeholder="you@your-org.com" required>
+        <div class="report-card" style="padding:16px;margin-bottom:18px">
+          <div class="report-card-header">Jira</div>
+          <div class="report-card-body" style="padding-top:14px;display:flex;flex-direction:column;gap:14px">
+            <div class="form-group" style="margin-bottom:0">
+              <label>Jira URL</label>
+              <input type="text" id="jiraUrl" class="text-input" placeholder="https://your-org.atlassian.net" required>
+            </div>
+            <div class="form-group" style="margin-bottom:0">
+              <label>Jira Email</label>
+              <input type="email" id="jiraEmail" class="text-input" placeholder="you@your-org.com" required>
+            </div>
+            <div class="form-group" style="margin-bottom:0">
+              <label>Jira API Token</label>
+              <input type="password" id="jiraToken" class="text-input" placeholder="Settings → Security → API tokens" required>
+            </div>
+            <div class="form-group" style="margin-bottom:0">
+              <label>Jira Project Key</label>
+              <input type="text" id="jiraProject" class="text-input" placeholder="PROJ" required>
+            </div>
+          </div>
         </div>
-        <div class="form-group">
-          <label>Jira API Token</label>
-          <input type="password" id="jiraToken" class="text-input" placeholder="Settings → Security → API tokens" required>
+
+        <div class="report-card" style="padding:16px;margin-bottom:18px">
+          <div class="report-card-header">Jump Server</div>
+          <div class="report-card-body" style="padding-top:14px;display:flex;flex-direction:column;gap:14px">
+            <div class="form-group" style="margin-bottom:0">
+              <label>Jump Server Host</label>
+              <input type="text" id="jumpHost" class="text-input" placeholder="jump.your-org.com" required>
+            </div>
+            <div class="form-group" style="margin-bottom:0">
+              <label>Jump Server Username</label>
+              <input type="text" id="jumpUser" class="text-input" required>
+            </div>
+            <div class="form-group" style="margin-bottom:0">
+              <label>Jump Server Password</label>
+              <input type="password" id="jumpPassword" class="text-input" required>
+            </div>
+          </div>
         </div>
-        <div class="form-group">
-          <label>Jump Server Username</label>
-          <input type="text" id="jumpUser" class="text-input" required>
-        </div>
-        <div class="form-group">
-          <label>Jump Server Password</label>
-          <input type="password" id="jumpPassword" class="text-input" required>
-        </div>
-        <div class="form-group">
-          <label>Your Opcos <span style="font-weight:400;color:var(--text-dim)">(select all that you work on)</span></label>
-          <div id="opcoList" class="opco-list">
-            <span style="color:var(--text-dim);font-size:12px">Loading…</span>
+
+        <div class="report-card" style="padding:16px;margin-bottom:18px">
+          <div class="report-card-header" style="display:flex;align-items:center;justify-content:space-between">
+            <span>Clients / Kali Boxes</span>
+            <button type="button" class="btn btn-sm btn-secondary" onclick="addSetupClientRow()">+ Add Client</button>
+          </div>
+          <div class="report-card-body" style="padding-top:14px">
+            <p style="font-size:11px;color:var(--text-dim);margin-bottom:14px">
+              Add each client you work on, with that client's Kali box login.
+            </p>
+            <div id="setupClientRows" style="display:flex;flex-direction:column;gap:18px"></div>
           </div>
         </div>
 

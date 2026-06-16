@@ -54,10 +54,3 @@ def load_config(path: str = "config/config.yaml") -> Config:
     clients = [ClientConfig(**c) for c in data["clients"]]
     app = AppConfig(**data.get("app", {}))
     return Config(jira=jira, jump_server=jump, clients=clients, app=app)
-
-
-def load_catalog(path: str = "config/clients_catalog.yaml") -> dict:
-    """Load the shared opco/Kali-credentials catalog used by the first-run
-    Settings page. Raw dict — only consumed by src/setup.py."""
-    with open(path) as f:
-        return yaml.safe_load(f)

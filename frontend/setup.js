@@ -20,30 +20,57 @@ function showToast(msg, type = 'info', duration = 5000) {
   }, duration);
 }
 
-async function loadCatalog() {
-  const listEl = $('opcoList');
-  const errEl = $('setupCatalogError');
-  try {
-    const resp = await fetch('/api/setup/catalog');
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.detail || 'Failed to load opco catalog');
+let _setupRowSeq = 0;
 
-    if (!data.clients.length) {
-      listEl.innerHTML = '<span style="color:var(--text-dim);font-size:12px">No opcos found in the catalog.</span>';
-      return;
-    }
-    listEl.innerHTML = data.clients.map(c => `
-      <label class="opco-item">
-        <input type="checkbox" value="${escHtml(c.label)}" class="opco-checkbox">
-        <span>${escHtml(c.name)}</span>
-      </label>
-    `).join('');
-  } catch (exc) {
-    errEl.style.display = 'block';
-    errEl.textContent = exc.message;
-    listEl.innerHTML = '<span style="color:var(--text-dim);font-size:12px">Unavailable</span>';
-    $('setupSubmitBtn').disabled = true;
-  }
+function setupClientRowHtml() {
+  const rowId = `setup-client-${_setupRowSeq++}`;
+  return `
+    <div class="settings-client-row" id="${rowId}">
+      <button type="button" class="settings-remove-client" onclick="removeSetupClientRow('${rowId}')" title="Remove client">✕</button>
+      <div class="settings-client-row-grid">
+        <div>
+          <label>Label</label>
+          <input type="text" class="text-input su-c-label" placeholder="ClientA">
+        </div>
+        <div>
+          <label>Display Name</label>
+          <input type="text" class="text-input su-c-name" placeholder="Client A">
+        </div>
+        <div>
+          <label>Kali Port</label>
+          <input type="number" class="text-input su-c-kaliport" value="22">
+        </div>
+        <div>
+          <label>Kali User</label>
+          <input type="text" class="text-input su-c-kaliuser" value="kali">
+        </div>
+      </div>
+      <div class="settings-client-row-grid2">
+        <div>
+          <label>Kali Password</label>
+          <input type="password" class="text-input su-c-kalipass" placeholder="Kali box password">
+        </div>
+        <div></div>
+        <div>
+          <label>Nessus Access Key <span style="font-weight:400;color:var(--text-dim)">(optional)</span></label>
+          <input type="password" class="text-input su-c-nessusaccess">
+        </div>
+        <div>
+          <label>Nessus Secret Key <span style="font-weight:400;color:var(--text-dim)">(optional)</span></label>
+          <input type="password" class="text-input su-c-nessussecret">
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function addSetupClientRow() {
+  $('setupClientRows').insertAdjacentHTML('beforeend', setupClientRowHtml());
+}
+
+function removeSetupClientRow(rowId) {
+  const row = $(rowId);
+  if (row) row.remove();
 }
 
 function setStatus(msg, type) {
@@ -55,19 +82,43 @@ function setStatus(msg, type) {
 
 async function handleSubmit(ev) {
   ev.preventDefault();
-  const selected = Array.from(document.querySelectorAll('.opco-checkbox:checked')).map(c => c.value);
 
-  if (!selected.length) {
-    setStatus('Select at least one opco.', 'error');
+  const clientRows = Array.from(document.querySelectorAll('.settings-client-row'));
+  const clients = clientRows.map(row => {
+    const v = sel => row.querySelector(sel).value;
+    return {
+      label: v('.su-c-label').trim(),
+      name: v('.su-c-name').trim(),
+      kali_port: parseInt(v('.su-c-kaliport'), 10) || 22,
+      kali_user: v('.su-c-kaliuser').trim() || 'kali',
+      kali_password: v('.su-c-kalipass'),
+      nessus_access_key: v('.su-c-nessusaccess') || null,
+      nessus_secret_key: v('.su-c-nessussecret') || null,
+    };
+  });
+
+  if (!clients.length) {
+    setStatus('Add at least one client.', 'error');
+    return;
+  }
+  if (clients.some(c => !c.label)) {
+    setStatus('Every client needs a label.', 'error');
+    return;
+  }
+  if (clients.some(c => !c.kali_password)) {
+    setStatus('Every client needs a Kali password.', 'error');
     return;
   }
 
   const body = {
+    jira_url: $('jiraUrl').value.trim(),
     jira_email: $('jiraEmail').value.trim(),
     jira_api_token: $('jiraToken').value,
+    jira_project: $('jiraProject').value.trim(),
+    jump_host: $('jumpHost').value.trim(),
     jump_user: $('jumpUser').value.trim(),
     jump_password: $('jumpPassword').value,
-    client_labels: selected,
+    clients,
   };
 
   const btn = $('setupSubmitBtn');
@@ -96,4 +147,4 @@ async function handleSubmit(ev) {
 }
 
 document.getElementById('setupForm').addEventListener('submit', handleSubmit);
-loadCatalog();
+addSetupClientRow();

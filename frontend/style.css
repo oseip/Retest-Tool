@@ -881,7 +881,7 @@ textarea:focus { border-color: var(--blue); }
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 28px 32px;
-  width: 440px;
+  width: 620px;
   max-width: 100%;
 }
 .setup-card h3 { font-size: 16px; margin-bottom: 6px; }
