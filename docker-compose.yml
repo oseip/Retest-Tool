@@ -1,0 +1,12 @@
+services:
+  nemesis:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount your local config/ so credentials stay outside the image.
+      # Edit config/config.yaml before starting.
+      - ./config:/app/config:ro
+      # Persist runtime data (system log file, saved asset lists) across restarts.
+      - ./data:/app/data
+    restart: unless-stopped

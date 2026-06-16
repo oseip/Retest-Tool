@@ -1,0 +1,38 @@
+# Nemesis — Retest Tool Configuration
+# Copy this file to config.yaml and fill in your values.
+# config.yaml is gitignored — never commit real credentials.
+
+jira:
+  url: "https://your-org.atlassian.net"
+  username: "your.email@example.com"
+  api_token: "your-jira-api-token"     # Settings → Security → API tokens
+  project: "PROJ"                       # Jira project key (e.g. IPT, SCN)
+  retest_status: "Remediated"           # Status name that triggers a retest poll
+  poll_interval: 300                    # Seconds between Jira polls (default: 300)
+
+jump_server:
+  host: "jump.your-org.com"            # Jump server hostname or IP
+  port: 22
+  user: "your-jump-username"
+  password: "your-jump-password"
+
+# Each entry is one Kali instance reachable via the jump server.
+# Add one block per client / project / Kali box.
+clients:
+  - label: "ClientA"                   # Short ID used in Jira labels
+    name: "Client A"                   # Display name shown in the UI
+    kali_port: 22                      # SSH port on the Kali machine (via jump)
+    kali_user: "kali"
+    kali_password: "your-kali-password"
+
+  # To add a second client, uncomment and fill in:
+  # - label: "ClientB"
+  #   name: "Client B"
+  #   kali_port: 22
+  #   kali_user: "kali"
+  #   kali_password: "another-password"
+
+# Optional — override the default bind address / port for the web UI.
+# app:
+#   host: "0.0.0.0"
+#   port: 8000

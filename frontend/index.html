@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nemesis</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
+</head>
+<body>
+
+  <!-- HEADER -->
+  <header>
+    <div class="header-left">
+      <span class="logo">⚡ NEMESIS</span>
+      <div class="nav-tabs">
+        <button class="nav-tab active" id="tabDashboard" onclick="switchTab('dashboard')">Dashboard</button>
+        <button class="nav-tab" id="tabReport" onclick="switchTab('report')">Monthly Report</button>
+        <button class="nav-tab" id="tabAssets" onclick="switchTab('assets')">Assets</button>
+        <button class="nav-tab" id="tabShell" onclick="switchTab('shell')">Shell</button>
+        <button class="nav-tab" id="tabSettings" onclick="switchTab('settings')">Settings</button>
+      </div>
+    </div>
+    <div class="header-center" id="dashboardControls">
+      <select id="clientFilter">
+        <option value="">All Opcos</option>
+      </select>
+      <select id="statusFilter">
+        <option value="">All Statuses</option>
+        <option value="queued">Queued</option>
+        <option value="scanning">Scanning</option>
+        <option value="completed">Completed</option>
+        <option value="error">Error</option>
+        <optgroup label="By Verdict">
+          <option value="fixed">✅ Fixed</option>
+          <option value="not_fixed">❌ Not Fixed</option>
+          <option value="inconclusive">⚠️ Inconclusive</option>
+        </optgroup>
+      </select>
+      <select id="triageFilter">
+        <option value="">All Triage</option>
+        <option value="closed">🟢 Likely Fixed</option>
+        <option value="open">🔴 Still Open</option>
+        <option value="host_down">⚠️ Host Down</option>
+        <option value="error">⚠️ Triage Error</option>
+        <option value="none">Not Triaged</option>
+      </select>
+    </div>
+    <div class="header-right" id="dashboardStats">
+      <span class="stat-badge" id="statQueued">⏳ 0</span>
+      <span class="stat-badge scanning" id="statScanning">🔍 0</span>
+      <span class="stat-badge done" id="statDone">✅ 0</span>
+      <span class="stat-badge err" id="statErr">❌ 0</span>
+      <button class="btn btn-secondary btn-sm" id="pollNowBtn" onclick="forcePoll()">↻ Poll Now</button>
+      <button class="btn btn-secondary btn-sm" id="themeBtn" onclick="toggleTheme()" title="Toggle light/dark mode">🌙</button>
+    </div>
+  </header>
+
+  <!-- MAIN LAYOUT -->
+  <div class="layout">
+
+    <!-- LEFT: JOB QUEUE -->
+    <div class="panel-left">
+      <div class="panel-toolbar panel-toolbar-2row">
+        <span class="panel-title">SCAN QUEUE</span>
+        <div class="panel-toolbar-actions">
+          <button class="btn btn-sm btn-secondary" onclick="openAddTicket()" title="Add tickets by key">+ Add Ticket</button>
+          <button class="btn btn-sm btn-secondary" id="triageAllBtn" style="display:none" onclick="triageAll()" title="Fast port-reachability check — flags likely-fixed tickets before running full scans">⚡ Triage All</button>
+          <button class="btn btn-sm btn-red" id="stopTriageBtn" style="display:none" onclick="stopAllTriage()" title="Cancel pending triage checks that haven't started yet">⏹ Stop Triage</button>
+          <button class="btn btn-sm btn-green" id="triageTransitionBtn" style="display:none" onclick="openTriageTransitionModal()" title="Transition all likely-fixed (port closed) tickets straight to Fixed — no full scan">🟢 Transition Likely Fixed</button>
+          <button class="btn btn-sm btn-green" id="transitionReadyBtn" style="display:none" onclick="openTransitionModal()">⚡ Transition Ready</button>
+        </div>
+      </div>
+      <div class="panel-scan-bar">
+        <button class="btn btn-sm btn-primary" id="scanAllBtn" style="visibility:hidden" onclick="scanAll()">▶▶ Scan All</button>
+        <button class="btn btn-sm btn-red" id="stopAllBtn" style="display:none" onclick="stopAllScans()">⏹ Stop All</button>
+        <button class="btn btn-sm btn-primary" id="scanSelectedBtn" disabled>▶ Scan Selected</button>
+      </div>
+
+      <!-- Verdict stats bar -->
+      <div id="verdictStats" class="verdict-stats-bar" style="display:none"></div>
+
+      <!-- SSH Sessions -->
+      <div class="ssh-panel" id="sshPanel">
+        <div class="ssh-panel-header" id="sshToggle" onclick="toggleSshPanel()">
+          <span class="panel-title">SSH SESSIONS</span>
+          <span id="sshChevron" style="font-size:10px;color:var(--text-dim)">▼</span>
+        </div>
+        <div class="ssh-panel-body" id="sshPanelBody"></div>
+      </div>
+
+      <div id="jobList" class="job-list"></div>
+    </div>
+
+    <!-- RIGHT: JOB DETAIL -->
+    <div class="panel-right" id="detailPanel">
+      <div class="empty-state">
+        <div class="empty-icon">⚡</div>
+        <div>Select a ticket from the queue to view details</div>
+        <div class="empty-sub">New remediated tickets appear automatically when Jira is polled</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- MONTHLY REPORT VIEW -->
+  <div id="reportView" style="display:none; flex:1; overflow-y:auto; padding:28px 32px; background:var(--bg);">
+
+    <div class="report-controls">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div>
+          <label class="report-label">Client</label>
+          <select id="reportClient" class="report-select"></select>
+        </div>
+        <div>
+          <label class="report-label">Month</label>
+          <input type="month" id="reportMonth" class="report-month-input">
+        </div>
+        <button class="btn btn-primary" id="reportGenBtn" onclick="generateReport()" style="margin-top:18px">
+          Generate Report
+        </button>
+      </div>
+    </div>
+
+    <div id="reportResults" style="margin-top:28px;"></div>
+
+  </div>
+
+  <!-- ASSETS VIEW -->
+  <div id="assetsView" style="display:none; flex:1; overflow-y:auto; padding:28px 32px; background:var(--bg); flex-direction:column;">
+
+    <div class="report-controls">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div>
+          <label class="report-label">Client</label>
+          <select id="assetsClient" class="report-select" onchange="onAssetsClientChange()"></select>
+        </div>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px">
+
+      <!-- Asset List Panel -->
+      <div class="report-card" style="padding:16px">
+        <div class="report-card-header">Client Asset List</div>
+        <div class="report-card-body" style="padding-top:10px">
+          <p style="font-size:11px;color:var(--text-dim);margin-bottom:8px">
+            Paste client-provided IPs and subnets — one per line. CIDR notation supported (e.g. 10.0.1.0/24).
+          </p>
+          <textarea id="assetsTextarea" rows="12"
+            placeholder="10.0.0.1&#10;192.168.1.0/24&#10;172.16.5.100"
+            style="width:100%;box-sizing:border-box;font-family:monospace;font-size:12px;padding:8px;background:var(--bg3);color:var(--text);border:1px solid var(--border);border-radius:4px;resize:vertical"></textarea>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+            <button class="btn btn-primary btn-sm" onclick="saveAssets()">💾 Save Asset List</button>
+            <span id="assetsSaveStatus" style="font-size:11px;color:var(--text-dim)"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Nessus Panel -->
+      <div class="report-card" style="padding:16px">
+        <div class="report-card-header" style="display:flex;align-items:center;justify-content:space-between">
+          <span>Nessus Scans</span>
+          <button class="btn btn-secondary btn-sm" onclick="openNessus()" title="Opens Nessus's web UI on the selected client's Kali box, via a local tunnel">🌐 Open Nessus</button>
+        </div>
+        <div class="report-card-body" style="padding-top:10px">
+          <p style="font-size:11px;color:var(--text-dim);margin-bottom:10px">
+            SSH must be connected. Check any number of folders — their scans are combined before comparing against the asset list.
+          </p>
+
+          <div style="margin-bottom:8px">
+            <button class="btn btn-secondary btn-sm" onclick="loadNessusFolders()">↻ Load Folders</button>
+          </div>
+
+          <div id="nessusFolderList"
+            style="max-height:130px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:6px;background:var(--bg3);font-size:12px;margin-bottom:10px">
+            <span style="color:var(--text-dim)">Click "Load Folders" to see this client's Nessus folders</span>
+          </div>
+
+          <div id="nessusScanList"
+            style="min-height:50px;max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:6px;background:var(--bg3);font-size:11px;margin-bottom:10px">
+            <span style="color:var(--text-dim)">Check a folder to see its scans</span>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:10px">
+            <button class="btn btn-primary btn-sm" id="nessusPullBtn" onclick="pullNessus()" disabled>Pull &amp; Compare</button>
+            <span id="nessusPullStatus" style="font-size:11px;color:var(--text-dim)"></span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div id="assetsResults" style="margin-top:20px"></div>
+
+  </div>
+
+  <!-- SHELL VIEW -->
+  <div id="shellView" style="display:none; flex:1; overflow-y:auto; padding:28px 32px; background:var(--bg); flex-direction:column;">
+
+    <div class="report-controls">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div>
+          <label class="report-label">Client</label>
+          <select id="shellClient" class="report-select"></select>
+        </div>
+        <button class="btn btn-primary btn-sm" id="shellConnectBtn" onclick="connectShell()">▶ Connect</button>
+        <button class="btn btn-red btn-sm" id="shellDisconnectBtn" onclick="disconnectShell()" style="display:none">⏹ Disconnect</button>
+        <span id="shellStatus" style="font-size:11px;color:var(--text-dim)">
+          Opens a real bash session on the client's Kali box — independent of the SSH panel's connection. Connect manually when you're ready.
+        </span>
+      </div>
+    </div>
+
+    <div class="report-card" style="padding:8px;margin-top:20px;flex:1;display:flex;flex-direction:column;min-height:0">
+      <div id="shellTerminalContainer" style="flex:1;min-height:480px;background:#0d1117;border-radius:4px;padding:8px"></div>
+    </div>
+
+    <div class="report-card" style="padding:16px;margin-top:20px">
+      <div style="font-size:12px;font-weight:600;color:var(--text-dim);margin-bottom:10px;text-transform:uppercase;letter-spacing:0.5px">Port Forward</div>
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:14px">
+        Reach a web app that's only visible from the selected client's Kali box — picks a port on your own machine only, nothing is opened on the jump server.
+      </div>
+      <div style="display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+        <div>
+          <label class="report-label">Target host:port</label>
+          <input type="text" id="tunnelTarget" class="report-month-input" placeholder="127.0.0.1:8080" style="width:180px">
+        </div>
+        <div>
+          <label class="report-label">Local port (optional)</label>
+          <input type="number" id="tunnelLocalPort" class="report-month-input" placeholder="same as target" style="width:130px">
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="startTunnel()">▶ Start Tunnel</button>
+      </div>
+      <div id="tunnelList" style="display:flex;flex-direction:column;gap:6px"></div>
+    </div>
+
+  </div>
+
+  <!-- SETTINGS VIEW -->
+  <div id="settingsView" style="display:none; flex:1; overflow-y:auto; padding:28px 32px; background:var(--bg);">
+
+    <div style="max-width:760px">
+
+      <div class="report-card" style="padding:16px;margin-bottom:20px">
+        <div class="report-card-header">Jira</div>
+        <div class="report-card-body" style="padding-top:14px;display:flex;flex-direction:column;gap:14px">
+          <div class="form-group">
+            <label>Jira URL</label>
+            <input type="text" id="setJiraUrl" class="text-input">
+          </div>
+          <div class="form-group">
+            <label>Email</label>
+            <input type="text" id="setJiraUsername" class="text-input">
+          </div>
+          <div class="form-group">
+            <label>API Token <span style="font-weight:400;color:var(--text-dim)" id="setJiraTokenStatus"></span></label>
+            <input type="password" id="setJiraToken" class="text-input" placeholder="Leave blank to keep the current token">
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px">
+            <div class="form-group" style="margin-bottom:0">
+              <label>Project Key</label>
+              <input type="text" id="setJiraProject" class="text-input">
+            </div>
+            <div class="form-group" style="margin-bottom:0">
+              <label>Retest Status</label>
+              <input type="text" id="setJiraRetestStatus" class="text-input">
+            </div>
+            <div class="form-group" style="margin-bottom:0">
+              <label>Poll Interval (sec)</label>
+              <input type="number" id="setJiraPollInterval" class="text-input">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="report-card" style="padding:16px;margin-bottom:20px">
+        <div class="report-card-header">Jump Server</div>
+        <div class="report-card-body" style="padding-top:14px;display:flex;flex-direction:column;gap:14px">
+          <div style="display:grid;grid-template-columns:2fr 1fr;gap:14px">
+            <div class="form-group" style="margin-bottom:0">
+              <label>Host</label>
+              <input type="text" id="setJumpHost" class="text-input">
+            </div>
+            <div class="form-group" style="margin-bottom:0">
+              <label>Port</label>
+              <input type="number" id="setJumpPort" class="text-input">
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Username</label>
+            <input type="text" id="setJumpUser" class="text-input">
+          </div>
+          <div class="form-group">
+            <label>Password <span style="font-weight:400;color:var(--text-dim)" id="setJumpPasswordStatus"></span></label>
+            <input type="password" id="setJumpPassword" class="text-input" placeholder="Leave blank to keep the current password">
+          </div>
+        </div>
+      </div>
+
+      <div class="report-card" style="padding:16px;margin-bottom:20px">
+        <div class="report-card-header" style="display:flex;align-items:center;justify-content:space-between">
+          <span>Clients (Opcos)</span>
+          <button class="btn btn-sm btn-secondary" onclick="addSettingsClientRow()">+ Add Client</button>
+        </div>
+        <div class="report-card-body" style="padding-top:14px">
+          <div id="settingsClientRows" style="display:flex;flex-direction:column;gap:18px"></div>
+        </div>
+      </div>
+
+      <div style="display:flex;align-items:center;gap:12px">
+        <button class="btn btn-primary" id="settingsSaveBtn" onclick="saveSettings()">Save Settings</button>
+        <span id="settingsSaveStatus" style="font-size:12px;color:var(--text-dim)"></span>
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- BOTTOM: SYSTEM LOGS -->
+  <div class="logs-bar" id="logsBar">
+    <div class="logs-header" id="logsToggle">
+      <span>📋 SYSTEM LOGS</span>
+      <span id="logsChevron">▲</span>
+    </div>
+    <div class="logs-body" id="logsBody"></div>
+  </div>
+
+  <!-- CONFIRM TRANSITION MODAL -->
+  <div class="modal-overlay" id="transitionModal" style="display:none">
+    <div class="modal">
+      <h3 id="modalTitle">Confirm Jira Transition</h3>
+      <p id="modalSubtitle" class="modal-subtitle"></p>
+      <div class="form-group">
+        <label>Comment (optional)</label>
+        <textarea id="modalComment" rows="3" placeholder="Add a comment to the Jira ticket..."></textarea>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" id="modalCancel">Cancel</button>
+        <button class="btn btn-primary" id="modalConfirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ADD TICKET MODAL -->
+  <div class="modal-overlay" id="addTicketModal" style="display:none">
+    <div class="modal" style="width:480px">
+      <h3>Add Tickets to Queue</h3>
+      <p class="modal-subtitle">Enter ticket keys regardless of their Jira status</p>
+      <div class="form-group">
+        <label>Client</label>
+        <select id="addTicketClient" class="report-select" style="width:100%"></select>
+      </div>
+      <div class="form-group">
+        <label>Ticket Keys <span style="color:var(--text-dim);font-weight:400">(one per line or comma-separated)</span></label>
+        <textarea id="addTicketKeys" rows="4" placeholder="AXG-1234&#10;AXG-5678, AXG-9012"></textarea>
+      </div>
+      <div id="addTicketResults" style="margin-bottom:12px;font-size:12px;display:none"></div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="closeAddTicket()">Cancel</button>
+        <button class="btn btn-primary" id="addTicketBtn" onclick="submitAddTicket()">Add to Queue</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SWEEP MODAL -->
+  <div class="modal-overlay" id="sweepModal" style="display:none">
+    <div class="modal" style="width:520px">
+      <h3 id="sweepModalTitle">Sweep Open Tickets</h3>
+      <p class="modal-subtitle" id="sweepModalSubtitle">Fetching tickets from Jira…</p>
+      <div id="sweepPreviewBody" style="margin:14px 0;font-size:12px;min-height:72px"></div>
+      <div id="sweepSample" style="margin-bottom:12px;font-size:11px;color:var(--text-dim);max-height:120px;overflow-y:auto;border-top:1px solid var(--border);padding-top:8px"></div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="closeSweep()">Cancel</button>
+        <button class="btn btn-sweep" id="sweepRunBtn" disabled onclick="runSweep()">Queue Tickets</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- BULK TRANSITION MODAL -->
+  <div class="modal-overlay" id="bulkTransitionModal" style="display:none">
+    <div class="modal" style="width:560px">
+      <h3 id="transitionModalTitle">Transition Completed Tickets</h3>
+      <p class="modal-subtitle">Jira will be updated for all eligible completed scans</p>
+      <div id="transitionPreviewBody" style="margin:14px 0;font-size:12px;min-height:60px"></div>
+      <div id="transitionTicketList" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;margin-bottom:14px;display:none"></div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="closeTransitionModal()">Cancel</button>
+        <button class="btn btn-primary" id="transitionConfirmBtn" disabled onclick="runBulkTransition()">Confirm Transition</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TRIAGE BULK TRANSITION MODAL -->
+  <div class="modal-overlay" id="triageTransitionModal" style="display:none">
+    <div class="modal" style="width:560px">
+      <h3>Transition Likely-Fixed Tickets</h3>
+      <p class="modal-subtitle">Based on triage only (port closed) — no full scan was run on these</p>
+      <div class="form-group">
+        <label>Comment (optional)</label>
+        <textarea id="triageModalComment" rows="2" placeholder="Add a comment to each Jira ticket..."></textarea>
+      </div>
+      <div id="triageTransitionPreviewBody" style="margin:10px 0;font-size:12px;min-height:24px"></div>
+      <div id="triageTransitionTicketList" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;margin-bottom:14px;display:none"></div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="closeTriageTransitionModal()">Cancel</button>
+        <button class="btn btn-primary" id="triageTransitionConfirmBtn" disabled onclick="runTriageBulkTransition()">Confirm Transition</button>
+      </div>
+    </div>
+  </div>
+
+  
+  <div id="toastContainer" class="toast-container"></div>
+  <script src="/static/vendor/xterm/xterm.js"></script>
+  <script src="/static/vendor/xterm/xterm-addon-fit.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

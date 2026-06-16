@@ -1,0 +1,14 @@
+# Credentials — never commit
+config/config.yaml
+config/clients_catalog.yaml
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Runtime data
+data/
+*.log

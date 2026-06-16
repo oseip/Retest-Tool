@@ -1,0 +1,40 @@
+# Nemesis — Shared Client/Opco Catalog
+#
+# This is the master list of every opco's Kali box credentials, shared across
+# the whole team. The first-run Settings page reads it to (a) show a pick
+# list of opcos and (b) pull in the right Kali credentials for whichever
+# opcos a person selects — so individual config.yaml files never need to
+# contain copy-pasted Kali secrets, and colleagues never type them in.
+#
+# This file is NOT read once config.yaml already exists — it's only used by
+# the setup wizard.
+#
+# Copy this file to clients_catalog.yaml, fill in real values, and share
+# clients_catalog.yaml with colleagues out-of-band (Slack DM, password
+# manager, shared drive — NOT git). It's gitignored, same as config.yaml.
+
+defaults:
+  jira:
+    url: "https://your-org.atlassian.net"
+    project: "PROJ"                       # Jira project key (e.g. IPT, SCN)
+    retest_status: "Remediated"
+    poll_interval: 300
+  jump_server:
+    host: "jump.your-org.com"
+    port: 22
+
+# Every opco the team works on. Each person's setup page lets them tick the
+# subset that's theirs — only the ticked entries get copied into their
+# personal config.yaml.
+clients:
+  - label: "ClientA"                   # Short ID used in Jira labels
+    name: "Client A"                   # Display name shown in the UI
+    kali_port: 22                      # SSH port on the Kali machine (via jump)
+    kali_user: "kali"
+    kali_password: "your-kali-password"
+
+  # - label: "ClientB"
+  #   name: "Client B"
+  #   kali_port: 22
+  #   kali_user: "kali"
+  #   kali_password: "another-password"
