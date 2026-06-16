@@ -837,22 +837,17 @@ def nessus_pull(label: str, req: NessusPullRequest):
     all_hosts: list = []
     errors: list = []
 
-    def _fetch(scan_id: int):
-        return scan_id, nc.get_scan_hosts(
-            conn, client_cfg.nessus_access_key, client_cfg.nessus_secret_key, scan_id
-        )
-
-    # Fetch all selected scans in parallel — each call opens its own SSH channel
-    # on the shared paramiko transport, so concurrent fetches are safe and fast.
-    with ThreadPoolExecutor(max_workers=min(4, len(req.scan_ids))) as pool:
-        futures = {pool.submit(_fetch, sid): sid for sid in req.scan_ids}
-        for future in as_completed(futures):
-            scan_id = futures[future]
-            try:
-                _, hosts = future.result()
-                all_hosts.extend(hosts)
-            except Exception as exc:
-                errors.append(f"Scan {scan_id}: {exc}")
+    # Sequential fetch: large Nessus scan responses (1 MB+) can cause one channel
+    # to flood the SSH transport, corrupting a parallel channel's data stream.
+    # Sequential is slower but eliminates that interference entirely.
+    for scan_id in req.scan_ids:
+        try:
+            hosts = nc.get_scan_hosts(
+                conn, client_cfg.nessus_access_key, client_cfg.nessus_secret_key, scan_id
+            )
+            all_hosts.extend(hosts)
+        except Exception as exc:
+            errors.append(f"Scan {scan_id}: {exc}")
 
     asset_data = assets_mod.load_asset_list(label)
     result = assets_mod.cross_reference(asset_data["entries"], all_hosts)

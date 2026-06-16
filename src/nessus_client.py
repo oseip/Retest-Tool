@@ -19,8 +19,9 @@ def _req(conn, method: str, path: str, access_key: str, secret_key: str, body=No
         cmd += f" -H 'Content-Type: application/json' -d '{safe}'"
     cmd += f" 'https://localhost:8834{path}'"
 
-    out, _err, _code = conn.exec(cmd, timeout=60)
+    out, err, _code = conn.exec(cmd, timeout=60)
     text = out.strip()
+    log.debug("Nessus %s %s → %d bytes (stderr: %d bytes)", method, path, len(text), len(err.strip()))
     if not text:
         raise ValueError(
             f"Empty response from Nessus ({method} {path}) — "
@@ -29,7 +30,11 @@ def _req(conn, method: str, path: str, access_key: str, secret_key: str, body=No
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        raise ValueError(f"Non-JSON response from Nessus: {text[:300]}")
+        raise ValueError(
+            f"Non-JSON response from Nessus ({method} {path}): "
+            f"{len(text)} bytes received — "
+            f"first 200: {text[:200]!r} … last 100: {text[-100:]!r}"
+        )
 
 
 def get_folders(conn, access_key: str, secret_key: str) -> List[Dict]:
