@@ -1599,7 +1599,7 @@ async function onNessusFolderToggle(folderId, checked) {
       const stColor = s.status === 'completed' ? 'var(--green)' : 'var(--text-dim)';
       return `
         <label style="display:flex;align-items:center;gap:8px;padding:4px 2px;cursor:pointer;border-bottom:1px solid var(--border)">
-          <input type="checkbox" class="nessus-scan-check" value="${s.id}" onchange="_updateNessusPullBtn()" checked>
+          <input type="checkbox" class="nessus-scan-check" value="${s.id}" onchange="_updateNessusPullBtn()" ${s.status === 'completed' ? 'checked' : ''}>
           <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(s.name)}</span>
           <span style="color:${stColor};flex-shrink:0;font-size:10px">${escHtml(s.status)}</span>
           ${dt ? `<span style="color:var(--text-dim);flex-shrink:0;font-size:10px">${dt}</span>` : ''}
@@ -1731,7 +1731,9 @@ async function pullNessus() {
     }
     status.textContent = `${data.total_hosts_pulled} hosts pulled`;
     if (data.errors && data.errors.length) {
-      showToast(`Partial results — ${data.errors.length} scan error(s)`, 'warn');
+      const detail = data.errors.slice(0, 2).join(' | ');
+      const more   = data.errors.length > 2 ? ` (+${data.errors.length - 2} more)` : '';
+      showToast(`Partial results — ${data.errors.length} scan error(s): ${detail}${more}`, 'warn', 12000);
     }
     renderAssetsResults(data);
   } catch (e) {

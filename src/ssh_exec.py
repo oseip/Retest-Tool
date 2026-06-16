@@ -135,7 +135,18 @@ class KaliConnection:
                 if chan.recv_stderr_ready():
                     stderr_buf += chan.recv_stderr(65536)
                 if chan.exit_status_ready() and not chan.recv_ready() and not chan.recv_stderr_ready():
-                    # Capture exit code here, before close()
+                    # In double-hop SSH the exit status can arrive before the last
+                    # bytes have propagated through the jump-server channel.  Give
+                    # the buffer a short extra drain so we don't lose trailing data.
+                    drain_until = time.time() + 0.5
+                    while time.time() < drain_until:
+                        time.sleep(0.02)
+                        if chan.recv_ready():
+                            stdout_buf += chan.recv(65536)
+                        if chan.recv_stderr_ready():
+                            stderr_buf += chan.recv_stderr(65536)
+                        if not chan.recv_ready() and not chan.recv_stderr_ready():
+                            break
                     exit_code = chan.recv_exit_status()
                     break
                 time.sleep(0.05)

@@ -10,7 +10,7 @@ def _req(conn, method: str, path: str, access_key: str, secret_key: str, body=No
     """Run a Nessus API request via curl on the remote Kali box (localhost:8834)."""
     auth = f"accessKey={access_key}; secretKey={secret_key}"
     cmd = (
-        f"curl -sk -X {method} "
+        f"curl -sk --connect-timeout 10 -m 55 -X {method} "
         f"-H 'X-ApiKeys: {auth}' "
         f"-H 'Accept: application/json'"
     )
@@ -19,7 +19,7 @@ def _req(conn, method: str, path: str, access_key: str, secret_key: str, body=No
         cmd += f" -H 'Content-Type: application/json' -d '{safe}'"
     cmd += f" 'https://localhost:8834{path}'"
 
-    out, _err, _code = conn.exec(cmd, timeout=30)
+    out, _err, _code = conn.exec(cmd, timeout=60)
     text = out.strip()
     if not text:
         raise ValueError(
