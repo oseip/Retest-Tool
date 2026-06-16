@@ -116,6 +116,7 @@ async function handleSubmit(ev) {
     jira_api_token: $('jiraToken').value,
     jira_project: $('jiraProject').value.trim(),
     jump_host: $('jumpHost').value.trim(),
+    jump_port: parseInt($('jumpPort').value, 10) || 22,
     jump_user: $('jumpUser').value.trim(),
     jump_password: $('jumpPassword').value,
     clients,
