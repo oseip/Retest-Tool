@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
@@ -21,6 +22,22 @@ from . import scanner, connections
 
 LOG_DIR = "data/logs"
 os.makedirs(LOG_DIR, exist_ok=True)
+
+
+def _resource_path(*parts: str) -> str:
+    """
+    Resolve a path to a bundled read-only resource (e.g. frontend/).
+
+    • Normal run: path is relative to the project root (parent of src/).
+    • PyInstaller frozen build: bundled files live in sys._MEIPASS; writable
+      files (config/, data/) stay relative to the executable directory via
+      os.chdir() in run.py — so they never need this helper.
+    """
+    if getattr(sys, "frozen", False):
+        base = sys._MEIPASS  # type: ignore[attr-defined]
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, *parts)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,7 +64,7 @@ else:
     log.warning("No %s found — serving first-run Settings page until setup completes.", CONFIG_PATH)
 
 app = FastAPI(title="Nemesis")
-app.mount("/static", StaticFiles(directory="frontend"), name="static")
+app.mount("/static", StaticFiles(directory=_resource_path("frontend")), name="static")
 
 from . import setup as setup_mod
 app.include_router(setup_mod.router)
@@ -108,8 +125,8 @@ _NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "
 @app.get("/")
 def index():
     if not os.path.exists(CONFIG_PATH):
-        return FileResponse("frontend/setup.html", headers=_NO_CACHE)
-    return FileResponse("frontend/index.html", headers=_NO_CACHE)
+        return FileResponse(_resource_path("frontend", "setup.html"), headers=_NO_CACHE)
+    return FileResponse(_resource_path("frontend", "index.html"), headers=_NO_CACHE)
 
 
 @app.post("/api/setup/activate")
@@ -125,15 +142,15 @@ def setup_activate():
 
 @app.get("/static/app.js")
 def serve_app_js():
-    return FileResponse("frontend/app.js", headers=_NO_CACHE)
+    return FileResponse(_resource_path("frontend", "app.js"), headers=_NO_CACHE)
 
 @app.get("/static/style.css")
 def serve_style_css():
-    return FileResponse("frontend/style.css", headers=_NO_CACHE)
+    return FileResponse(_resource_path("frontend", "style.css"), headers=_NO_CACHE)
 
 @app.get("/static/setup.js")
 def serve_setup_js():
-    return FileResponse("frontend/setup.js", headers=_NO_CACHE)
+    return FileResponse(_resource_path("frontend", "setup.js"), headers=_NO_CACHE)
 
 
 # ── Config ─────────────────────────────────────────────────────────────────
