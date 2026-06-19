@@ -115,15 +115,13 @@ def index():
 @app.post("/api/setup/activate")
 def setup_activate():
     """Called by setup.html after config.yaml has been written.
-    Boots the Jira client and poller so the app becomes fully live
-    without requiring a server restart."""
+    Starts the reload in a background thread and returns immediately so the
+    browser redirect is never blocked by Jira initialisation time."""
     if not os.path.exists(CONFIG_PATH):
         raise HTTPException(400, "config.yaml not found — complete setup first.")
-    try:
-        reload_runtime_config()
-    except Exception as exc:
-        raise HTTPException(500, f"Failed to activate configuration: {exc}")
-    return {"ok": True, "message": "App activated — redirecting to main UI."}
+    import threading
+    threading.Thread(target=reload_runtime_config, daemon=True).start()
+    return {"ok": True}
 
 @app.get("/static/app.js")
 def serve_app_js():
@@ -132,6 +130,10 @@ def serve_app_js():
 @app.get("/static/style.css")
 def serve_style_css():
     return FileResponse("frontend/style.css", headers=_NO_CACHE)
+
+@app.get("/static/setup.js")
+def serve_setup_js():
+    return FileResponse("frontend/setup.js", headers=_NO_CACHE)
 
 
 # ── Config ─────────────────────────────────────────────────────────────────
