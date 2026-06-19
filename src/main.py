@@ -412,6 +412,42 @@ def transition_ticket(req: TransitionRequest):
         raise HTTPException(500, str(exc))
 
 
+class FastTrackRequest(BaseModel):
+    target: str               # "Fixed" or "Not Fixed"
+    comment: Optional[str] = None
+
+
+@app.post("/api/jobs/{job_id}/fast-track")
+def fast_track_ticket(job_id: str, req: FastTrackRequest):
+    """
+    Chain all intermediate Jira transitions required to reach *target* from
+    the ticket's current status, then apply *target* itself.
+
+    Example: ticket in 'Reported' + target='Fixed'
+      → In Progress → Remediated → Fixed  (3 transitions, 1 API call)
+    """
+    job = scanner.JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    ticket_key = job["ticket_key"]
+    try:
+        completed = jira.fast_track(ticket_key, req.target, comment=req.comment or "")
+        with scanner._lock:
+            scanner.JOBS.pop(job_id, None)
+            scanner.SEEN_KEYS.discard(ticket_key)
+        scanner._app_log(
+            f"Fast-track: {ticket_key} → {' → '.join(completed)}"
+        )
+        return {"ok": True, "ticket": ticket_key, "chain": completed}
+    except Exception as exc:
+        completed = getattr(exc, "completed", [])
+        raise HTTPException(500, {
+            "detail": str(exc),
+            "completed": completed,
+        })
+
+
 
 # ── Bulk transition ────────────────────────────────────────────────────────
 
@@ -673,9 +709,10 @@ def sweep_preview(label: str):
     if not any(c.label == label for c in cfg.clients):
         raise HTTPException(400, f"Unknown client: {label}")
     from .vuln_rules import match_rule
-    tickets = jira.get_sweep_tickets(label, max_results=100)
+    # Fetch ALL open tickets — no limit; _search_jql pages through everything
+    tickets = jira.get_sweep_tickets(label)
     by_rule: Dict[str, List[dict]] = {}
-    skipped_no_rule = 0
+    queued_manual = 0
     skipped_queued = 0
     for t in tickets:
         if t["key"] in scanner.SEEN_KEYS:
@@ -683,22 +720,24 @@ def sweep_preview(label: str):
         else:
             rule = match_rule(t["summary"])
             if not rule:
-                skipped_no_rule += 1
+                # Will be queued as a manual review job
+                queued_manual += 1
             else:
                 by_rule.setdefault(rule.name, []).append({
                     "key": t["key"],
                     "summary": t["summary"],
                     "ip": t["ips"][0] if t.get("ips") else None,
                 })
-    to_queue = sum(len(v) for v in by_rule.values())
-    is_partial = len(tickets) >= 100
+    auto_queue = sum(len(v) for v in by_rule.values())
+    to_queue = auto_queue + queued_manual
     return {
         "total": len(tickets),
         "to_queue": to_queue,
-        "skipped_no_rule": skipped_no_rule,
+        "auto_queue": auto_queue,
+        "queued_manual": queued_manual,
         "skipped_queued": skipped_queued,
         "by_rule": by_rule,
-        "is_partial": is_partial,
+        "is_partial": False,
         "sample_size": len(tickets),
     }
 
@@ -717,22 +756,32 @@ def sweep_run(label: str, body: Optional[SweepRunRequest] = None):
         except Exception as exc:
             scanner._app_log(f"[Sweep] {label}: fetch failed — {exc}")
             return
-        queued = 0
+        queued = queued_manual = 0
         for ticket in tickets:
             key = ticket["key"]
-            rule = match_rule(ticket["summary"])
-            if key in scanner.SEEN_KEYS or not rule:
+            if key in scanner.SEEN_KEYS:
                 continue
-            if filter_set and rule.name not in filter_set:
+            rule = match_rule(ticket["summary"])
+            # Apply rule filter (only relevant to auto-scan tickets)
+            if filter_set and rule and rule.name not in filter_set:
                 continue
             scanner.SEEN_KEYS.add(key)
-            job_id = scanner._queue_ticket(ticket, label, source="sweep")
-            scanner._app_log(
-                f"Sweep: {key} ({label}) | "
-                f"IP: {scanner.JOBS[job_id].get('ip')} | Rule: {rule.name}"
-            )
-            queued += 1
-        scanner._app_log(f"[Sweep] {label}: done — {queued} ticket(s) queued")
+            is_manual = rule is None
+            job_id = scanner._queue_ticket(ticket, label, source="sweep", manual=is_manual)
+            if is_manual:
+                scanner._app_log(
+                    f"Sweep (manual): {key} ({label}) — no matching rule"
+                )
+                queued_manual += 1
+            else:
+                scanner._app_log(
+                    f"Sweep: {key} ({label}) | "
+                    f"IP: {scanner.JOBS[job_id].get('ip')} | Rule: {rule.name}"
+                )
+                queued += 1
+        scanner._app_log(
+            f"[Sweep] {label}: done — {queued} auto-scan + {queued_manual} manual review ticket(s) queued"
+        )
 
     threading.Thread(target=_do, daemon=True).start()
     return {"ok": True}
@@ -861,6 +910,62 @@ def nessus_pull(label: str, req: NessusPullRequest):
         f"OOS: {result['counts']['out_of_scope']}"
     )
     return result
+
+
+# ── Nessus — CSV export (bulk ZIP) ───────────────────────────────────────────
+
+class NessusExportRequest(BaseModel):
+    scan_ids: List[int]
+
+
+@app.post("/api/nessus/{label}/export")
+def nessus_export(label: str, req: NessusExportRequest):
+    """Export selected scans as CSV reports bundled into a ZIP file."""
+    import io
+    import re
+    import zipfile
+
+    client_cfg = next((c for c in cfg.clients if c.label == label), None)
+    if not client_cfg:
+        raise HTTPException(400, f"Unknown client: {label}")
+    if not getattr(client_cfg, "nessus_access_key", None):
+        raise HTTPException(400, f"Nessus API keys not configured for {label}")
+    conn = connections.get_connection(label)
+    if not conn:
+        raise HTTPException(400, f"SSH not connected for '{label}' — connect in the SSH panel first")
+    from . import nessus_client as nc
+
+    zip_buf = io.BytesIO()
+    errors = []
+    succeeded = 0
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for scan_id in req.scan_ids:
+            try:
+                csv_text, scan_name = nc.export_scan_csv(
+                    conn, client_cfg.nessus_access_key, client_cfg.nessus_secret_key, scan_id
+                )
+                safe_name = re.sub(r"[^\w\s\-]", "_", scan_name).strip() or f"scan_{scan_id}"
+                zf.writestr(f"{safe_name}_{scan_id}.csv", csv_text.encode("utf-8"))
+                scanner._app_log(f"[Export] {label}: exported '{scan_name}' (scan {scan_id})")
+                succeeded += 1
+            except Exception as exc:
+                errors.append(f"Scan {scan_id}: {exc}")
+                log.warning("CSV export failed for scan %s: %s", scan_id, exc)
+
+    # Even an empty ZipFile has a non-zero EOCD record, so tell()==0 never fires.
+    # Check the actual count of exported files instead.
+    if succeeded == 0:
+        raise HTTPException(500, "All exports failed: " + "; ".join(errors))
+
+    zip_buf.seek(0)
+    today = date.today().isoformat()
+    headers = {
+        "Content-Disposition": f"attachment; filename=nessus_reports_{today}.zip",
+        "X-Export-Errors": str(len(errors)),
+    }
+    return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
+
+
 
 
 # ── Force poll ─────────────────────────────────────────────────────────────

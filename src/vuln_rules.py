@@ -53,7 +53,9 @@ _VER_EXTRACT_PATTERNS = [
     r'version[:\s]+v?([\d]+[\d.p\-]+)',
     r'(?:apache|nginx|openssh|openssl|jenkins|kibana|grafana|tomcat|iis|php|'
     r'mysql|mariadb|redis|mongodb|elasticsearch|node\.?js|python|ruby|'
-    r'wordpress|joomla|drupal|proftpd|vsftpd|postfix|exim)[/ ]+v?([\d]+[\d.p\-]+)',
+    r'wordpress|joomla|drupal|proftpd|vsftpd|postfix|exim|struts|spring|'
+    r'confluence|jira|fortios|fortigate|pan-os|netscaler|citrix|'
+    r'pulse|ivanti|exchange|rabbitmq|cassandra|couchdb)[/ ]+v?([\d]+[\d.p\-]+)',
     r'/([\d]+\.\d+[\d.p\-]*)',
     r'v?([\d]+\.\d+\.\d+[\d.p\-]*)\s+(?:was|is|has been|are)\s+(?:detected|found|installed|running|vulnerable)',
 ]
@@ -358,14 +360,21 @@ def _parse_http_methods(text: str, xml: str, description: str = "") -> Tuple[Ver
         return "inconclusive", "Host unreachable"
     low = text.lower()
     problems = []
-    if re.search(r'\btrace\b', low) and "http-methods" in low:
-        problems.append("TRACE method still enabled")
-    if re.search(r'\btrack\b', low) and "http-methods" in low:
-        problems.append("TRACK method still enabled")
+    if "http-methods" in low:
+        if re.search(r'\btrace\b', low):
+            problems.append("TRACE method still enabled")
+        if re.search(r'\btrack\b', low):
+            problems.append("TRACK method still enabled")
+        if re.search(r'\bput\b', low):
+            problems.append("PUT method enabled (file upload risk)")
+        if re.search(r'\bdelete\b', low):
+            problems.append("DELETE method enabled")
+        if re.search(r'\bconnect\b', low):
+            problems.append("CONNECT method enabled (proxy tunnelling risk)")
     if problems:
         return "not_fixed", "; ".join(problems)
     if "http-methods" in low:
-        return "fixed", "TRACE/TRACK methods not detected"
+        return "fixed", "Dangerous HTTP methods (TRACE/TRACK/PUT/DELETE/CONNECT) not detected"
     return "inconclusive", "Could not determine HTTP methods — port may be closed"
 
 
@@ -374,7 +383,14 @@ def _parse_hsts(text: str, xml: str, description: str = "") -> Tuple[Verdict, st
         return "inconclusive", "Host unreachable"
     low = text.lower()
     if "strict-transport-security" in low:
-        return "fixed", "HSTS (Strict-Transport-Security) header is present"
+        # Verify max-age meets the 1-year minimum (31536000 s) per OWASP guidance
+        m = re.search(r'max-age\s*=\s*(\d+)', low)
+        if m and int(m.group(1)) < 31536000:
+            return "not_fixed", (
+                f"HSTS present but max-age={m.group(1)} is insufficient "
+                "(minimum 31536000 / 1 year required)"
+            )
+        return "fixed", "HSTS (Strict-Transport-Security) header is present with adequate max-age"
     # Script ran but HSTS was not in response headers
     if "http-security-headers" in low or "http-headers" in low:
         return "not_fixed", "HSTS header not found in server response"
@@ -389,8 +405,13 @@ def _parse_clickjacking(text: str, xml: str, description: str = "") -> Tuple[Ver
         return "inconclusive", "Host unreachable"
     low = text.lower()
     if "x-frame-options" in low:
+        # ALLOWALL / ALLOW-FROM * offer no real protection
+        if re.search(r'x-frame-options\s*:\s*(allowall|\*)', low):
+            return "not_fixed", "X-Frame-Options is set to a permissive value (ALLOWALL/*) — does not prevent clickjacking"
         return "fixed", "X-Frame-Options header is present"
     if "content-security-policy" in low and "frame-ancestors" in low:
+        if re.search(r"frame-ancestors\s+\*", low):
+            return "not_fixed", "CSP frame-ancestors set to wildcard (*) — does not prevent clickjacking"
         return "fixed", "Content-Security-Policy with frame-ancestors protection is present"
     if "http-security-headers" in low or "http-headers" in low:
         return "not_fixed", "X-Frame-Options / CSP frame-ancestors header not found in response"
@@ -1077,6 +1098,690 @@ def _parse_react_rce(text: str, xml: str, description: str = "") -> Tuple[Verdic
 
 
 # ---------------------------------------------------------------------------
+# Additional parsers — new coverage added below
+# ---------------------------------------------------------------------------
+
+# ── SSL: Heartbleed (CVE-2014-0160) ──────────────────────────────────────────
+
+def _parse_heartbleed(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if re.search(r'heartbleed.*vulnerable|state:\s*vulnerable', low):
+        return "not_fixed", (
+            "Heartbleed (CVE-2014-0160) still present — "
+            "upgrade OpenSSL to 1.0.1g+ / 1.0.2+ and restart all TLS services"
+        )
+    if re.search(r'not vulnerable|heartbleed.*false', low):
+        return "fixed", "Host is not vulnerable to Heartbleed"
+    if "ssl-heartbleed" in low:
+        return "inconclusive", "ssl-heartbleed script ran but result unclear — check raw output"
+    if re.search(r'\d+/tcp open', low):
+        return "inconclusive", "SSL service detected — Heartbleed test inconclusive; confirm OpenSSL is patched to 1.0.1g+"
+    return "inconclusive", "Could not test for Heartbleed — port may be closed or filtered"
+
+
+# ── Web: CORS misconfiguration ────────────────────────────────────────────────
+
+def _parse_cors(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if "access-control-allow-origin: *" in low:
+        if "access-control-allow-credentials: true" in low:
+            return "not_fixed", (
+                "CORS wildcard with credentials allowed — "
+                "any origin can make authenticated cross-origin requests (critical)"
+            )
+        return "not_fixed", "CORS wildcard (Access-Control-Allow-Origin: *) still present"
+    if re.search(r'access-control-allow-origin:\s*null', low):
+        return "not_fixed", "CORS allows null origin — exploitable via sandboxed iframes"
+    # Reflected origin back without validation
+    if "access-control-allow-origin: https://evil.example.com" in low:
+        if "access-control-allow-credentials: true" in low:
+            return "not_fixed", "CORS reflects arbitrary origin with credentials — full CORS bypass possible"
+        return "not_fixed", "CORS reflects arbitrary supplied Origin header without validation"
+    if "access-control-allow-origin" in low:
+        return "fixed", "CORS Access-Control-Allow-Origin is restricted to specific origin(s)"
+    if _got_response(low):
+        return "fixed", "No CORS wildcard header in response"
+    return "inconclusive", "Could not check CORS headers — port may be closed or filtered"
+
+
+# ── Web: X-Content-Type-Options ───────────────────────────────────────────────
+
+def _parse_content_type_options(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if "x-content-type-options" in low:
+        if re.search(r'x-content-type-options\s*:\s*nosniff', low):
+            return "fixed", "X-Content-Type-Options: nosniff is present"
+        return "not_fixed", "X-Content-Type-Options header found but not set to 'nosniff'"
+    if _got_response(low):
+        return "not_fixed", "X-Content-Type-Options header not found in response — add 'X-Content-Type-Options: nosniff'"
+    return "inconclusive", "Could not check X-Content-Type-Options — port may be closed or filtered"
+
+
+# ── Web: Referrer-Policy ──────────────────────────────────────────────────────
+
+def _parse_referrer_policy(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if "referrer-policy" in low:
+        if re.search(r'referrer-policy\s*:\s*(unsafe-url|no-referrer-when-downgrade)', low):
+            return "not_fixed", (
+                "Referrer-Policy is set to a weak value — "
+                "change to 'no-referrer' or 'strict-origin-when-cross-origin'"
+            )
+        return "fixed", "Referrer-Policy header is present"
+    if _got_response(low):
+        return "not_fixed", "Referrer-Policy header not found — add 'Referrer-Policy: strict-origin-when-cross-origin'"
+    return "inconclusive", "Could not check Referrer-Policy — port may be closed or filtered"
+
+
+# ── Web: Content-Security-Policy ─────────────────────────────────────────────
+
+def _parse_csp(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if "content-security-policy" in low:
+        problems = []
+        if "'unsafe-inline'" in low:
+            problems.append("'unsafe-inline' reduces XSS protection")
+        if "'unsafe-eval'" in low:
+            problems.append("'unsafe-eval' reduces XSS protection")
+        if re.search(r"(?:default-src|script-src)\s+'?\*'?", low):
+            problems.append("wildcard (*) source allows any origin")
+        if problems:
+            return "not_fixed", "CSP present but weak: " + "; ".join(problems)
+        return "fixed", "Content-Security-Policy header is present"
+    if _got_response(low):
+        return "not_fixed", "Content-Security-Policy header not found in response"
+    return "inconclusive", "Could not check Content-Security-Policy — port may be closed or filtered"
+
+
+# ── Web: Cookie security flags ────────────────────────────────────────────────
+
+def _parse_cookie_flags(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if "set-cookie" in low:
+        cookie_lines = [l for l in low.splitlines() if "set-cookie" in l]
+        problems = []
+        if any("httponly" not in l for l in cookie_lines):
+            problems.append("HttpOnly flag missing on one or more cookies")
+        if any("secure" not in l for l in cookie_lines) and (
+                "[url:https://" in low or "443/tcp open" in low):
+            problems.append("Secure flag missing on HTTPS cookie(s)")
+        if any("samesite" not in l for l in cookie_lines):
+            problems.append("SameSite attribute not set on one or more cookies")
+        if problems:
+            return "not_fixed", "Cookie security attributes missing: " + "; ".join(problems)
+        return "fixed", "Cookies have HttpOnly, Secure, and SameSite attributes set"
+    if _got_response(low):
+        return "inconclusive", (
+            "No Set-Cookie header in response — "
+            "check an authenticated endpoint (login page / session endpoint) for cookie flags"
+        )
+    return "inconclusive", "Could not check cookie flags — port may be closed or filtered"
+
+
+# ── Web: Exposed .git directory ───────────────────────────────────────────────
+
+def _parse_exposed_git(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    # .git/HEAD contains "ref: refs/heads/..." or a 40-char SHA-1 for a detached HEAD
+    if re.search(r'ref:\s*refs/', low) or re.search(r'^[0-9a-f]{40}$', text.strip(), re.M):
+        return "not_fixed", (
+            "/.git/HEAD is accessible — full source code may be clonable; "
+            "block /.git/ in web server config and verify with git-dumper"
+        )
+    if re.search(r'[45]\d\d', text) and _got_response(low):
+        return "fixed", "/.git/HEAD returned 4xx/5xx — git directory is not publicly accessible"
+    if _got_response(low):
+        return "inconclusive", "Got response from /.git/HEAD — verify it does not return git repository data"
+    return "inconclusive", "Could not check /.git/HEAD — web service may not be running"
+
+
+# ── Web: Exposed .env / secrets files ────────────────────────────────────────
+
+def _parse_exposed_secrets(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if re.search(
+        r'(db_password|db_host|db_name|app_key|secret_key|api_key|aws_secret|'
+        r'database_url|smtp_password|mail_password|auth_secret|jwt_secret|'
+        r'private_key|access_token)\s*=',
+        low
+    ):
+        return "not_fixed", (
+            "Environment / secrets file is publicly accessible — "
+            "credentials or secret keys are exposed; restrict file access immediately"
+        )
+    if re.search(r'[45]\d\d', text) and _got_response(low):
+        return "fixed", "Environment file returned 4xx/5xx — not publicly accessible"
+    if _got_response(low):
+        return "inconclusive", "Got response — verify the file does not expose credentials or API keys"
+    return "inconclusive", "Could not check for exposed secrets file — web service may not be running"
+
+
+# ── Web: phpinfo() page exposed ───────────────────────────────────────────────
+
+def _parse_phpinfo(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if ("phpinfo()" in low or
+            ("php version" in low and "php credits" in low) or
+            ("phpinfo" in low and "system" in low and "build date" in low)):
+        return "not_fixed", (
+            "phpinfo() page is publicly accessible — "
+            "PHP configuration, extension list, and system paths are disclosed; "
+            "remove or restrict this file immediately"
+        )
+    if re.search(r'[45]\d\d', text) and _got_response(low):
+        return "fixed", "phpinfo page returned 4xx/5xx — not publicly accessible"
+    if _got_response(low):
+        return "inconclusive", "Got response — verify it does not expose phpinfo() output"
+    return "inconclusive", "Could not check for phpinfo() — web service may not be running"
+
+
+# ── Web: phpMyAdmin / Adminer exposed ────────────────────────────────────────
+
+def _parse_phpmyadmin(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if "phpmyadmin" in low and re.search(r'(200|login|welcome|pma_|<title)', low):
+        return "not_fixed", "phpMyAdmin is publicly accessible — restrict by IP or place behind VPN/authentication"
+    if "adminer" in low and ("200" in text or "db =" in low or "select db" in low):
+        return "not_fixed", "Adminer database interface is publicly accessible"
+    if re.search(r'[45]\d\d', text) and _got_response(low):
+        return "fixed", "phpMyAdmin/Adminer returned 4xx/5xx — not publicly accessible"
+    if _got_response(low):
+        return "inconclusive", "Got response — verify phpMyAdmin/Adminer is not accessible at this path"
+    return "inconclusive", "Could not check for phpMyAdmin/Adminer — web service may not be running"
+
+
+# ── Web: Spring Boot Actuator exposed ────────────────────────────────────────
+
+def _parse_spring_actuator(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    # Actuator JSON (HAL format) has _links; health endpoint has {"status":"UP"}
+    if '"_links"' in text or ('"status"' in text and '"up"' in low):
+        sensitive = [ep for ep in ("env", "heapdump", "threaddump", "beans",
+                                    "mappings", "configprops", "logfile", "shutdown")
+                     if ep in low]
+        if sensitive:
+            return "not_fixed", (
+                f"Spring Boot Actuator exposed with sensitive endpoints: "
+                f"{', '.join(sensitive)} — restrict /actuator to internal networks"
+            )
+        return "not_fixed", "Spring Boot Actuator is publicly accessible — restrict /actuator endpoints"
+    if re.search(r'40[13]', text) and _got_response(low):
+        return "fixed", "Spring Boot Actuator requires authentication (401/403)"
+    if "404" in text and _got_response(low):
+        return "fixed", "Spring Boot Actuator not found at /actuator (404)"
+    if _got_response(low):
+        return "inconclusive", "Service responding — check /actuator/env and /actuator/health manually"
+    return "inconclusive", "Could not reach Spring Boot Actuator endpoint — port may be closed"
+
+
+# ── Web: WebDAV enabled ───────────────────────────────────────────────────────
+
+def _parse_webdav(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    webdav_hit = re.search(r'\b(propfind|proppatch|mkcol|copy|move|lock|unlock)\b', low)
+    if webdav_hit:
+        return "not_fixed", (
+            f"WebDAV method '{webdav_hit.group(1)}' is still advertised — "
+            "disable WebDAV or restrict to authenticated/internal users only"
+        )
+    if "microsoft-webdav" in low or ("dav" in low and "enabled" in low):
+        return "not_fixed", "WebDAV is still enabled — disable via IIS/Apache configuration"
+    if "http-methods" in low or "http-webdav" in low or _got_response(low):
+        return "fixed", "WebDAV methods (PROPFIND/MKCOL/LOCK) not detected in allowed methods"
+    return "inconclusive", "Could not determine WebDAV status — port may be closed"
+
+
+# ── Web: Microsoft IIS version ────────────────────────────────────────────────
+
+def _parse_iis_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    m = re.search(r'microsoft-iis/([0-9]+\.[0-9]+)', text, re.I)
+    if m:
+        detected = m.group(1)
+        vuln_ver = _extract_version_from_description(description)
+        if vuln_ver:
+            return _compare_versions(detected, vuln_ver)
+        return "inconclusive", f"Detected IIS/{detected} — compare against the vulnerable version in the ticket"
+    if "microsoft-iis" in low or ("iis" in low and "server:" in low):
+        return "inconclusive", "IIS detected but version string is suppressed — check raw Server header"
+    if _got_response(low):
+        return "inconclusive", "Service responding — IIS version not detected (may be suppressed)"
+    return "inconclusive", "Could not detect IIS version — port may be closed or filtered"
+
+
+# ── Web: Apache Struts version ────────────────────────────────────────────────
+
+def _parse_struts(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    m = re.search(r'(?:apache[\s/])?struts[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)', text, re.I)
+    if m:
+        detected = m.group(1)
+        vuln_ver = _extract_version_from_description(description)
+        if vuln_ver:
+            return _compare_versions(detected, vuln_ver)
+        return "inconclusive", f"Detected Apache Struts {detected} — compare against vulnerable version in ticket"
+    if "struts" in low:
+        return "inconclusive", "Apache Struts detected but version not parsed — check X-Powered-By header or trigger an error page"
+    if _got_response(low):
+        return "inconclusive", "Service responding — Struts version not detected; check X-Powered-By or error responses"
+    return "inconclusive", "Could not detect Apache Struts — port may be closed or filtered"
+
+
+# ── Web: Spring4Shell (CVE-2022-22965) ───────────────────────────────────────
+
+def _parse_spring4shell(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if re.search(r'spring4shell.*vulnerable|cve-2022-22965.*vulnerable|vulnerable.*spring4shell', low):
+        return "not_fixed", (
+            "Spring4Shell (CVE-2022-22965) still present — "
+            "upgrade Spring Framework to 5.3.18+ / 5.2.20+ and JDK to 9.0.3+"
+        )
+    if re.search(r'not vulnerable|spring4shell.*patched', low):
+        return "fixed", "Host is not vulnerable to Spring4Shell"
+    m = re.search(r'spring(?:-core|-framework)?[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)', text, re.I)
+    if m:
+        detected = m.group(1)
+        vuln_ver = _extract_version_from_description(description)
+        if vuln_ver:
+            return _compare_versions(detected, vuln_ver)
+        return "inconclusive", (
+            f"Spring Framework {detected} detected — "
+            "Spring4Shell affects 5.3.0–5.3.17 and 5.2.0–5.2.19 on JDK 9+ with Tomcat"
+        )
+    if _got_response(low):
+        return "inconclusive", (
+            "Spring application responding — confirm Spring Framework is upgraded to 5.3.18+/5.2.20+"
+        )
+    return "inconclusive", "Could not reach service — port may be closed or filtered"
+
+
+# ── Web: Microsoft Exchange version ──────────────────────────────────────────
+
+def _parse_exchange(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    m = (re.search(r'x-owa-version:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)', text, re.I) or
+         re.search(r'exchange[/\s]+([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)', text, re.I))
+    if m:
+        detected = m.group(1)
+        vuln_ver = _extract_version_from_description(description)
+        if vuln_ver:
+            return _compare_versions(detected, vuln_ver)
+        return "inconclusive", f"Detected Exchange build {detected} — compare against patched build in ticket"
+    if "x-owa-version" in low or "x-ms-diagnostics" in low or ("owa" in low and "microsoft" in low):
+        return "inconclusive", "Exchange/OWA detected but version not extracted — check X-OWA-Version header"
+    if _got_response(low):
+        return "inconclusive", "Service responding — Exchange version not confirmed; check X-OWA-Version response header"
+    return "inconclusive", "Could not connect to Exchange/OWA — port may be closed or filtered"
+
+
+# ── Database: Memcached unauthenticated ───────────────────────────────────────
+
+def _parse_memcached(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if _port_closed(low, 11211):
+        return "inconclusive", "Memcached port (11211) closed or filtered"
+    if "memcached" in low or ("version" in low and "bytes" in low and "curr_items" in low):
+        if "sasl" in low or "authentication" in low:
+            return "fixed", "Memcached has SASL authentication configured"
+        return "not_fixed", (
+            "Memcached is accessible without authentication — "
+            "restrict via host-based firewall rules (bind to 127.0.0.1) or enable SASL auth"
+        )
+    if re.search(r'11211/tcp open', low):
+        return "not_fixed", "Memcached port is open — verify unauthenticated access is blocked at the network level"
+    return "inconclusive", "Could not determine Memcached access status — port may be closed"
+
+
+# ── Database: CouchDB unauthenticated ─────────────────────────────────────────
+
+def _parse_couchdb(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if _port_closed(low, 5984):
+        return "inconclusive", "CouchDB port (5984) closed or filtered"
+    if '"couchdb"' in text and '"version"' in text:
+        if re.search(r'"admin_party"\s*:\s*true', text) or \
+                re.search(r'"userctx"\s*:\s*\{[^}]*"roles"\s*:\s*\["\s*_admin"', text):
+            return "not_fixed", (
+                "CouchDB is in Admin Party mode — all requests have full admin privileges; "
+                "create an admin account immediately: PUT /_config/admins/admin"
+            )
+        if "401" in text or "unauthorized" in low:
+            return "fixed", "CouchDB requires authentication"
+        return "not_fixed", "CouchDB is accessible without authentication — configure an admin user"
+    if _got_response(low):
+        return "inconclusive", "Got response on CouchDB port — verify authentication is required at /_session"
+    return "inconclusive", "Could not determine CouchDB access status"
+
+
+# ── Database: Apache Cassandra unauthenticated ────────────────────────────────
+
+def _parse_cassandra(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if _port_closed(low, 9042):
+        return "inconclusive", "Cassandra port (9042) closed or filtered"
+    if "cassandra" in low or re.search(r'9042/tcp open', low):
+        if "allowallauthenticator" in low or re.search(r'authenticator\s*:\s*allowall', low):
+            return "not_fixed", (
+                "Cassandra uses AllowAllAuthenticator — no credentials required; "
+                "set authenticator: PasswordAuthenticator in cassandra.yaml"
+            )
+        if "authentication" in low or "password" in low or "cassandra-info" in low:
+            return "fixed", "Cassandra appears to require authentication"
+        return "inconclusive", "Cassandra port open — verify PasswordAuthenticator is set in cassandra.yaml"
+    return "inconclusive", "Could not detect Cassandra — port 9042 may be closed"
+
+
+# ── Database: Apache ZooKeeper unauthenticated ────────────────────────────────
+
+def _parse_zookeeper(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if _port_closed(low, 2181):
+        return "inconclusive", "ZooKeeper port (2181) closed or filtered"
+    # ZooKeeper mntr/stat commands return version and metrics when unauthenticated
+    if "zookeeper.version" in low or "zk_version" in low or "latency min/avg/max" in low:
+        return "not_fixed", (
+            "ZooKeeper is accessible without authentication — "
+            "restrict port 2181 via network ACLs or configure SASL authentication"
+        )
+    if "authentication" in low and "zookeeper" in low:
+        return "fixed", "ZooKeeper requires authentication"
+    if re.search(r'2181/tcp open', low):
+        return "not_fixed", "ZooKeeper port is open — verify unauthenticated access is blocked via firewall"
+    return "inconclusive", "Could not determine ZooKeeper access status"
+
+
+# ── Infrastructure: etcd unauthenticated ──────────────────────────────────────
+
+def _parse_etcd(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if _port_closed(low, 2379):
+        return "inconclusive", "etcd port (2379) closed or filtered"
+    if ('"cluster_id"' in text or '"etcdserver"' in text or
+            ('"members"' in text and '"clienturls"' in text)):
+        return "not_fixed", (
+            "etcd API is accessible without authentication — "
+            "Kubernetes secrets and cluster config may be readable; enable etcd authentication"
+        )
+    if "401" in text and "unauthorized" in low:
+        return "fixed", "etcd requires authentication"
+    if re.search(r'2379/tcp open', low):
+        return "not_fixed", "etcd port is open — verify unauthenticated API access is blocked"
+    return "inconclusive", "Could not determine etcd access status"
+
+
+# ── Infrastructure: Docker Remote API exposed ─────────────────────────────────
+
+def _parse_docker_api(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    # /v1/version returns {"ApiVersion":"...","ServerVersion":"...",...}
+    if '"apiversion"' in low or '"serverversion"' in low:
+        return "not_fixed", (
+            "Docker Remote API is exposed without authentication — "
+            "full container/host control possible; bind to localhost or enforce TLS mutual auth"
+        )
+    if '"containers"' in text and '"images"' in text:
+        return "not_fixed", "Docker Remote API returns container/image data without authentication"
+    if "401" in text or "403" in text:
+        return "fixed", "Docker API requires authentication"
+    if re.search(r'(2375|2376)/tcp open', low):
+        return "not_fixed", "Docker API port is open — verify unauthenticated access is blocked"
+    return "inconclusive", "Could not determine Docker API access status"
+
+
+# ── Infrastructure: Kubernetes API unauthenticated ────────────────────────────
+
+def _parse_kubernetes_api(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    # Anonymous access: /api returns kind:APIVersions; /api/v1/namespaces returns namespace list
+    if '"kind"' in text and re.search(r'"(APIVersions|NamespaceList|NodeList|PodList)"', text):
+        return "not_fixed", (
+            "Kubernetes API is accessible without authentication — "
+            "cluster data exposed; disable anonymous auth with --anonymous-auth=false"
+        )
+    if "401" in text and "unauthorized" in low:
+        return "fixed", "Kubernetes API requires authentication"
+    if "403" in text and "forbidden" in low:
+        return "fixed", "Kubernetes API access is forbidden for anonymous requests (authentication is enforced)"
+    if re.search(r'(6443|8443)/tcp open', low):
+        return "inconclusive", "Kubernetes API port open — verify --anonymous-auth=false in kube-apiserver flags"
+    return "inconclusive", "Could not determine Kubernetes API access status"
+
+
+# ── Infrastructure: RabbitMQ management default credentials ──────────────────
+
+def _parse_rabbitmq(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if '"rabbitmq_version"' in low or ('"overview"' in low and '"message_stats"' in low):
+        return "not_fixed", (
+            "RabbitMQ management API is accessible — "
+            "verify default guest/guest credentials are disabled and UI is restricted to internal networks"
+        )
+    if "200" in text and ("rabbitmq" in low or re.search(r'15672/tcp open', low)):
+        return "not_fixed", "RabbitMQ management UI appears accessible — confirm guest user is disabled"
+    if "401" in text and _got_response(low):
+        return "fixed", "RabbitMQ management requires authentication"
+    if re.search(r'15672/tcp open', low):
+        return "inconclusive", "RabbitMQ management port open — verify guest user is disabled or UI is IP-restricted"
+    return "inconclusive", "Could not detect RabbitMQ management UI — check port 15672"
+
+
+# ── Application: Confluence / Jira version ────────────────────────────────────
+
+def _parse_inline_version(text: str, product: str) -> Optional[str]:
+    """Extract 'product X.Y.Z' from free text (helper used by platform parsers)."""
+    m = re.search(rf'{re.escape(product)}[/\s]+v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)', text, re.I)
+    return m.group(1) if m else None
+
+
+def _parse_confluence_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    for key, label in (("confluence", "Confluence"), ("jira", "Jira")):
+        m = re.search(rf'{key}[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)', text, re.I)
+        if m:
+            detected = m.group(1)
+            vuln_ver = (_extract_version_from_description(description) or
+                        _parse_inline_version(description, key))
+            if vuln_ver:
+                return _compare_versions(detected, vuln_ver)
+            return "inconclusive", (
+                f"Detected {label} {detected} — compare against vulnerable version in ticket"
+            )
+    if _got_response(low):
+        return "inconclusive", (
+            "Service responding but Confluence/Jira version not parsed — "
+            "check /confluence/rest/applinks/1.0/manifest or Jira /rest/api/2/serverInfo"
+        )
+    return "inconclusive", "Could not connect to Confluence/Jira — port may be closed or filtered"
+
+
+# ── Application: FortiGate / FortiOS version ──────────────────────────────────
+
+def _parse_fortinet(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    m = (re.search(r'(?:fortios|fortigate)[/\s]+v?([0-9]+\.[0-9]+(?:\.[0-9]+(?:\.[0-9]+)?)?)',
+                   text, re.I) or
+         re.search(r'version[:\s]+v?([0-9]+\.[0-9]+\.[0-9]+)\s+build\s+\d+', text, re.I))
+    if m:
+        detected = m.group(1)
+        vuln_ver = (_extract_version_from_description(description) or
+                    _parse_inline_version(description, "fortios"))
+        if vuln_ver:
+            return _compare_versions(detected, vuln_ver)
+        return "inconclusive", f"Detected FortiOS {detected} — compare against patched version in ticket"
+    if "fortinet" in low or "fortigate" in low:
+        return "inconclusive", "Fortinet/FortiGate detected but version not parsed — check CLI: 'get system status'"
+    if _got_response(low):
+        return "inconclusive", "Service responding — FortiGate version not confirmed; verify via management interface"
+    return "inconclusive", "Could not detect FortiGate — management port may be closed or filtered"
+
+
+# ── Application: Palo Alto PAN-OS version ─────────────────────────────────────
+
+def _parse_paloalto(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    m = re.search(r'pan-os[/\s]+v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)', text, re.I)
+    if m:
+        detected = m.group(1)
+        vuln_ver = (_extract_version_from_description(description) or
+                    _parse_inline_version(description, "pan-os"))
+        if vuln_ver:
+            return _compare_versions(detected, vuln_ver)
+        return "inconclusive", f"Detected PAN-OS {detected} — compare against patched version in ticket"
+    if "palo alto" in low or "pan-os" in low or "globalprotect" in low:
+        return "inconclusive", "Palo Alto / PAN-OS detected — version not parsed; check admin UI at https://<IP>"
+    if _got_response(low):
+        return "inconclusive", "Service responding — PAN-OS version not confirmed; verify via management interface"
+    return "inconclusive", "Could not detect PAN-OS — management port may be closed or filtered"
+
+
+# ── Application: Citrix NetScaler / ADC version ───────────────────────────────
+
+def _parse_citrix(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    m = (re.search(r'netscaler[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)', text, re.I) or
+         re.search(r'citrix\s+adc[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)', text, re.I))
+    if m:
+        detected = m.group(1)
+        vuln_ver = (_extract_version_from_description(description) or
+                    _parse_inline_version(description, "netscaler"))
+        if vuln_ver:
+            return _compare_versions(detected, vuln_ver)
+        return "inconclusive", f"Detected NetScaler/ADC {detected} — compare against patched version in ticket"
+    if "netscaler" in low or "citrix" in low:
+        return "inconclusive", "Citrix NetScaler/ADC detected — version not parsed; check /nitro/v1/stat/ns or admin portal"
+    if _got_response(low):
+        return "inconclusive", "Service responding — Citrix version not confirmed; verify via management interface"
+    return "inconclusive", "Could not detect Citrix NetScaler/ADC — port may be closed or filtered"
+
+
+# ── Application: Ivanti / Pulse Secure version ────────────────────────────────
+
+def _parse_ivanti(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    m = re.search(
+        r'(?:ivanti|pulse\s+(?:secure|connect))[/\s]+v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+        text, re.I
+    )
+    if m:
+        detected = m.group(1)
+        vuln_ver = (_extract_version_from_description(description) or
+                    _parse_inline_version(description, "pulse"))
+        if vuln_ver:
+            return _compare_versions(detected, vuln_ver)
+        return "inconclusive", f"Detected Ivanti/Pulse Secure {detected} — compare against patched version in ticket"
+    if "ivanti" in low or "pulse secure" in low or "pulse connect" in low:
+        return "inconclusive", (
+            "Ivanti/Pulse Secure detected — version not parsed; "
+            "check admin portal at /dana-na/auth/url_default/welcome.cgi"
+        )
+    if _got_response(low):
+        return "inconclusive", "Service responding — Ivanti/Pulse Secure version not confirmed"
+    return "inconclusive", "Could not detect Ivanti/Pulse Secure — port may be closed or filtered"
+
+
+# ── Network: ProFTPd / vsFTPd version ─────────────────────────────────────────
+
+def _parse_ftpd_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if _port_closed(low, 21):
+        return "inconclusive", "FTP port (21) closed or filtered"
+    for sw in ("proftpd", "vsftpd", "filezilla server", "pure-ftpd", "wu-ftpd"):
+        m = re.search(rf'{sw}[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)', text, re.I)
+        if m:
+            detected = m.group(1)
+            vuln_ver = _extract_version_from_description(description)
+            if vuln_ver:
+                return _compare_versions(detected, vuln_ver)
+            return "inconclusive", f"Detected {sw} {detected} — compare against vulnerable version in ticket"
+    if "ftp" in low and re.search(r'21/tcp open', low):
+        return "inconclusive", "FTP service open but version not parsed from 220 banner — check banner manually"
+    return "inconclusive", "Could not detect FTP server version — port may be closed"
+
+
+# ── Web: HTTP PUT / DELETE dangerous methods ──────────────────────────────────
+
+def _parse_http_put_delete(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    """Detect PUT/DELETE/CONNECT still enabled (complement to the TRACE/TRACK parser)."""
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    problems = []
+    if "http-methods" in low:
+        if re.search(r'\bput\b', low):
+            problems.append("PUT method enabled (file upload risk)")
+        if re.search(r'\bdelete\b', low):
+            problems.append("DELETE method enabled")
+        if re.search(r'\bconnect\b', low):
+            problems.append("CONNECT method enabled (proxy tunnel risk)")
+        if problems:
+            return "not_fixed", "; ".join(problems)
+        return "fixed", "PUT/DELETE/CONNECT methods not detected"
+    if _got_response(low):
+        return "inconclusive", "Service responding — re-run with --script http-methods to enumerate allowed methods"
+    return "inconclusive", "Could not determine HTTP methods — port may be closed"
+
+
+# ---------------------------------------------------------------------------
 # Rule definition
 # ---------------------------------------------------------------------------
 
@@ -1154,9 +1859,10 @@ RULES: List[VulnRule] = [
     VulnRule(
         name="HSTS Missing from HTTPS Server",
         patterns=[
-            r"hsts missing", r"strict.transport.security.*missing", r"hsts not enabled",
+            r"hsts missing", r"hsts.*missing", r"missing.*hsts",
+            r"strict.transport.security.*missing", r"hsts not enabled",
             r"misconfigured hsts", r"hsts header.*not", r"missing hsts",
-            r"strict transport security header missing",
+            r"strict transport security header missing", r"hsts.*not.*set",
         ],
         nmap_script="",
         default_port=443,
@@ -1354,7 +2060,8 @@ RULES: List[VulnRule] = [
     ),
     VulnRule(
         name="HTTP TRACE / TRACK Methods Allowed",
-        patterns=[r"http trace", r"http track", r"options method allowed", r"http.*dangerous method"],
+        patterns=[r"http trace", r"http track", r"options method allowed", r"http.*dangerous method",
+                  r"dangerous.*http.*method", r"http.*unsafe.*method"],
         nmap_script="http-methods",
         default_port=80,
         parse=_parse_http_methods,
@@ -1365,7 +2072,7 @@ RULES: List[VulnRule] = [
             r"apache 2\.4", r"apache 2\.2", r"apache http server",
             r"nginx\s*<", r"apache activemq web console",
             r"unsupported web server", r"unsupported web server detection",
-            r"apache.*multiple vulnerabilities", r"apache.*cve",
+            r"apache.*multiple vulnerabilities", r"apache http.*cve", r"apache httpd.*cve",
             r"nginx.*multiple vulnerabilities",
             r"apache.*seol", r"apache http server seol",
         ],
@@ -1895,6 +2602,366 @@ RULES: List[VulnRule] = [
         nmap_script="smtp-commands",
         default_port=25,
         parse=_parse_smtp_info,
+    ),
+
+    # --- Heartbleed ---
+    VulnRule(
+        name="Heartbleed OpenSSL CVE-2014-0160",
+        patterns=[r"heartbleed", r"cve.2014.0160", r"openssl.*heartbleed", r"ssl.*heartbleed"],
+        nmap_script="ssl-heartbleed",
+        default_port=443,
+        parse=_parse_heartbleed,
+    ),
+
+    # --- CORS ---
+    VulnRule(
+        name="CORS Misconfiguration / Wildcard Origin",
+        patterns=[r"cors.*misconfiguration", r"cross.origin.*wildcard", r"cors.*wildcard",
+                  r"access.control.allow.origin", r"cors.*overly.permissive",
+                  r"cors.*unrestricted", r"cors.*bypass"],
+        tool="curl",
+        curl_path="/",
+        extra_args="-H 'Origin: https://evil.example.com'",
+        default_port=443,
+        parse=_parse_cors,
+    ),
+
+    # --- X-Content-Type-Options ---
+    VulnRule(
+        name="Missing X-Content-Type-Options Header",
+        patterns=[r"x.content.type.options", r"content.type.sniffing", r"mime.sniffing",
+                  r"x-content-type-options.*missing", r"missing.*x-content-type"],
+        tool="curl",
+        curl_path="/",
+        default_port=443,
+        parse=_parse_content_type_options,
+    ),
+
+    # --- Referrer-Policy ---
+    VulnRule(
+        name="Missing Referrer-Policy Header",
+        patterns=[r"referrer.policy", r"missing.*referrer.*policy",
+                  r"referrer.*policy.*missing", r"referrer.*policy.*not.*set"],
+        tool="curl",
+        curl_path="/",
+        default_port=443,
+        parse=_parse_referrer_policy,
+    ),
+
+    # --- Content-Security-Policy ---
+    VulnRule(
+        name="Missing or Weak Content-Security-Policy Header",
+        patterns=[r"content.security.policy", r"missing.*csp\b", r"\bcsp\b.*missing",
+                  r"content security policy", r"\bcsp\b.*unsafe.inline",
+                  r"\bcsp\b.*not.*set", r"\bcsp\b.*not.*configured"],
+        tool="curl",
+        curl_path="/",
+        default_port=443,
+        parse=_parse_csp,
+    ),
+
+    # --- Cookie security flags ---
+    VulnRule(
+        name="Missing Cookie Security Attributes (HttpOnly / Secure / SameSite)",
+        patterns=[r"cookie.*httponly", r"httponly.*flag", r"secure.*flag.*cookie",
+                  r"cookie.*security", r"insecure.*cookie", r"missing.*cookie.*flag",
+                  r"cookie.*attribute", r"samesite.*cookie", r"cookie.*not.*secure"],
+        tool="curl",
+        curl_path="/",
+        default_port=443,
+        parse=_parse_cookie_flags,
+    ),
+
+    # --- Exposed .git directory ---
+    VulnRule(
+        name="Exposed .git Repository Directory",
+        patterns=[r"\.git.*exposed", r"git.*repository.*exposed", r"exposed.*git.*repo",
+                  r"git.*directory.*accessible", r"\.git.*publicly.*accessible",
+                  r"git.*source.*exposed"],
+        tool="curl",
+        curl_path="/.git/HEAD",
+        default_port=80,
+        parse=_parse_exposed_git,
+    ),
+
+    # --- Exposed .env / secrets files ---
+    VulnRule(
+        name="Exposed Environment / Secrets File",
+        patterns=[r"\.env.*exposed", r"exposed.*\.env", r"environment.*file.*exposed",
+                  r"config.*file.*exposed", r"\.htpasswd.*exposed", r"secrets.*file.*accessible",
+                  r"exposed.*credentials.*file"],
+        tool="curl",
+        curl_path="/.env",
+        default_port=80,
+        parse=_parse_exposed_secrets,
+    ),
+
+    # --- phpinfo() ---
+    VulnRule(
+        name="phpinfo() Page Publicly Accessible",
+        patterns=[r"phpinfo", r"php.*info.*page", r"php.*configuration.*disclosure",
+                  r"php.*info.*exposed", r"php.*info.*accessible"],
+        tool="curl",
+        curl_path="/phpinfo.php",
+        default_port=80,
+        parse=_parse_phpinfo,
+    ),
+
+    # --- phpMyAdmin / Adminer ---
+    VulnRule(
+        name="phpMyAdmin / Adminer Database Interface Exposed",
+        patterns=[r"phpmyadmin", r"adminer.*exposed", r"adminer.*accessible",
+                  r"database.*management.*interface.*exposed",
+                  r"phpmyadmin.*accessible", r"phpmyadmin.*public"],
+        tool="curl",
+        curl_path="/phpmyadmin/",
+        default_port=80,
+        parse=_parse_phpmyadmin,
+    ),
+
+    # --- Spring Boot Actuator ---
+    VulnRule(
+        name="Spring Boot Actuator Endpoints Exposed",
+        patterns=[r"spring.*actuator", r"actuator.*endpoint.*exposed",
+                  r"spring boot.*actuator", r"actuator.*accessible",
+                  r"actuator.*unauthenticated"],
+        tool="curl",
+        curl_path="/actuator",
+        default_port=8080,
+        parse=_parse_spring_actuator,
+    ),
+
+    # --- WebDAV ---
+    VulnRule(
+        name="WebDAV Enabled on Web Server",
+        patterns=[r"webdav.*enabled", r"web.*dav.*enabled", r"webdav.*method",
+                  r"dav.*enabled", r"webdav.*allowed", r"webdav.*accessible"],
+        nmap_script="http-methods",
+        default_port=80,
+        parse=_parse_webdav,
+    ),
+
+    # --- HTTP dangerous methods PUT/DELETE ---
+    VulnRule(
+        name="Dangerous HTTP Methods Enabled (PUT / DELETE / CONNECT)",
+        patterns=[r"http.*put.*method", r"http.*delete.*method", r"dangerous.*method",
+                  r"web server.*put", r"http.*unsafe.*method",
+                  r"unrestricted.*http.*method", r"http put.*enabled"],
+        nmap_script="http-methods",
+        default_port=80,
+        parse=_parse_http_put_delete,
+    ),
+
+    # --- IIS version ---
+    VulnRule(
+        name="Microsoft IIS Version Disclosure",
+        patterns=[r"iis.*version.*disclosure", r"microsoft.*iis.*version",
+                  r"iis.*banner.*disclosure", r"iis.*server.*header.*disclosure",
+                  r"iis.*version.*information"],
+        tool="curl",
+        curl_path="/",
+        default_port=80,
+        parse=_parse_iis_version,
+    ),
+
+    # --- Apache Struts ---
+    VulnRule(
+        name="Apache Struts Remote Code Execution",
+        patterns=[r"\bstruts\b", r"apache.*struts", r"struts.*rce",
+                  r"struts.*remote.*code.*execution", r"struts.*ognl.*injection",
+                  r"cve.2017.5638", r"s2-045", r"s2-057", r"struts.*vulnerability"],
+        tool="curl",
+        curl_path="/",
+        default_port=8080,
+        parse=_parse_struts,
+    ),
+
+    # --- Spring4Shell ---
+    VulnRule(
+        name="Spring4Shell Spring Framework RCE (CVE-2022-22965)",
+        patterns=[r"spring4shell", r"cve.2022.22965", r"spring.*framework.*rce",
+                  r"spring.*remote.*code.*execution", r"spring.*classloader.*manipulation",
+                  r"spring.*classloader.*rce"],
+        tool="curl",
+        curl_path="/",
+        default_port=8080,
+        parse=_parse_spring4shell,
+    ),
+
+    # --- Microsoft Exchange ---
+    VulnRule(
+        name="Microsoft Exchange Server Version",
+        patterns=[r"exchange.*version", r"microsoft.*exchange", r"exchange.*proxylogon",
+                  r"exchange.*proxyshell", r"cve.2021.26855", r"owa.*version",
+                  r"exchange.*rce", r"exchange.*patch"],
+        tool="curl",
+        curl_path="/owa/",
+        default_port=443,
+        parse=_parse_exchange,
+    ),
+
+    # --- Memcached ---
+    VulnRule(
+        name="Memcached Accessible Without Authentication",
+        patterns=[r"memcached.*unauthenticated", r"memcached.*without.*auth",
+                  r"memcached.*no.*auth", r"memcached.*open",
+                  r"unauthenticated.*memcached", r"memcached.*exposed"],
+        nmap_script="memcached-info",
+        default_port=11211,
+        parse=_parse_memcached,
+    ),
+
+    # --- CouchDB ---
+    VulnRule(
+        name="CouchDB Accessible Without Authentication",
+        patterns=[r"couchdb.*unauthenticated", r"couchdb.*no.*auth",
+                  r"couchdb.*admin.*party", r"couchdb.*open",
+                  r"apache.*couchdb.*unauthenticated", r"couchdb.*exposed"],
+        tool="curl",
+        curl_path="/",
+        default_port=5984,
+        parse=_parse_couchdb,
+    ),
+
+    # --- Cassandra ---
+    VulnRule(
+        name="Apache Cassandra Accessible Without Authentication",
+        patterns=[r"cassandra.*unauthenticated", r"cassandra.*no.*auth",
+                  r"cassandra.*without.*auth", r"cassandra.*open.*access",
+                  r"cassandra.*exposed"],
+        nmap_script="cassandra-info",
+        default_port=9042,
+        parse=_parse_cassandra,
+    ),
+
+    # --- ZooKeeper ---
+    VulnRule(
+        name="Apache ZooKeeper Accessible Without Authentication",
+        patterns=[r"zookeeper.*unauthenticated", r"zookeeper.*no.*auth",
+                  r"zookeeper.*without.*auth", r"zookeeper.*open.*access",
+                  r"zookeeper.*exposed"],
+        nmap_script="zookeeper-info",
+        default_port=2181,
+        parse=_parse_zookeeper,
+    ),
+
+    # --- etcd ---
+    VulnRule(
+        name="etcd Cluster API Accessible Without Authentication",
+        patterns=[r"etcd.*unauthenticated", r"etcd.*no.*auth", r"etcd.*exposed",
+                  r"etcd.*without.*auth", r"etcd.*open.*access",
+                  r"etcd.*kubernetes.*exposed"],
+        tool="curl",
+        curl_path="/v2/members",
+        default_port=2379,
+        parse=_parse_etcd,
+    ),
+
+    # --- Docker API ---
+    VulnRule(
+        name="Docker Remote API Exposed Without Authentication",
+        patterns=[r"docker.*api.*exposed", r"docker.*remote.*api",
+                  r"docker.*api.*unauthenticated", r"docker.*daemon.*exposed",
+                  r"docker.*socket.*exposed", r"unauthenticated.*docker"],
+        tool="curl",
+        curl_path="/v1/version",
+        default_port=2375,
+        parse=_parse_docker_api,
+    ),
+
+    # --- Kubernetes API ---
+    VulnRule(
+        name="Kubernetes API Server Accessible Without Authentication",
+        patterns=[r"kubernetes.*api.*unauthenticated", r"k8s.*api.*exposed",
+                  r"kubernetes.*api.*exposed", r"kubernetes.*anonymous.*access",
+                  r"kubernetes.*dashboard.*exposed", r"kube.*api.*unauthenticated"],
+        tool="curl",
+        curl_path="/api",
+        default_port=6443,
+        parse=_parse_kubernetes_api,
+    ),
+
+    # --- RabbitMQ ---
+    VulnRule(
+        name="RabbitMQ Management Interface Default Credentials",
+        patterns=[r"rabbitmq.*default.*credentials", r"rabbitmq.*management",
+                  r"rabbitmq.*guest", r"rabbitmq.*unauthenticated",
+                  r"rabbitmq.*exposed", r"rabbitmq.*no.*auth"],
+        tool="curl",
+        curl_path="/api/overview",
+        default_port=15672,
+        parse=_parse_rabbitmq,
+    ),
+
+    # --- Confluence / Jira ---
+    VulnRule(
+        name="Atlassian Confluence / Jira Version",
+        patterns=[r"confluence.*version", r"atlassian.*confluence", r"jira.*version",
+                  r"confluence.*cve", r"confluence.*rce", r"cve.2021.26084",
+                  r"cve.2022.26134", r"confluence.*vulnerability"],
+        tool="curl",
+        curl_path="/rest/applinks/1.0/manifest",
+        default_port=8090,
+        parse=_parse_confluence_version,
+    ),
+
+    # --- FortiGate ---
+    VulnRule(
+        name="Fortinet FortiGate / FortiOS Version",
+        patterns=[r"fortigate", r"\bfortios\b", r"fortinet.*version",
+                  r"fortigate.*version", r"fortios.*cve",
+                  r"cve.2022.42475", r"cve.2023.27997", r"fortigate.*ssl.*vpn"],
+        tool="curl",
+        curl_path="/",
+        default_port=443,
+        parse=_parse_fortinet,
+    ),
+
+    # --- PAN-OS ---
+    VulnRule(
+        name="Palo Alto PAN-OS Version",
+        patterns=[r"\bpan-os\b", r"palo alto.*version", r"panos.*version",
+                  r"globalprotect.*version", r"pan-os.*cve",
+                  r"palo alto.*firewall.*version"],
+        tool="curl",
+        curl_path="/",
+        default_port=443,
+        parse=_parse_paloalto,
+    ),
+
+    # --- Citrix ---
+    VulnRule(
+        name="Citrix NetScaler / ADC Version",
+        patterns=[r"citrix.*netscaler", r"netscaler.*version", r"citrix.*adc",
+                  r"citrix.*gateway", r"cve.2023.3519", r"citrix.*bleed",
+                  r"netscaler.*vulnerability"],
+        tool="curl",
+        curl_path="/",
+        default_port=443,
+        parse=_parse_citrix,
+    ),
+
+    # --- Ivanti ---
+    VulnRule(
+        name="Ivanti / Pulse Secure VPN Version",
+        patterns=[r"ivanti.*version", r"pulse secure.*version", r"pulse connect",
+                  r"ivanti.*cve", r"cve.2023.46805", r"cve.2024.21887",
+                  r"pulse.*vpn.*version", r"ivanti.*vpn"],
+        tool="curl",
+        curl_path="/",
+        default_port=443,
+        parse=_parse_ivanti,
+    ),
+
+    # --- ProFTPd / vsFTPd ---
+    VulnRule(
+        name="ProFTPd / vsFTPd FTP Server Version",
+        patterns=[r"proftpd.*version", r"vsftpd.*version", r"ftp.*server.*version",
+                  r"ftp.*banner.*disclosure", r"ftp.*version.*disclosure",
+                  r"proftpd.*vulnerability", r"vsftpd.*vulnerability"],
+        nmap_script="banner",
+        default_port=21,
+        parse=_parse_ftpd_version,
     ),
 ]
 

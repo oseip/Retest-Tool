@@ -27,7 +27,8 @@
       </select>
       <select id="statusFilter">
         <option value="">All Statuses</option>
-        <option value="queued">Queued</option>
+        <option value="queued">⚡ Auto-scan (Queued)</option>
+        <option value="manual">🖐 Manual Review</option>
         <option value="scanning">Scanning</option>
         <option value="completed">Completed</option>
         <option value="error">Error</option>
@@ -182,8 +183,9 @@
             <span style="color:var(--text-dim)">Check a folder to see its scans</span>
           </div>
 
-          <div style="display:flex;align-items:center;gap:10px">
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
             <button class="btn btn-primary btn-sm" id="nessusPullBtn" onclick="pullNessus()" disabled>Pull &amp; Compare</button>
+            <button class="btn btn-secondary btn-sm" id="nessusExportBtn" onclick="downloadReports()" disabled>⬇ Download Reports</button>
             <span id="nessusPullStatus" style="font-size:11px;color:var(--text-dim)"></span>
           </div>
         </div>

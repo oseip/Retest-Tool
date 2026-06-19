@@ -30,6 +30,8 @@ class ClientConfig:
     kali_password: str
     nessus_access_key: Optional[str] = None
     nessus_secret_key: Optional[str] = None
+    nessus_username: Optional[str] = None   # unused — kept for config compatibility
+    nessus_password: Optional[str] = None   # unused — kept for config compatibility
 
 
 @dataclass

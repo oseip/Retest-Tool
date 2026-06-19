@@ -191,10 +191,13 @@ class TestSweepJql:
         jql = client._sweep_jql("ClientABC")
         assert "Remediated" in jql
 
-    def test_filters_by_testtype(self):
+    def test_does_not_filter_by_testtype(self):
+        # Sweep now fetches ALL open tickets regardless of TestType.
+        # SCN/IPT → auto-scan; everything else → manual review job.
+        # The TestType filter was removed so non-scannable tickets are visible.
         client = make_client()
         jql = client._sweep_jql("ClientABC")
-        assert "SCN" in jql or "IPT" in jql
+        assert "SCN" not in jql and "IPT" not in jql
 
 
 # ---------------------------------------------------------------------------

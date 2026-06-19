@@ -85,8 +85,14 @@ def _build_triage_command(rule, ip: Optional[str], port: Optional[int]) -> Optio
     return " ".join(parts)
 
 
-def _queue_ticket(ticket: Dict[str, Any], client_label: str, source: str = "poll") -> str:
-    """Create a queued job from a Jira ticket. Returns job_id."""
+def _queue_ticket(ticket: Dict[str, Any], client_label: str,
+                  source: str = "poll", manual: bool = False) -> str:
+    """Create a queued job from a Jira ticket. Returns job_id.
+
+    manual=True marks the job status as 'manual' (no scan command will be run;
+    the user reviews and sets the verdict themselves). Used for sweep tickets
+    that have no matching automated scan rule.
+    """
     rule = match_rule(ticket["summary"])
 
     # Determine target IP
@@ -107,10 +113,12 @@ def _queue_ticket(ticket: Dict[str, Any], client_label: str, source: str = "poll
     if rule and ip:
         if rule.tool == "curl":
             scheme = "https" if port in (443, 8443) else "http"
+            # extra_args can inject additional curl flags (e.g. -H 'Origin: ...' for CORS)
+            curl_extra = f" {rule.extra_args}" if rule.extra_args else ""
             nmap_cmd = (
                 f'curl -sk -L --max-time 15 '
                 f'-w "\\n[STATUS:%{{http_code}}][URL:%{{url_effective}}]\\n" '
-                f'-D - {scheme}://{ip}:{port}{rule.curl_path}'
+                f'-D -{curl_extra} {scheme}://{ip}:{port}{rule.curl_path}'
             )
         else:
             parts = ["sudo nmap" if rule.requires_root else "nmap"]
@@ -141,6 +149,7 @@ def _queue_ticket(ticket: Dict[str, Any], client_label: str, source: str = "poll
         "ticket_cvss": ticket.get("cvss"),
         "ticket_severity": ticket.get("severity"),
         "ticket_technology": ticket.get("technology"),
+        "ticket_testtype": (ticket.get("testtype") or "").upper(),
         "ticket_cves": ticket.get("cves", []),
         "client_label": client_label,
         "ip": ip,
@@ -152,7 +161,7 @@ def _queue_ticket(ticket: Dict[str, Any], client_label: str, source: str = "poll
         "triage_command": _build_triage_command(rule, ip, port),
         "triage": None,              # None | running | open | closed | host_down | error | skipped
         "triage_note": None,
-        "status": "queued",          # queued | scanning | completed | error
+        "status": "manual" if manual else "queued",  # queued | scanning | completed | error | manual
         "verdict": None,             # fixed | not_fixed | inconclusive | None
         "verdict_reason": None,
         "output_lines": [],
@@ -270,7 +279,13 @@ def run_scan(job_id: str, cfg: Config):
             # XML was collected inline by the emit interceptor — no second channel needed
             xml_out = "\n".join(_xml_chunks)
 
-        text_output = "\n".join(JOBS[job_id]["output_lines"])
+        # Parsers should only see tool output, not the [INFO] header block
+        # (ticket summary, target info, command). Split on the ─ separator
+        # that is emitted between the header and the actual scan output.
+        all_lines = "\n".join(JOBS[job_id]["output_lines"])
+        _sep = "─" * 70
+        _parts = all_lines.split(_sep, 1)
+        text_output = _parts[1].strip() if len(_parts) > 1 else all_lines
 
         if rule and rule.parse:
             ticket_desc = job.get("ticket_description", "")
@@ -479,13 +494,23 @@ def run_poll_cycle(cfg: Config, jira_client) -> None:
                     if key in SEEN_KEYS:
                         continue
                     SEEN_KEYS.add(key)
-                job_id = _queue_ticket(ticket, client.label)
+                # SCN and IPT test-types support automated scanning;
+                # everything else (APP, WEB, NET, OSINT, …) goes to manual review.
+                testtype = (ticket.get("testtype") or "").upper()
+                is_manual = testtype not in jira_client.SCANNABLE_TYPES
+                job_id = _queue_ticket(ticket, client.label, manual=is_manual)
                 new_count += 1
                 rule = JOBS[job_id].get("rule_name")
-                _app_log(
-                    f"Queued: {key} ({client.label}) | "
-                    f"IP: {JOBS[job_id].get('ip')} | Rule: {rule or 'none'}"
-                )
+                if is_manual:
+                    _app_log(
+                        f"Queued (manual): {key} ({client.label}) | "
+                        f"TestType: {testtype or 'unknown'}"
+                    )
+                else:
+                    _app_log(
+                        f"Queued: {key} ({client.label}) | "
+                        f"IP: {JOBS[job_id].get('ip')} | Rule: {rule or 'none'}"
+                    )
 
             total = len(tickets)
             if new_count:

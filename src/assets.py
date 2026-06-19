@@ -4,11 +4,15 @@ import json
 import logging
 import os
 from datetime import datetime
-from typing import Dict, List, Set
+from typing import Dict, List, Union
 
 log = logging.getLogger(__name__)
 
 ASSETS_DIR = "data/assets"
+
+# Subnets larger than this are not enumerated for the "missed" list — the
+# number of individual IPs would be impractical to report.
+_ENUM_LIMIT = 65536
 
 
 def _path(label: str) -> str:
@@ -46,51 +50,90 @@ def load_asset_list(label: str) -> Dict:
         return json.load(f)
 
 
-def _expand(entries: List[str]) -> Set[str]:
-    """Expand CIDR notation to individual IP strings."""
-    ips: Set[str] = set()
+def _parse_scope(entries: List[str]) -> List[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]]:
+    """Parse asset entries into ip_network objects (any size, any version)."""
+    nets = []
     for entry in entries:
+        entry = entry.strip()
+        if not entry:
+            continue
         try:
-            net = ipaddress.ip_network(entry, strict=False)
-            if net.num_addresses == 1:
-                ips.add(str(net.network_address))
-            elif net.num_addresses > 65536:
-                # Keep as network notation — too large to enumerate
-                log.warning("Large subnet kept as-is: %s (%d addrs)", entry, net.num_addresses)
-                ips.add(entry)
-            else:
-                for ip in net.hosts():
-                    ips.add(str(ip))
+            nets.append(ipaddress.ip_network(entry, strict=False))
         except ValueError:
-            ips.add(entry)
-    return ips
+            log.warning("Could not parse scope entry: %s", entry)
+    return nets
+
+
+def _in_scope(ip_str: str, scope: list) -> bool:
+    """Return True if ip_str falls within any network in scope."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return any(addr in net for net in scope)
+    except ValueError:
+        return False
 
 
 def cross_reference(asset_entries: List[str], scan_hosts: List[Dict]) -> Dict:
     """
     Cross-reference client asset list against Nessus scan hosts.
 
-    Returns three categories:
-      in_scope_scanned  — in asset list + appeared in Nessus scan (reachable)
-      in_scope_missed   — in asset list + NOT in Nessus scan (unreachable or not targeted)
-      out_of_scope      — in Nessus scan + NOT in asset list
-    """
-    asset_ips: Set[str] = _expand(asset_entries)
-    scanned_ips: Set[str] = {h["ip"] for h in scan_hosts if h.get("ip")}
+    Works with individual IPs, small subnets (/24, /16, etc.) and large
+    subnets (/8 or wider) — uses containment checks instead of expanding
+    every address, so memory usage stays flat regardless of subnet size.
 
-    in_scope_scanned = sorted(asset_ips & scanned_ips)
-    in_scope_missed  = sorted(asset_ips - scanned_ips)
-    out_of_scope     = sorted(scanned_ips - asset_ips)
+    Returns three categories:
+      in_scope_scanned  — fell within asset scope AND appeared in Nessus scan
+      in_scope_missed   — fell within asset scope but NOT seen by Nessus
+      out_of_scope      — Nessus found it but it is NOT in asset scope
+    """
+    scope = _parse_scope(asset_entries)
+    scanned_ips = sorted({h["ip"] for h in scan_hosts if h.get("ip")})
+    scanned_set = set(scanned_ips)
+
+    # Partition every scanned IP into in-scope / out-of-scope
+    in_scope_scanned = [ip for ip in scanned_ips if _in_scope(ip, scope)]
+    out_of_scope     = [ip for ip in scanned_ips if not _in_scope(ip, scope)]
+
+    # Build the missed list: asset addresses not seen by Nessus
+    missed: List[str] = []
+    for net in scope:
+        if net.num_addresses == 1:
+            # Single host (/32 or /128)
+            ip = str(net.network_address)
+            if ip not in scanned_set:
+                missed.append(ip)
+        elif net.num_addresses <= _ENUM_LIMIT:
+            # Small subnet — enumerate individual host addresses
+            for host in net.hosts():
+                if str(host) not in scanned_set:
+                    missed.append(str(host))
+        else:
+            # Large subnet — impractical to list every missing IP.
+            # Report the subnet itself so the operator knows it wasn't
+            # fully covered, without flooding the output.
+            scanned_in_net = [ip for ip in scanned_set if _in_scope(ip, [net])]
+            missed_count   = net.num_addresses - len(scanned_in_net)
+            if missed_count > 0:
+                missed.append(
+                    f"{net}  "
+                    f"[{scanned_in_net.__len__()} scanned / {net.num_addresses} total — "
+                    f"{missed_count} not reached]"
+                )
+
+    # Count of distinct "scope positions" (hosts for small nets, addresses for large)
+    total_asset = 0
+    for net in scope:
+        total_asset += net.num_addresses
 
     return {
-        "in_scope_scanned": in_scope_scanned,
-        "in_scope_missed":  in_scope_missed,
-        "out_of_scope":     out_of_scope,
+        "in_scope_scanned": sorted(in_scope_scanned),
+        "in_scope_missed":  sorted(missed),
+        "out_of_scope":     sorted(out_of_scope),
         "counts": {
             "in_scope_scanned": len(in_scope_scanned),
-            "in_scope_missed":  len(in_scope_missed),
+            "in_scope_missed":  len(missed),
             "out_of_scope":     len(out_of_scope),
-            "total_asset":      len(asset_ips),
+            "total_asset":      total_asset,
             "total_scanned":    len(scanned_ips),
         },
     }

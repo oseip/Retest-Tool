@@ -94,6 +94,7 @@ header {
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-shrink: 0;
 }
 
 select {
@@ -536,11 +537,12 @@ textarea:focus { border-color: var(--blue); }
   background: transparent;
   border: 1px solid transparent;
   color: var(--text-dim);
-  padding: 4px 14px;
+  padding: 4px 10px;
   border-radius: 6px;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
+  white-space: nowrap;
   transition: all 0.15s;
 }
 .nav-tab:hover { color: var(--text); border-color: var(--border); }

@@ -7,8 +7,11 @@ const state = {
   clientFilter: '',
   statusFilter: '',
   triageFilter: '',
+  remExpanded: true,      // collapsed/expanded state of the REMEDIATED pane
+  remTypeFilter: 'all',   // 'all' | 'auto' | 'manual'  — remediated section
   sweepSearch: '',
-  sweepRenderLimit: 100, // grows as the user scrolls — see _sweepObserver
+  sweepTypeFilter: 'all', // 'all' | 'auto' | 'manual'  — sweep section
+  sweepRenderLimit: 100,  // grows as the user scrolls — see _sweepObserver
   checkedIds: new Set(),
   activeStreams: {},  // jobId → EventSource
 };
@@ -56,10 +59,16 @@ async function fetchJobs() {
     });
     renderJobList();
     updateStats();
-    // Re-attach stream for the selected job if it dropped (e.g. server restart)
+    // Re-attach stream for the selected job if it dropped (e.g. server restart).
+    // Also re-render the detail panel so the terminal element is fresh and the
+    // output_lines accumulated so far are visible before new lines arrive.
     const _selJob = state.selectedJobId && newJobs[state.selectedJobId];
     if (_selJob && _selJob.status === 'scanning' && !state.activeStreams[_selJob.id]) {
       openStream(_selJob.id);
+      if (!document.getElementById(`terminal-${_selJob.id}`)) {
+        // Terminal element gone (user navigated away then back) — re-render detail
+        renderDetail(_selJob.id);
+      }
     }
   } catch (e) { /* network error, ignore */ }
 }
@@ -67,6 +76,7 @@ async function fetchJobs() {
 async function fetchClients() {
   try {
     const res = await fetch('/api/clients');
+    if (!res.ok) return;
     const clients = await res.json();
     const sel = $('clientFilter');
     clients.forEach(c => {
@@ -138,6 +148,7 @@ function renderJobCard(j) {
       <div class="job-item-body">
         <div class="job-key">
           ${escHtml(j.ticket_key)}
+          ${j.status === 'manual' ? '<span class="badge-manual">🖐 MANUAL</span>' : ''}
           ${j.source === 'manual' ? '<span class="badge-manual">MANUAL</span>' : ''}
           ${j.jira_updated ? '<span class="badge-updated">✓ JIRA</span>' : ''}
           ${triageBadge(j)}
@@ -173,24 +184,82 @@ function renderJobList() {
 
   let html = '';
   if (remJobs.length) {
-    html += `<div class="queue-section-header">📋 REMEDIATED <span class="section-count">${remJobs.length}</span></div>`;
-    html += remJobs.map(renderJobCard).join('');
+    const autoRemCount   = remJobs.filter(j => j.status !== 'manual').length;
+    const manualRemCount = remJobs.filter(j => j.status === 'manual').length;
+
+    const rtf = state.remTypeFilter;
+    const filteredRem = rtf === 'auto'   ? remJobs.filter(j => j.status !== 'manual')
+                      : rtf === 'manual' ? remJobs.filter(j => j.status === 'manual')
+                      : remJobs;
+
+    const remCountLabel = rtf !== 'all'
+      ? `${filteredRem.length} of ${remJobs.length}`
+      : remJobs.length;
+
+    const remPill = (active) =>
+      `style="padding:2px 8px;font-size:10px;border-radius:10px;border:1px solid var(--border);cursor:pointer;` +
+      `background:${active ? 'var(--cyan)' : 'var(--bg3)'};color:${active ? '#000' : 'var(--text-dim)'};font-weight:${active ? '600' : '400'}"`;
+
+    const remChevron = state.remExpanded ? '▼' : '▶';
+    html += `<div class="queue-section-header" style="cursor:pointer" onclick="toggleRemPane()">
+      📋 REMEDIATED <span class="section-count">${remCountLabel}</span>
+      <span style="margin-left:auto;font-size:10px;color:var(--text-dim)">${remChevron}</span>
+    </div>`;
+
+    if (state.remExpanded) {
+      html += `<div style="padding:5px 8px;border-bottom:1px solid var(--border);background:var(--bg2);display:flex;gap:5px">
+        <button ${remPill(rtf === 'all')}    onclick="setRemTypeFilter('all')">All (${remJobs.length})</button>
+        <button ${remPill(rtf === 'auto')}   onclick="setRemTypeFilter('auto')">⚡ Auto-scan (${autoRemCount})</button>
+        <button ${remPill(rtf === 'manual')} onclick="setRemTypeFilter('manual')">🖐 Manual (${manualRemCount})</button>
+      </div>`;
+      html += filteredRem.map(renderJobCard).join('');
+    }
   }
   let hasMoreSweep = false;
   if (sweepJobs.length) {
+    // --- counts for the type filter pills ---
+    const autoCount   = sweepJobs.filter(j => j.status !== 'manual').length;
+    const manualCount = sweepJobs.filter(j => j.status === 'manual').length;
+
+    // --- apply type filter ---
+    const tf = state.sweepTypeFilter;
+    const typeFiltered = tf === 'auto'   ? sweepJobs.filter(j => j.status !== 'manual')
+                       : tf === 'manual' ? sweepJobs.filter(j => j.status === 'manual')
+                       : sweepJobs;
+
+    // --- apply text search ---
     const q = state.sweepSearch.toLowerCase();
     const filteredSweep = q
-      ? sweepJobs.filter(j =>
+      ? typeFiltered.filter(j =>
           `${j.ticket_key} ${j.ticket_summary} ${j.rule_name || ''}`.toLowerCase().includes(q))
-      : sweepJobs;
+      : typeFiltered;
+
     const visibleSweep = filteredSweep.slice(0, state.sweepRenderLimit);
     hasMoreSweep = filteredSweep.length > visibleSweep.length;
-    const countLabel = q ? `${filteredSweep.length} of ${sweepJobs.length}` : sweepJobs.length;
-    html += `<div class="queue-section-header sweep-section">⟳ SWEEP <span class="section-count">${countLabel}</span><button class="btn btn-sm btn-red" style="margin-left:auto;font-size:10px;padding:2px 8px" onclick="clearSweepJobs()">🗑 Clear All</button></div>`;
-    html += `<div style="padding:5px 8px;border-bottom:1px solid var(--border);background:var(--bg2)">
+    const countLabel = (q || tf !== 'all')
+      ? `${filteredSweep.length} of ${sweepJobs.length}`
+      : sweepJobs.length;
+
+    const pillStyle = (active) =>
+      `style="padding:2px 8px;font-size:10px;border-radius:10px;border:1px solid var(--border);cursor:pointer;` +
+      `background:${active ? 'var(--cyan)' : 'var(--bg3)'};color:${active ? '#000' : 'var(--text-dim)'};font-weight:${active ? '600' : '400'}"`;
+
+    const sweepScanning = sweepJobs.some(j => j.status === 'scanning');
+    html += `<div class="queue-section-header sweep-section">⟳ SWEEP <span class="section-count">${countLabel}</span>
+      <div style="display:flex;gap:5px;margin-left:auto">
+        ${sweepScanning ? `<button class="btn btn-sm btn-red" style="font-size:10px;padding:2px 8px" onclick="stopSweepScans()">⏹ Stop All</button>` : ''}
+        <button class="btn btn-sm btn-red" style="font-size:10px;padding:2px 8px" onclick="clearSweepJobs()">🗑 Clear All</button>
+      </div>
+    </div>`;
+    html += `<div style="padding:5px 8px;border-bottom:1px solid var(--border);background:var(--bg2);display:flex;flex-direction:column;gap:5px">
       <input id="sweepSearchInput" type="text" placeholder="Filter sweep tickets…" autocomplete="off"
              value="${escHtml(state.sweepSearch)}"
              style="width:100%;box-sizing:border-box;padding:4px 8px;font-size:11px;border:1px solid var(--border);border-radius:4px;background:var(--bg3);color:var(--text)">
+      <div style="display:flex;gap:5px">
+        <button ${pillStyle(tf === 'all')}    onclick="setSweepTypeFilter('all')">All (${sweepJobs.length})</button>
+        <button ${pillStyle(tf === 'auto')}   onclick="setSweepTypeFilter('auto')">⚡ Auto-scan (${autoCount})</button>
+        <button ${pillStyle(tf === 'manual')} onclick="setSweepTypeFilter('manual')">🖐 Manual (${manualCount})</button>
+      </div>
     </div>`;
     if (visibleSweep.length) {
       html += visibleSweep.map(renderJobCard).join('');
@@ -200,7 +269,7 @@ function renderJobList() {
         </div>`;
       }
     } else {
-      html += `<div style="padding:14px;text-align:center;color:var(--text-dim);font-size:11px">No sweep tickets match "${escHtml(state.sweepSearch)}"</div>`;
+      html += `<div style="padding:14px;text-align:center;color:var(--text-dim);font-size:11px">No sweep tickets match the current filter</div>`;
     }
   }
 
@@ -237,6 +306,22 @@ function renderJobList() {
   }
 }
 
+function setRemTypeFilter(type) {
+  state.remTypeFilter = type;
+  renderJobList();
+}
+
+function toggleRemPane() {
+  state.remExpanded = !state.remExpanded;
+  renderJobList();
+}
+
+function setSweepTypeFilter(type) {
+  state.sweepTypeFilter  = type;
+  state.sweepRenderLimit = 100;
+  renderJobList();
+}
+
 let _sweepObserver = null;
 let _loadingMoreSweep = false;
 
@@ -265,6 +350,7 @@ function statusIcon(status, verdict) {
   if (status === 'queued')   return '⏳';
   if (status === 'scanning') return '🔍';
   if (status === 'error')    return '💥';
+  if (status === 'manual')   return '🖐';
   if (status === 'completed') {
     if (verdict === 'fixed')       return '✅';
     if (verdict === 'not_fixed')   return '❌';
@@ -609,7 +695,10 @@ async function scanAll() {
   const startedIds = new Set();
   results.forEach((r, i) => {
     if (r.status === 'fulfilled' && r.value.ok) {
-      if (state.jobs[ids[i]]) { state.jobs[ids[i]].status = 'scanning'; state.jobs[ids[i]].output_lines = []; }
+      // _full=true prevents fetchJobs polls from wiping output_lines with the
+      // slim list response while the scan is in progress — same protection as
+      // scanSelected and triggerScan.
+      if (state.jobs[ids[i]]) { state.jobs[ids[i]]._full = true; state.jobs[ids[i]].status = 'scanning'; state.jobs[ids[i]].output_lines = []; }
       startedIds.add(ids[i]);
       ok++;
     } else { fail++; }
@@ -641,17 +730,34 @@ async function selectJob(jobId, e) {
   if (e && e.target.type === 'checkbox') return;
   state.selectedJobId = jobId;
   renderJobList();
-  // List view only carries slim job data — fetch full detail (output_lines,
-  // description, command) before rendering the detail panel.
-  if (!state.jobs[jobId]?._full) {
+
+  // Decide whether to (re-)fetch full job data from the server:
+  //   1. Never fetched before (_full not set)
+  //   2. Background scan completed/errored without a stream — _full was set on
+  //      scan start to protect output_lines during the run, but no stream was
+  //      ever open so output_lines is still the empty array we set at launch.
+  //      We must re-fetch to get the real output the server recorded.
+  const job = state.jobs[jobId];
+  const isFinished   = job?.status === 'completed' || job?.status === 'error';
+  const hasNoOutput  = !job?.output_lines?.length;
+  const needsRefetch = !job?._full || (isFinished && hasNoOutput);
+
+  if (needsRefetch) {
     try {
       const res = await fetch(`/api/jobs/${jobId}`);
       if (res.ok) {
         const full = await res.json();
         full._full = true;
+        // Merge rather than overwrite: if the stream was already running and
+        // accumulated lines in memory while this fetch was in-flight, keep
+        // whichever output_lines list is longer so we never lose live output.
+        const prev = state.jobs[jobId];
+        if ((prev?.output_lines?.length ?? 0) > (full.output_lines?.length ?? 0)) {
+          full.output_lines = prev.output_lines;
+        }
         state.jobs[jobId] = full;
       }
-    } catch (e) { /* ignore */ }
+    } catch (_) { /* ignore */ }
   }
   if (state.selectedJobId === jobId) renderDetail(jobId);
 }
@@ -706,6 +812,13 @@ function renderDetail(jobId) {
             <span class="meta-value ${sevClass}">${job.ticket_severity || '—'}</span>
           </div>
           <div class="meta-item">
+            <span class="meta-label">TestType</span>
+            <span class="meta-value" style="color:${job.ticket_testtype && ['SCN','IPT'].includes(job.ticket_testtype) ? 'var(--cyan)' : 'var(--yellow,#e6a817)'};font-size:10px">
+              ${job.ticket_testtype || '—'}
+              ${job.status === 'manual' ? ' · 🖐 Manual' : ' · ⚡ Auto'}
+            </span>
+          </div>
+          <div class="meta-item">
             <span class="meta-label">Rule</span>
             <span class="meta-value" style="color:var(--cyan);font-size:10px">${escHtml(job.rule_name || 'No matching rule')}</span>
           </div>
@@ -718,6 +831,28 @@ function renderDetail(jobId) {
           </div>` : ''}
       </div>
 
+      ${job.status === 'manual' ? `
+      <div class="terminal-section">
+        <div class="terminal-header">
+          <span class="terminal-title">🖐 MANUAL REVIEW</span>
+          <span style="font-size:11px;color:var(--yellow,#e6a817)">No automated scan rule — review manually and set verdict below</span>
+        </div>
+        <div class="terminal" style="padding:14px;white-space:pre-wrap;font-family:inherit;font-size:12px;line-height:1.6;color:var(--text)">
+${job.ticket_description
+  ? escHtml(job.ticket_description).replace(/\n/g, '<br>')
+  : '<span style="color:var(--text-dim)">No description available — open the Jira ticket for full details.</span>'}
+        </div>
+      </div>
+
+      <div class="action-bar">
+        ${renderVerdictBadge(job)}
+        <span class="verdict-reason">${escHtml(job.verdict_reason || '')}</span>
+        <div style="display:flex;gap:8px;margin-left:auto;flex-shrink:0">
+          ${!job.jira_updated ? renderTransitionBtns(job) : ''}
+          ${job.jira_updated ? `<span style="color:var(--green);font-size:12px">✔ Jira Updated</span>` : ''}
+        </div>
+      </div>
+      ` : `
       <div class="terminal-section">
         <div class="terminal-header">
           <span class="terminal-title">SCAN OUTPUT</span>
@@ -742,13 +877,11 @@ function renderDetail(jobId) {
           ${job.status === 'completed' || job.status === 'error' ? `
             <button class="btn btn-secondary btn-sm" onclick="resetJob('${jobId}')">↺ Re-scan</button>
           ` : ''}
-          ${(job.status === 'completed' || job.status === 'error') && !job.jira_updated ? `
-            <button class="btn btn-green" onclick="openTransition('${jobId}','Fixed')">✅ Fixed</button>
-            <button class="btn btn-red"   onclick="openTransition('${jobId}','Not Fixed')">❌ Not Fixed</button>
-          ` : ''}
+          ${(job.status === 'completed' || job.status === 'error') && !job.jira_updated ? renderTransitionBtns(job) : ''}
           ${job.jira_updated ? `<span style="color:var(--green);font-size:12px">✔ Jira Updated</span>` : ''}
         </div>
       </div>
+      `}
 
     </div>`;
 
@@ -784,7 +917,13 @@ function renderVerdictBadge(job) {
 }
 
 function statusLabel(job) {
-  const map = { queued: 'Waiting to scan', scanning: '🔍 Scanning…', completed: 'Scan complete', error: 'Scan error' };
+  const map = {
+    queued:    'Waiting to scan',
+    scanning:  '🔍 Scanning…',
+    completed: 'Scan complete',
+    error:     'Scan error',
+    manual:    '🖐 Manual review',
+  };
   return map[job.status] || job.status;
 }
 
@@ -803,16 +942,25 @@ function openStream(jobId) {
     if (data.done) {
       es.close();
       delete state.activeStreams[jobId];
-      // Refresh this job's state
+      // Refresh this job's full state from the server.
+      // Merge rather than overwrite: keep whichever output_lines is longer
+      // (in-memory stream lines vs server-recorded lines) so we never drop
+      // a line that arrived via the stream but hasn't persisted yet.
       fetch(`/api/jobs/${jobId}`)
-        .then(r => r.json())
+        .then(r => r.ok ? r.json() : null)
         .then(j => {
+          if (!j) return;
           j._full = true;
+          const prev = state.jobs[jobId];
+          if ((prev?.output_lines?.length ?? 0) > (j.output_lines?.length ?? 0)) {
+            j.output_lines = prev.output_lines;
+          }
           state.jobs[jobId] = j;
           if (state.selectedJobId === jobId) renderDetail(jobId);
           renderJobList();
           updateStats();
-        });
+        })
+        .catch(() => {});
     }
   };
 
@@ -863,7 +1011,11 @@ async function triggerScan(jobId) {
       showToast(`Scan error: ${err.detail}`, 'error');
       return;
     }
-    state.jobs[jobId].status = 'scanning';
+    // Mark _full=true so fetchJobs polls never overwrite output_lines with the
+    // slim list response (which has no output_lines field) — previously this
+    // caused the terminal to go blank mid-scan.
+    state.jobs[jobId]._full        = true;
+    state.jobs[jobId].status       = 'scanning';
     state.jobs[jobId].output_lines = [];
     renderJobList();
     renderDetail(jobId);  // opens stream via closeOtherStreams + openStream
@@ -884,7 +1036,7 @@ async function scanSelected() {
   results.forEach((r, i) => {
     const id = ids[i];
     if (r.status === 'fulfilled' && r.value.ok) {
-      if (state.jobs[id]) { state.jobs[id].status = 'scanning'; state.jobs[id].output_lines = []; }
+      if (state.jobs[id]) { state.jobs[id]._full = true; state.jobs[id].status = 'scanning'; state.jobs[id].output_lines = []; }
       state.checkedIds.delete(id);
       startedIds.add(id);
     }
@@ -911,13 +1063,19 @@ async function stopScan(jobId) {
 }
 
 async function resetJob(jobId) {
-  await fetch(`/api/jobs/${jobId}/reset`, { method: 'POST' });
-  const res = await fetch(`/api/jobs/${jobId}`);
-  const full = await res.json();
-  full._full = true;
-  state.jobs[jobId] = full;
-  renderJobList();
-  if (state.selectedJobId === jobId) renderDetail(jobId);
+  try {
+    const r = await fetch(`/api/jobs/${jobId}/reset`, { method: 'POST' });
+    if (!r.ok) { showToast('Reset failed', 'error'); return; }
+    const res = await fetch(`/api/jobs/${jobId}`);
+    if (!res.ok) { showToast('Could not reload job after reset', 'warn'); return; }
+    const full = await res.json();
+    full._full = true;
+    state.jobs[jobId] = full;
+    renderJobList();
+    if (state.selectedJobId === jobId) renderDetail(jobId);
+  } catch (e) {
+    showToast(`Reset failed: ${e.message}`, 'error');
+  }
 }
 
 async function removeJob(jobId, e) {
@@ -926,6 +1084,11 @@ async function removeJob(jobId, e) {
   if (!job) return;
   if (!confirm(`Remove ${job.ticket_key} from queue?\nIt will re-appear on the next Jira poll if still Remediated.`)) return;
   await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' });
+  // Close any active SSE stream for this job before removing it from state
+  if (state.activeStreams[jobId]) {
+    state.activeStreams[jobId].close();
+    delete state.activeStreams[jobId];
+  }
   delete state.jobs[jobId];
   state.checkedIds.delete(jobId);
   if (state.selectedJobId === jobId) {
@@ -959,6 +1122,57 @@ async function forcePoll() {
 // ── Transition modal ──────────────────────────────────────────────────────
 let _pendingTransition = null;
 
+// ── Fast-track helpers ─────────────────────────────────────────────────────
+
+const _FAST_TRACK_CHAINS = {
+  'reported':    ['In Progress', 'Remediated'],
+  'in progress': ['Remediated'],
+  'not fixed':   ['Remediated'],
+  'remediated':  [],
+};
+
+function fastTrackChain(ticketStatus, target) {
+  const s = (ticketStatus || '').toLowerCase().trim();
+  const intermediate = _FAST_TRACK_CHAINS[s];
+  if (intermediate === undefined) return null;
+  return [...intermediate, target];
+}
+
+function needsFastTrack(job) {
+  const s = (job.ticket_status || '').toLowerCase().trim();
+  return s in _FAST_TRACK_CHAINS && s !== 'remediated';
+}
+
+/** Render Fixed / Not Fixed buttons — or ⚡ fast-track variants if the ticket
+ *  is not yet in Remediated state and needs intermediate transitions. */
+function renderTransitionBtns(job) {
+  const jid = job.id;
+  if (needsFastTrack(job)) {
+    const chain = fastTrackChain(job.ticket_status, '…');
+    const hops  = chain.slice(0, -1).join(' → ');   // show intermediates only
+    const tip   = hops ? `Via: ${hops}` : '';
+    return `
+      <button class="btn btn-green" onclick="openFastTrack('${jid}','Fixed')"
+              title="${escHtml(tip)}">⚡ Fast-track → Fixed</button>
+      <button class="btn btn-red" onclick="openFastTrack('${jid}','Not Fixed')"
+              title="${escHtml(tip)}">⚡ → Not Fixed</button>`;
+  }
+  return `
+    <button class="btn btn-green" onclick="openTransition('${jid}','Fixed')">✅ Fixed</button>
+    <button class="btn btn-red"   onclick="openTransition('${jid}','Not Fixed')">❌ Not Fixed</button>`;
+}
+
+function openFastTrack(jobId, target) {
+  const job   = state.jobs[jobId];
+  const chain = fastTrackChain(job.ticket_status, target);
+  const chainStr = chain.join(' → ');
+  _pendingTransition = { jobId, toStatus: target, isFastTrack: true };
+  $('modalTitle').textContent    = `⚡ Fast-track → ${target}`;
+  $('modalSubtitle').textContent = `${job.ticket_key} (${job.ticket_status || '?'})  →  ${chainStr}`;
+  $('modalComment').value        = buildAutoComment(job, target);
+  $('transitionModal').style.display = 'flex';
+}
+
 function openTransition(jobId, toStatus) {
   _pendingTransition = { jobId, toStatus };
   const job = state.jobs[jobId];
@@ -971,17 +1185,44 @@ function openTransition(jobId, toStatus) {
 function buildAutoComment(job, toStatus) {
   const ts = new Date().toISOString().slice(0, 16).replace('T', ' ');
   const verdict = job.verdict_reason ? `\nVerdict: ${job.verdict_reason}` : '';
-  return `Retest performed on ${ts} UTC\nStatus: ${toStatus}${verdict}\nNmap rule: ${job.rule_name || 'manual review'}\nTarget: ${job.ip}:${job.port}`;
+  return `Retest performed on ${ts} UTC\nStatus: ${toStatus}${verdict}\nNmap rule: ${job.rule_name || 'manual review'}\nTarget: ${job.ip || 'N/A'}:${job.port || 'N/A'}`;
 }
 
 async function confirmTransition() {
   if (!_pendingTransition) return;
-  const { jobId, toStatus } = _pendingTransition;
-  const comment = $('modalComment').value.trim();
+  const { jobId, toStatus, isFastTrack } = _pendingTransition;
+  const comment    = $('modalComment').value.trim();
+  const ticketKey  = state.jobs[jobId]?.ticket_key;
   $('transitionModal').style.display = 'none';
+  _pendingTransition = null;
 
-  const ticketKey = state.jobs[jobId]?.ticket_key;
+  if (isFastTrack) {
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/fast-track`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: toStatus, comment }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        const detail    = typeof err.detail === 'object' ? err.detail.detail    : (err.detail || 'Unknown error');
+        const completed = typeof err.detail === 'object' ? err.detail.completed : [];
+        const doneStr   = completed.length ? ` (completed: ${completed.join(' → ')})` : '';
+        showToast(`Fast-track failed: ${detail}${doneStr}`, 'error', 8000);
+        return;
+      }
+      const data = await res.json();
+      _removeJobLocally(jobId);
+      showToast(`⚡ ${ticketKey}: ${data.chain.join(' → ')}`, 'success', 5000);
+      renderJobList();
+      updateStats();
+    } catch (e) {
+      showToast(e.message, 'error');
+    }
+    return;
+  }
 
+  // ── Standard single-step transition ──────────────────────────────────────
   try {
     const res = await fetch('/api/transition', {
       method: 'POST',
@@ -993,23 +1234,22 @@ async function confirmTransition() {
       showToast(`Transition failed: ${err.detail}`, 'error');
       return;
     }
-
-    // Server removed the job immediately — remove it locally too
-    delete state.jobs[jobId];
-    state.checkedIds.delete(jobId);
-    if (state.selectedJobId === jobId) {
-      state.selectedJobId = null;
-      $('detailPanel').innerHTML = `<div class="empty-state"><div class="empty-icon">⚡</div><div>Select a ticket from the queue to view details</div></div>`;
-    }
-
+    _removeJobLocally(jobId);
     showToast(`${ticketKey} → ${toStatus}`, 'success');
     renderJobList();
     updateStats();
-
   } catch (e) {
     showToast(e.message, 'error');
   }
-  _pendingTransition = null;
+}
+
+function _removeJobLocally(jobId) {
+  delete state.jobs[jobId];
+  state.checkedIds.delete(jobId);
+  if (state.selectedJobId === jobId) {
+    state.selectedJobId = null;
+    $('detailPanel').innerHTML = `<div class="empty-state"><div class="empty-icon">⚡</div><div>Select a ticket from the queue to view details</div></div>`;
+  }
 }
 
 // ── Bulk transition modal ─────────────────────────────────────────────────
@@ -1178,19 +1418,25 @@ $('logsToggle').addEventListener('click', () => {
 
 // ── Filters ───────────────────────────────────────────────────────────────
 $('clientFilter').addEventListener('change', e => {
-  state.clientFilter = e.target.value;
+  state.clientFilter     = e.target.value;
+  state.remTypeFilter    = 'all';
+  state.sweepTypeFilter  = 'all';
   state.sweepRenderLimit = 100;
   renderJobList();
   // Auto-poll Jira whenever the opco filter changes so results are always fresh
   fetch('/api/poll', { method: 'POST' }).catch(() => {});
 });
 $('statusFilter').addEventListener('change', e => {
-  state.statusFilter = e.target.value;
+  state.statusFilter     = e.target.value;
+  state.remTypeFilter    = 'all';
+  state.sweepTypeFilter  = 'all';
   state.sweepRenderLimit = 100;
   renderJobList();
 });
 $('triageFilter').addEventListener('change', e => {
-  state.triageFilter = e.target.value;
+  state.triageFilter     = e.target.value;
+  state.remTypeFilter    = 'all';
+  state.sweepTypeFilter  = 'all';
   state.sweepRenderLimit = 100;
   renderJobList();
 });
@@ -1326,16 +1572,12 @@ async function openSweep(label) {
     }
     _sweepToQueue = data.to_queue;
     $('sweepModalSubtitle').textContent = `Open tickets for ${label} — not Fixed or Risk Accepted`;
-    const partialNote = data.is_partial
-      ? `<div style="color:var(--yellow,#e6a817);font-size:11px">⚠️ Preview based on first ${data.sample_size} tickets — full set has ${data.total}</div>`
-      : '';
     $('sweepPreviewBody').innerHTML = `
       <div style="display:flex;flex-direction:column;gap:6px">
         <div>📋 <b>${data.total}</b> total open tickets found</div>
-        <div style="color:var(--green)">✅ <b>${data.to_queue}</b> have matching scan rules — will be queued</div>
-        <div style="color:var(--text-dim)">⚪ <b>${data.skipped_no_rule}</b> have no matching rule — skipped</div>
+        <div style="color:var(--green)">✅ <b>${data.auto_queue}</b> have matching scan rules — will be auto-scanned</div>
+        <div style="color:var(--yellow,#e6a817)">🖐 <b>${data.queued_manual}</b> have no matching rule — queued for manual review</div>
         <div style="color:var(--text-dim)">⚪ <b>${data.skipped_queued}</b> already in queue — skipped</div>
-        ${partialNote}
       </div>`;
     // Show breakdown grouped by rule type
     const byRule = data.by_rule || {};
@@ -1349,9 +1591,7 @@ async function openSweep(label) {
     }
     if (data.to_queue > 0) {
       $('sweepRunBtn').disabled    = false;
-      $('sweepRunBtn').textContent = data.is_partial
-        ? `Queue Eligible Tickets`
-        : `Queue ${data.to_queue} Ticket${data.to_queue !== 1 ? 's' : ''}`;
+      $('sweepRunBtn').textContent = `Queue ${data.to_queue} Ticket${data.to_queue !== 1 ? 's' : ''}`;
     } else {
       $('sweepRunBtn').textContent = 'Nothing to Queue';
     }
@@ -1374,9 +1614,23 @@ async function clearSweepJobs() {
   await fetchJobs();
 }
 
+async function stopSweepScans() {
+  // Stop all actively scanning sweep jobs
+  const scanningIds = Object.values(state.jobs)
+    .filter(j => j.source === 'sweep' && j.status === 'scanning')
+    .map(j => j.id);
+  if (!scanningIds.length) return;
+  showToast(`Stopping ${scanningIds.length} sweep scan${scanningIds.length !== 1 ? 's' : ''}…`, 'warn', 3000);
+  await Promise.allSettled(
+    scanningIds.map(id => fetch(`/api/jobs/${id}/stop`, { method: 'POST' }))
+  );
+  await fetchJobs();
+}
+
 async function runSweep() {
   if (!_sweepClient) return;
   const label = _sweepClient;
+  const btn = $('sweepRunBtn');
   try {
     const res = await fetch(`/api/sweep/${encodeURIComponent(label)}/run`, { method: 'POST' });
     if (!res.ok) {
@@ -1390,8 +1644,10 @@ async function runSweep() {
     await fetchJobs();
   } catch (e) {
     showToast(e.message, 'error');
-    btn.disabled    = false;
-    btn.textContent = `Queue ${_sweepToQueue} Ticket${_sweepToQueue !== 1 ? 's' : ''}`;
+    if (btn) {
+      btn.disabled    = false;
+      btn.textContent = `Queue ${_sweepToQueue} Ticket${_sweepToQueue !== 1 ? 's' : ''}`;
+    }
   }
 }
 
@@ -1580,9 +1836,19 @@ async function onNessusFolderToggle(folderId, checked) {
   listDiv.appendChild(group);
   _nessusLoadedFolders.add(folderId);
 
+  // Helper: returns true if this fetch is still relevant — the group element
+  // is still attached to the DOM and the user hasn't switched to a different
+  // client.  If either condition fails the request was superseded (folder
+  // unchecked, Load Folders clicked, client changed) and we must discard the
+  // result rather than write to a detached/wrong element.
+  const isCurrent = () => listDiv.contains(group) && $('assetsClient').value === label;
+
   try {
     const res  = await fetch(`/api/nessus/${encodeURIComponent(label)}/scans?folder_id=${folderId}`);
     const data = await res.json();
+
+    if (!isCurrent()) return;   // ← stale: DOM was reset while request was in-flight
+
     if (!res.ok) {
       group.innerHTML = _nessusFolderHeaderHtml(folderId) + `<span style="color:var(--red)">${escHtml(data.detail || 'Error')}</span>`;
       return;
@@ -1597,16 +1863,22 @@ async function onNessusFolderToggle(folderId, checked) {
         ? new Date(s.last_modification_date * 1000).toLocaleDateString()
         : '';
       const stColor = s.status === 'completed' ? 'var(--green)' : 'var(--text-dim)';
+      const hostCount = (s.total_hosts != null && s.total_hosts > 0)
+        ? `<span style="color:var(--cyan);flex-shrink:0;font-size:10px" title="${s.total_hosts} hosts">🖥 ${s.total_hosts}</span>`
+        : '';
       return `
         <label style="display:flex;align-items:center;gap:8px;padding:4px 2px;cursor:pointer;border-bottom:1px solid var(--border)">
           <input type="checkbox" class="nessus-scan-check" value="${s.id}" onchange="_updateNessusPullBtn()" ${s.status === 'completed' ? 'checked' : ''}>
           <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(s.name)}</span>
+          ${hostCount}
           <span style="color:${stColor};flex-shrink:0;font-size:10px">${escHtml(s.status)}</span>
           ${dt ? `<span style="color:var(--text-dim);flex-shrink:0;font-size:10px">${dt}</span>` : ''}
         </label>`;
     }).join('');
   } catch (e) {
-    group.innerHTML = _nessusFolderHeaderHtml(folderId) + `<span style="color:var(--red)">${escHtml(e.message)}</span>`;
+    if (isCurrent()) {
+      group.innerHTML = _nessusFolderHeaderHtml(folderId) + `<span style="color:var(--red)">${escHtml(e.message)}</span>`;
+    }
   } finally {
     _updateNessusPullBtn();
   }
@@ -1615,6 +1887,7 @@ async function onNessusFolderToggle(folderId, checked) {
 function _updateNessusPullBtn() {
   const any = document.querySelectorAll('.nessus-scan-check:checked').length > 0;
   $('nessusPullBtn').disabled = !any;
+  $('nessusExportBtn').disabled = !any;
 }
 
 const NESSUS_PORT = 8834;
@@ -1822,6 +2095,59 @@ function downloadAssetsCSV() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+// ── Nessus CSV export (bulk ZIP download) ────────────────────────────────────
+
+async function downloadReports() {
+  const label = $('assetsClient').value;
+  if (!label) { showToast('Select a client first', 'warn'); return; }
+
+  const checked  = [...document.querySelectorAll('.nessus-scan-check:checked')];
+  const scanIds  = checked.map(cb => parseInt(cb.value, 10));
+  if (!scanIds.length) { showToast('No scans selected', 'warn'); return; }
+
+  const btn    = $('nessusExportBtn');
+  const status = $('nessusPullStatus');
+  btn.disabled    = true;
+  btn.textContent = 'Exporting…';
+  status.textContent = `Generating CSV report${scanIds.length > 1 ? 's' : ''} for ${scanIds.length} scan(s) — this can take a minute…`;
+
+  try {
+    const res = await fetch(`/api/nessus/${encodeURIComponent(label)}/export`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scan_ids: scanIds }),
+    });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.detail || 'Export failed');
+    }
+
+    const errCount = parseInt(res.headers.get('X-Export-Errors') || '0', 10);
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `nessus_reports_${new Date().toISOString().slice(0, 10)}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    if (errCount > 0) {
+      showToast(`Downloaded with ${errCount} export error(s) — some scans may be missing`, 'warn', 8000);
+    } else {
+      showToast(`✅ Downloaded ${scanIds.length} report(s)`, 'success');
+    }
+    status.textContent = '';
+  } catch (e) {
+    showToast(e.message, 'error');
+    status.textContent = '';
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = '⬇ Download Reports';
+  }
 }
 
 // ── Monthly Report ────────────────────────────────────────────────────────

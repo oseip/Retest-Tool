@@ -65,21 +65,26 @@ class JiraClient:
     def _fid(self, name: str) -> Optional[str]:
         return self._fields.get(name.lower())
 
+    # TestTypes that support automated scanning (nmap / curl)
+    SCANNABLE_TYPES = {"SCN", "IPT"}
+
     def _jql(self, client_label: str) -> str:
+        # Pull ALL remediated tickets regardless of TestType.
+        # SCN/IPT → auto-scan job; everything else → manual review job.
         return (
             f'project = {self.cfg.project} '
             f'AND status = "{self.cfg.retest_status}" '
             f'AND labels = "{client_label}" '
-            f'AND ("TestType[Short text]" ~ "SCN" OR "TestType[Short text]" ~ "IPT") '
             f'ORDER BY updated DESC'
         )
 
     def _sweep_jql(self, client_label: str) -> str:
+        # Pull ALL open tickets regardless of TestType.
+        # SCN/IPT without a matching rule → manual; non-SCN/IPT → always manual.
         return (
             f'project = {self.cfg.project} '
             f'AND labels = "{client_label}" '
             f'AND status NOT IN (Fixed, "Risk Accepted", "{self.cfg.retest_status}") '
-            f'AND ("TestType[Short text]" ~ "SCN" OR "TestType[Short text]" ~ "IPT") '
             f'ORDER BY updated DESC'
         )
 
@@ -183,7 +188,62 @@ class JiraClient:
             "not fixed", "not fix", "not fix issue", "mark as not fixed",
             "won't fix", "wontfix", "reopen", "reopened", "reject",
         },
+        "in progress": {
+            "in progress", "start progress", "start", "start work",
+            "begin", "begin work", "take", "assign", "wip",
+        },
+        "remediated": {
+            "remediated", "mark remediated", "mark as remediated",
+            "client remediated", "remediate", "ready for retest",
+        },
     }
+
+    # Fast-track chains: what intermediate transitions are needed before the
+    # final Fixed / Not Fixed step, keyed by current ticket status (lower-case).
+    FAST_TRACK_CHAINS: Dict[str, List[str]] = {
+        "reported":    ["In Progress", "Remediated"],
+        "in progress": ["Remediated"],
+        "not fixed":   ["Remediated"],
+        "remediated":  [],   # direct — no intermediates needed
+    }
+
+    def fast_track(self, key: str, target: str, comment: str = "") -> List[str]:
+        """
+        Chain all intermediate transitions required to reach *target* from the
+        ticket's current status, then apply *target* itself.
+
+        Returns the list of transition names that were successfully applied.
+        Raises ValueError if any step fails, with the completed list attached
+        as the ``completed`` attribute so callers can report partial progress.
+        """
+        current_status = self._j.issue(key).fields.status.name.lower().strip()
+        chain = self.FAST_TRACK_CHAINS.get(current_status)
+        if chain is None:
+            raise ValueError(
+                f"No fast-track chain defined for status '{current_status}'. "
+                f"Defined for: {list(self.FAST_TRACK_CHAINS)}"
+            )
+
+        full_chain = chain + [target]
+        completed: List[str] = []
+
+        # Optional comment goes on the ticket before any transitions fire
+        if comment:
+            self.add_comment(key, comment)
+
+        for step in full_chain:
+            try:
+                self.transition(key, step)
+                completed.append(step)
+            except Exception as exc:
+                err = ValueError(
+                    f"Fast-track failed at step '{step}' "
+                    f"(completed: {completed}): {exc}"
+                )
+                err.completed = completed  # type: ignore[attr-defined]
+                raise err
+
+        return completed
 
     def transition(self, key: str, to_status: str):
         transitions = self._j.transitions(key)
