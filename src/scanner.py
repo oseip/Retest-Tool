@@ -275,6 +275,44 @@ def run_scan(job_id: str, cfg: Config):
                     })
                 return
             emit(f"[NMAP] Scan complete (exit code: {exit_code})")
+
+            # ── Auto-retry with -Pn if host blocked ICMP ping ─────────────────
+            _DOWN_PHRASES = ("host seems down", "0 hosts up", "skipping host")
+            _scan_text = "\n".join(JOBS[job_id]["output_lines"]).lower()
+            _host_blocked = (
+                any(p in _scan_text for p in _DOWN_PHRASES)
+                and "-Pn" not in job["nmap_command"]
+            )
+            if _host_blocked:
+                emit("")
+                emit("[NMAP] ⚠  Host appears to be blocking ICMP ping — retrying with -Pn ...")
+                emit("")
+                # Insert -Pn immediately after the nmap binary name
+                _orig = job["nmap_command"]
+                if _orig.startswith("sudo nmap "):
+                    _pn_cmd = "sudo nmap -Pn " + _orig[len("sudo nmap "):]
+                else:
+                    _pn_cmd = "nmap -Pn " + _orig[len("nmap "):]
+
+                # Reset XML collector so the retry result is clean
+                _collecting_xml[0] = False
+                _xml_chunks.clear()
+
+                exit_code = kali.exec_stream(_pn_cmd, emit, timeout=600, stop_event=stop_event)
+                emit("")
+                if stop_event.is_set():
+                    emit("[CANCELLED] Scan stopped by user")
+                    with _lock:
+                        JOBS[job_id].update({
+                            "status": "error",
+                            "verdict": "inconclusive",
+                            "verdict_reason": "Scan cancelled by user",
+                            "completed_at": datetime.utcnow().isoformat(),
+                        })
+                    return
+                emit(f"[NMAP] Retry (-Pn) complete (exit code: {exit_code})")
+            # ──────────────────────────────────────────────────────────────────
+
             emit("[PARSE] Analysing results...")
             # XML was collected inline by the emit interceptor — no second channel needed
             xml_out = "\n".join(_xml_chunks)
