@@ -140,12 +140,11 @@ async function handleSubmit(ev) {
     showToast('Config saved — loading app…', 'success', 4000);
     document.getElementById('setupForm').querySelectorAll('input, button').forEach(el => el.disabled = true);
 
-    // Boot the Jira client and poller without requiring a server restart,
-    // then redirect to the main UI.
-    try {
-      await fetch('/api/setup/activate', { method: 'POST' });
-    } catch (_) { /* best-effort — redirect anyway */ }
-    setTimeout(() => { window.location.href = '/'; }, 1500);
+    // Fire activate in the background — initialising Jira + poller can take
+    // a few seconds so we don't await it. The main UI handles a still-booting
+    // state gracefully (poll catches up within its first cycle).
+    fetch('/api/setup/activate', { method: 'POST' }).catch(() => {});
+    setTimeout(() => { window.location.href = '/'; }, 2000);
   } catch (exc) {
     setStatus(exc.message, 'error');
     showToast(exc.message, 'error');
