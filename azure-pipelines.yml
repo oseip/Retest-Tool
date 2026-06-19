@@ -1,29 +1,48 @@
 trigger:
   - main
 
-pool:
-  vmImage: windows-latest
+jobs:
+  - job: Build
+    strategy:
+      matrix:
+        Windows:
+          vmImage: 'windows-latest'
+          assetName: 'retest-tool-windows.exe'
+          isWindows: true
+        macOS:
+          vmImage: 'macos-latest'
+          assetName: 'retest-tool-macos'
+          isWindows: false
+        Linux:
+          vmImage: 'ubuntu-latest'
+          assetName: 'retest-tool-linux'
+          isWindows: false
 
-steps:
-  - task: UsePythonVersion@0
-    inputs:
-      versionSpec: '3.11'
-      architecture: 'x64'
+    pool:
+      vmImage: $(vmImage)
 
-  - script: |
-      pip install -r requirements.txt pyinstaller
-    displayName: Install dependencies
+    steps:
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: '3.11'
+          architecture: 'x64'
 
-  - script: |
-      pyinstaller retest.spec
-    displayName: Build Windows executable
+      - script: pip install -r requirements.txt pyinstaller
+        displayName: Install dependencies
 
-  - script: |
-      move dist\retest-tool.exe dist\retest-tool-windows.exe
-    displayName: Rename binary
+      - script: pyinstaller retest.spec
+        displayName: Build executable
 
-  - task: PublishBuildArtifacts@1
-    inputs:
-      pathToPublish: dist\retest-tool-windows.exe
-      artifactName: retest-tool-windows
-    displayName: Upload artifact
+      - bash: mv dist/retest-tool dist/$(assetName)
+        displayName: Rename binary (Unix)
+        condition: eq(variables['isWindows'], 'false')
+
+      - script: move dist\retest-tool.exe dist\$(assetName)
+        displayName: Rename binary (Windows)
+        condition: eq(variables['isWindows'], 'true')
+
+      - task: PublishBuildArtifacts@1
+        inputs:
+          pathToPublish: dist/$(assetName)
+          artifactName: $(assetName)
+        displayName: Upload artifact
