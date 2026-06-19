@@ -37,9 +37,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/config.yaml"
-SETUP_NEEDED = not os.path.exists(CONFIG_PATH)
 
-if not SETUP_NEEDED:
+if os.path.exists(CONFIG_PATH):
     cfg = load_config(CONFIG_PATH)
     jira = JiraClient(cfg.jira)
 else:
@@ -78,7 +77,7 @@ def _start_poller_thread():
 
 @app.on_event("startup")
 def _start_poller():
-    if SETUP_NEEDED:
+    if not os.path.exists(CONFIG_PATH):
         return
     _start_poller_thread()
     scanner._app_log("Retest Tool API ready")
@@ -108,9 +107,23 @@ _NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "
 
 @app.get("/")
 def index():
-    if SETUP_NEEDED:
+    if not os.path.exists(CONFIG_PATH):
         return FileResponse("frontend/setup.html", headers=_NO_CACHE)
     return FileResponse("frontend/index.html", headers=_NO_CACHE)
+
+
+@app.post("/api/setup/activate")
+def setup_activate():
+    """Called by setup.html after config.yaml has been written.
+    Boots the Jira client and poller so the app becomes fully live
+    without requiring a server restart."""
+    if not os.path.exists(CONFIG_PATH):
+        raise HTTPException(400, "config.yaml not found — complete setup first.")
+    try:
+        reload_runtime_config()
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to activate configuration: {exc}")
+    return {"ok": True, "message": "App activated — redirecting to main UI."}
 
 @app.get("/static/app.js")
 def serve_app_js():

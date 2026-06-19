@@ -136,9 +136,16 @@ async function handleSubmit(ev) {
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || 'Setup failed');
 
-    setStatus('✅ ' + data.message, 'success');
-    showToast(data.message, 'success', 8000);
+    setStatus('✅ Config saved — activating app…', 'success');
+    showToast('Config saved — loading app…', 'success', 4000);
     document.getElementById('setupForm').querySelectorAll('input, button').forEach(el => el.disabled = true);
+
+    // Boot the Jira client and poller without requiring a server restart,
+    // then redirect to the main UI.
+    try {
+      await fetch('/api/setup/activate', { method: 'POST' });
+    } catch (_) { /* best-effort — redirect anyway */ }
+    setTimeout(() => { window.location.href = '/'; }, 1500);
   } catch (exc) {
     setStatus(exc.message, 'error');
     showToast(exc.message, 'error');
