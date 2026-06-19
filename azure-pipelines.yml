@@ -1,0 +1,29 @@
+trigger:
+  - main
+
+pool:
+  vmImage: windows-latest
+
+steps:
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.11'
+      architecture: 'x64'
+
+  - script: |
+      pip install -r requirements.txt pyinstaller
+    displayName: Install dependencies
+
+  - script: |
+      pyinstaller retest.spec
+    displayName: Build Windows executable
+
+  - script: |
+      move dist\retest-tool.exe dist\retest-tool-windows.exe
+    displayName: Rename binary
+
+  - task: PublishBuildArtifacts@1
+    inputs:
+      pathToPublish: dist\retest-tool-windows.exe
+      artifactName: retest-tool-windows
+    displayName: Upload artifact
