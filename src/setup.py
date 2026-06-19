@@ -130,4 +130,4 @@ def submit_setup(req: SetupRequest):
         "Setup complete — config.yaml written for %s (%d client(s))",
         req.jira_email, len(clients),
     )
-    return {"ok": True, "message": "Setup complete. Restart the app to load your configuration."}
+    return {"ok": True, "message": "Setup complete. Loading the app…"}
