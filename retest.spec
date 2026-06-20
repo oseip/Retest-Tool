@@ -66,6 +66,9 @@ a = Analysis(
         # Jira / requests
         "requests", "requests_oauthlib", "oauthlib",
         "atlassian",
+        "jira", "jira.client", "jira.config", "jira.exceptions",
+        "jira.resilientsession", "jira.resources", "jira.utils",
+        "jira.version", "jira.jirashell",
         # Misc
         "multiprocessing.freeze_support",
         "email.mime.multipart", "email.mime.text",
