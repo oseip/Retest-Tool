@@ -2,9 +2,11 @@ name: Build Binaries
 
 on:
   push:
-    branches: [main]
-  release:
-    types: [created]
+    branches: [main]        # builds artifacts on every push
+    tags: ['v*']            # builds + attaches to release on version tags
+
+permissions:
+  contents: write           # needed to upload files to GitHub Releases
 
 jobs:
   build:
@@ -37,6 +39,7 @@ jobs:
       - name: Build binary
         run: pyinstaller retest.spec --noconfirm
 
+      # Always upload as workflow artifact (downloadable from Actions tab)
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -44,8 +47,9 @@ jobs:
           path: dist/${{ matrix.artifact }}
           if-no-files-found: error
 
+      # Only attach to GitHub Release when a version tag was pushed
       - name: Attach to GitHub Release
-        if: github.event_name == 'release'
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/${{ matrix.artifact }}
