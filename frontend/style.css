@@ -73,6 +73,7 @@ header {
   display: flex;
   align-items: center;
   flex-shrink: 0;
+  gap: 0;
 }
 
 .logo {
@@ -123,6 +124,90 @@ select:hover { border-color: var(--blue); }
 .stat-badge.err      { border-color: var(--red);   color: var(--red); }
 
 /* ── Layout ───────────────────────────────────────────────────────────── */
+/* ── Session switcher bar ─────────────────────────────────────────────── */
+.session-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 16px;
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.session-bar-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: .08em;
+  margin-right: 4px;
+}
+.session-btn {
+  padding: 4px 14px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  letter-spacing: .06em;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.session-btn:hover:not(:disabled) {
+  border-color: var(--blue);
+  color: var(--blue);
+}
+.session-btn.active {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #fff;
+}
+.session-btn:disabled {
+  opacity: .35;
+  cursor: not-allowed;
+}
+.session-active-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-left: 6px;
+}
+
+/* ── Settings two-column layout ───────────────────────────────────────── */
+.settings-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 28px;
+  align-items: start;
+  margin-bottom: 20px;
+}
+
+.settings-col {}
+
+.settings-col-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 16px;
+}
+
+.settings-col-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.settings-col-dot-axian    { background: var(--blue); }
+.settings-col-dot-nonaxian { background: var(--accent); }
+
 .layout {
   display: flex;
   flex: 1;
@@ -418,6 +503,7 @@ select:hover { border-color: var(--blue); }
 .btn-green     { background: var(--green);  color: #000; }
 .btn-red       { background: var(--red);    color: #fff; }
 .btn-secondary { background: var(--bg3);    color: var(--text); border: 1px solid var(--border); }
+.btn-danger    { background: var(--red);    color: #fff;        border: none; }
 .btn-sweep     { background: var(--orange); color: #000; }
 .btn-sm        { padding: 4px 10px; font-size: 11px; }
 
@@ -527,10 +613,20 @@ textarea:focus { border-color: var(--blue); }
 .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
 
 /* ── Nav Tabs ─────────────────────────────────────────────────────────── */
+.nav-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  padding: 0 16px;
+  height: 38px;
+  flex-shrink: 0;
+}
+
 .nav-tabs {
   display: flex;
   gap: 4px;
-  margin-left: 16px;
 }
 
 .nav-tab {
@@ -845,7 +941,7 @@ textarea:focus { border-color: var(--blue); }
 }
 .settings-client-row-grid2 {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr 1fr 1fr;
   gap: 10px;
 }
 .settings-client-row label {
@@ -909,7 +1005,7 @@ textarea:focus { border-color: var(--blue); }
   .setup-card { padding: 20px; }
   .setup-host-port-grid { grid-template-columns: 1fr; }
   .settings-client-row-grid { grid-template-columns: 1fr 1fr; }
-  .settings-client-row-grid2 { grid-template-columns: 1fr; }
+  .settings-client-row-grid2 { grid-template-columns: 1fr 1fr; }
 }
 
 .text-input {
@@ -1017,3 +1113,47 @@ textarea:focus { border-color: var(--blue); }
 .vs-incl   { color: var(--orange); }
 .vs-dim    { color: var(--text-dim); font-weight: 400; }
 .vs-sep    { color: var(--border); }
+
+/* ── Duplicate ticket detection ───────────────────────────────────────── */
+.dup-ticket-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.dup-ticket-row:last-of-type { border-bottom: none; }
+.dup-keep { opacity: 0.6; }
+.dup-key  { font-family: monospace; font-weight: 600; color: var(--accent); min-width: 110px; text-decoration: none; }
+.dup-key:hover { text-decoration: underline; }
+.dup-status { color: var(--text-dim); font-size: 12px; flex: 1; }
+.dup-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 3px;
+  letter-spacing: 0.4px;
+}
+.dup-badge-keep { background: var(--green-tint); color: var(--green); border: 1px solid var(--green); }
+.dup-badge-dup  { background: var(--red-tint,#3d1a1a); color: var(--red); border: 1px solid var(--red); }
+
+/* ── SSL Checker ──────────────────────────────────────────────────────── */
+.ssl-badge {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 12px;
+}
+.ssl-valid   { background: var(--green-tint); color: var(--green); }
+.ssl-expired { background: var(--red-tint,#3d1a1a); color: var(--red); }
+.ssl-nocert  { background: #3a2e00; color: #c8a020; }
+.ssl-error   { background: var(--bg3); color: var(--text-dim); }
+
+.ssl-status-badge {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+}

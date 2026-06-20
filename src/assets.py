@@ -77,63 +77,66 @@ def cross_reference(asset_entries: List[str], scan_hosts: List[Dict]) -> Dict:
     """
     Cross-reference client asset list against Nessus scan hosts.
 
-    Works with individual IPs, small subnets (/24, /16, etc.) and large
-    subnets (/8 or wider) — uses containment checks instead of expanding
-    every address, so memory usage stays flat regardless of subnet size.
+    Each scope entry (IP or subnet of any size) counts as exactly 1.
+    A subnet is "reachable" if Nessus found at least one host inside it.
+    A subnet is "not reachable" if Nessus found zero hosts inside it.
 
-    Returns three categories:
-      in_scope_scanned  — fell within asset scope AND appeared in Nessus scan
-      in_scope_missed   — fell within asset scope but NOT seen by Nessus
-      out_of_scope      — Nessus found it but it is NOT in asset scope
+    Returns:
+      reachable     — scope entries where Nessus found at least 1 host
+      not_reachable — scope entries where Nessus found nothing
+      out_of_scope  — IPs Nessus found that are NOT in any scope entry
     """
-    scope = _parse_scope(asset_entries)
     scanned_ips = sorted({h["ip"] for h in scan_hosts if h.get("ip")})
     scanned_set = set(scanned_ips)
 
-    # Partition every scanned IP into in-scope / out-of-scope
-    in_scope_scanned = [ip for ip in scanned_ips if _in_scope(ip, scope)]
-    out_of_scope     = [ip for ip in scanned_ips if not _in_scope(ip, scope)]
+    # Pre-convert all scanned IPs to ip_address objects once — avoids
+    # re-parsing the same string thousands of times across scope entries.
+    scanned_addrs: Dict[str, ipaddress.IPv4Address] = {}
+    for ip in scanned_ips:
+        try:
+            scanned_addrs[ip] = ipaddress.ip_address(ip)
+        except ValueError:
+            pass
 
-    # Build the missed list: asset addresses not seen by Nessus
-    missed: List[str] = []
-    for net in scope:
-        if net.num_addresses == 1:
-            # Single host (/32 or /128)
-            ip = str(net.network_address)
-            if ip not in scanned_set:
-                missed.append(ip)
-        elif net.num_addresses <= _ENUM_LIMIT:
-            # Small subnet — enumerate individual host addresses
-            for host in net.hosts():
-                if str(host) not in scanned_set:
-                    missed.append(str(host))
-        else:
-            # Large subnet — impractical to list every missing IP.
-            # Report the subnet itself so the operator knows it wasn't
-            # fully covered, without flooding the output.
-            scanned_in_net = [ip for ip in scanned_set if _in_scope(ip, [net])]
-            missed_count   = net.num_addresses - len(scanned_in_net)
-            if missed_count > 0:
-                missed.append(
-                    f"{net}  "
-                    f"[{scanned_in_net.__len__()} scanned / {net.num_addresses} total — "
-                    f"{missed_count} not reached]"
-                )
+    valid_nets = []
+    not_reachable: List[str] = []
 
-    # Count of distinct "scope positions" (hosts for small nets, addresses for large)
-    total_asset = 0
-    for net in scope:
-        total_asset += net.num_addresses
+    for entry in asset_entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            net = ipaddress.ip_network(entry, strict=False)
+            valid_nets.append(net)
+            hits = [ip for ip, addr in scanned_addrs.items() if addr in net]
+            if not hits:
+                # Preserve original entry string (don't expand IP to /32)
+                label = entry if '/' not in entry and net.prefixlen == 32 else str(net)
+                not_reachable.append(label)
+        except ValueError:
+            log.warning("Could not parse scope entry: %s", entry)
+
+    # Reachable = all Nessus hosts that fall within any scope entry
+    reachable = sorted(
+        ip for ip, addr in scanned_addrs.items()
+        if any(addr in net for net in valid_nets)
+    )
+
+    # Out of scope = Nessus hosts not in any scope entry
+    out_of_scope = sorted(
+        ip for ip, addr in scanned_addrs.items()
+        if not any(addr in net for net in valid_nets)
+    )
 
     return {
-        "in_scope_scanned": sorted(in_scope_scanned),
-        "in_scope_missed":  sorted(missed),
-        "out_of_scope":     sorted(out_of_scope),
+        "reachable":     reachable,
+        "not_reachable": sorted(not_reachable),
+        "out_of_scope":  out_of_scope,
         "counts": {
-            "in_scope_scanned": len(in_scope_scanned),
-            "in_scope_missed":  len(missed),
-            "out_of_scope":     len(out_of_scope),
-            "total_asset":      total_asset,
-            "total_scanned":    len(scanned_ips),
+            "reachable":     len(reachable),
+            "not_reachable": len(not_reachable),
+            "out_of_scope":  len(out_of_scope),
+            "total_scope":   len(valid_nets),
+            "total_scanned": len(scanned_ips),
         },
     }

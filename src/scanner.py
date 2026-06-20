@@ -30,13 +30,16 @@ APP_LOGS: List[str] = []
 
 # Signals the background poll thread to wake up immediately
 _wake_poll = threading.Event()
+_wake_poll_secondary = threading.Event()
 
 # Set to tell the current poll_jira() thread to exit its loop (used when
 # reloading config at runtime — see main.reload_runtime_config())
 _poll_stop = threading.Event()
+_poll_stop_secondary = threading.Event()
 
 # Incremented after every completed poll cycle — lets the frontend detect completion
 _poll_count: int = 0
+_poll_count_secondary: int = 0
 
 # Per-client queues — one worker per client, but scan and triage jobs are
 # kept in separate queues so a manual scan never waits behind a triage
@@ -86,7 +89,8 @@ def _build_triage_command(rule, ip: Optional[str], port: Optional[int]) -> Optio
 
 
 def _queue_ticket(ticket: Dict[str, Any], client_label: str,
-                  source: str = "poll", manual: bool = False) -> str:
+                  source: str = "poll", manual: bool = False,
+                  session: str = "axian") -> str:
     """Create a queued job from a Jira ticket. Returns job_id.
 
     manual=True marks the job status as 'manual' (no scan command will be run;
@@ -170,6 +174,7 @@ def _queue_ticket(ticket: Dict[str, Any], client_label: str,
         "completed_at": None,
         "jira_updated": False,
         "source": source,            # "poll" | "sweep" | "manual"
+        "session": session,          # "axian" | "non_axian"
     }
 
     with _lock:
@@ -516,11 +521,15 @@ def cancel_all_triage(client_label: Optional[str] = None) -> dict:
     return {"cancelled_triage": len(pending)}
 
 
-def run_poll_cycle(cfg: Config, jira_client) -> None:
+def run_poll_cycle(cfg: Config, jira_client, session: str = "axian") -> None:
     """Fetch current Remediated tickets from Jira, queue new ones, remove stale ones."""
-    global _poll_count
-    _app_log("Polling Jira for remediated tickets…")
-    for client in cfg.clients:
+    global _poll_count, _poll_count_secondary
+    tag = "" if session == "axian" else "[Secondary] "
+    clients = cfg.clients if session == "axian" else (cfg.clients_secondary or [])
+    if not clients:
+        return
+    _app_log(f"{tag}Polling Jira for remediated tickets…")
+    for client in clients:
         try:
             tickets = jira_client.get_remediated_tickets(client.label)
             current_keys = {t["key"] for t in tickets}
@@ -536,40 +545,44 @@ def run_poll_cycle(cfg: Config, jira_client) -> None:
                 # everything else (APP, WEB, NET, OSINT, …) goes to manual review.
                 testtype = (ticket.get("testtype") or "").upper()
                 is_manual = testtype not in jira_client.SCANNABLE_TYPES
-                job_id = _queue_ticket(ticket, client.label, manual=is_manual)
+                job_id = _queue_ticket(ticket, client.label, manual=is_manual, session=session)
                 new_count += 1
                 rule = JOBS[job_id].get("rule_name")
                 if is_manual:
                     _app_log(
-                        f"Queued (manual): {key} ({client.label}) | "
+                        f"{tag}Queued (manual): {key} ({client.label}) | "
                         f"TestType: {testtype or 'unknown'}"
                     )
                 else:
                     _app_log(
-                        f"Queued: {key} ({client.label}) | "
+                        f"{tag}Queued: {key} ({client.label}) | "
                         f"IP: {JOBS[job_id].get('ip')} | Rule: {rule or 'none'}"
                     )
 
             total = len(tickets)
             if new_count:
-                _app_log(f"[{client.label}] {new_count} new ticket(s) queued ({total} remediated total)")
+                _app_log(f"{tag}[{client.label}] {new_count} new ticket(s) queued ({total} remediated total)")
             else:
-                _app_log(f"[{client.label}] {total} remediated ticket(s) found — 0 new")
+                _app_log(f"{tag}[{client.label}] {total} remediated ticket(s) found — 0 new")
 
             with _lock:
                 for job_id, job in list(JOBS.items()):
                     if (job["client_label"] == client.label
+                            and job.get("session", "axian") == session
                             and job.get("source", "poll") == "poll"
                             and job["ticket_key"] not in current_keys
                             and job["status"] != "scanning"):
                         del JOBS[job_id]
                         SEEN_KEYS.discard(job["ticket_key"])
-                        _app_log(f"Cleared: {job['ticket_key']} — no longer Remediated in Jira")
+                        _app_log(f"{tag}Cleared: {job['ticket_key']} — no longer Remediated in Jira")
 
         except Exception as exc:
-            _app_log(f"[ERROR] Poll failed for {client.label}: {exc}")
+            _app_log(f"[ERROR] {tag}Poll failed for {client.label}: {exc}")
 
-    _poll_count += 1  # signal completion to any waiters
+    if session == "axian":
+        _poll_count += 1
+    else:
+        _poll_count_secondary += 1
 
 
 def poll_jira(cfg: Config):
@@ -580,6 +593,18 @@ def poll_jira(cfg: Config):
     _app_log("Jira poller started — polling every %ds" % cfg.jira.poll_interval)
     while not _poll_stop.is_set():
         _wake_poll.clear()
-        run_poll_cycle(cfg, jira_client)
+        run_poll_cycle(cfg, jira_client, session="axian")
         _wake_poll.wait(timeout=cfg.jira.poll_interval)
     _app_log("Jira poller stopped")
+
+
+def poll_jira_secondary(cfg: Config):
+    """Background thread for the Non-Axian (Jira Server/DC) session."""
+    from .jira_client_v2 import JiraClientV2
+    jira_client = JiraClientV2(cfg.jira_secondary)
+    _app_log(f"Secondary Jira poller started — polling every {cfg.jira_secondary.poll_interval}s")
+    while not _poll_stop_secondary.is_set():
+        _wake_poll_secondary.clear()
+        run_poll_cycle(cfg, jira_client, session="non_axian")
+        _wake_poll_secondary.wait(timeout=cfg.jira_secondary.poll_interval)
+    _app_log("Secondary Jira poller stopped")

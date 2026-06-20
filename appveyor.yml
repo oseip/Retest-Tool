@@ -1,0 +1,15 @@
+version: 1.0.{build}
+image: Visual Studio 2022
+
+build: off
+
+install:
+  - pip install -r requirements.txt pyinstaller
+
+build_script:
+  - pyinstaller retest.spec
+  - move dist\retest-tool.exe dist\retest-tool-windows.exe
+
+artifacts:
+  - path: dist\retest-tool-windows.exe
+    name: retest-tool-windows

@@ -3,21 +3,27 @@ import calendar
 import json
 import logging
 import os
+import queue as _queue_mod
 import random
 import sys
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+import csv
+import io
+import tempfile
+from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .config import load_config
 from .jira_client import JiraClient
+from .jira_client_v2 import JiraClientV2
 from . import scanner, connections
 
 LOG_DIR = "data/logs"
@@ -58,13 +64,23 @@ CONFIG_PATH = "config/config.yaml"
 if os.path.exists(CONFIG_PATH):
     cfg = load_config(CONFIG_PATH)
     jira = JiraClient(cfg.jira)
+    jira_secondary = JiraClientV2(cfg.jira_secondary) if cfg.jira_secondary else None
 else:
     cfg = None
     jira = None
+    jira_secondary = None
     log.warning("No %s found — serving first-run Settings page until setup completes.", CONFIG_PATH)
+
+# Active session: "axian" | "non_axian"
+active_session: str = "axian"
 
 app = FastAPI(title="Nemesis")
 app.mount("/static", StaticFiles(directory=_resource_path("frontend")), name="static")
+
+# ── Batch-scan streaming state ─────────────────────────────────────────────
+_BATCH_QUEUES:  dict = {}   # scan_id → queue.Queue
+_BATCH_CANCELS: dict = {}   # scan_id → threading.Event
+_BATCH_LOCK = threading.Lock()
 
 from . import setup as setup_mod
 app.include_router(setup_mod.router)
@@ -79,17 +95,64 @@ from . import tunnel_api
 app.include_router(tunnel_api.router)
 
 _poller_thread: Optional[threading.Thread] = None
+_poller_thread_secondary: Optional[threading.Thread] = None
 _reload_lock = threading.Lock()
 
 
+def _jira_for_label(label: str):
+    """Return the Jira client that owns this client label."""
+    if jira_secondary and cfg.clients_secondary and any(c.label == label for c in cfg.clients_secondary):
+        return jira_secondary
+    return jira
+
+
+def _jira_for_job(job: dict):
+    """Return the Jira client that owns this job's ticket."""
+    if job.get("session") == "non_axian" and jira_secondary:
+        return jira_secondary
+    return jira
+
+
+def _get_client(label: str):
+    """Find a ClientConfig by label across both sessions. Returns (client, session)."""
+    c = next((c for c in cfg.clients if c.label == label), None)
+    if c:
+        return c, "axian"
+    c = next((c for c in (cfg.clients_secondary or []) if c.label == label), None)
+    if c:
+        return c, "non_axian"
+    return None, None
+
+
 def _start_poller_thread():
-    global _poller_thread
-    # Seed all clients as disconnected
-    for c in cfg.clients:
-        connections._status[c.label] = "disconnected"
+    global _poller_thread, _poller_thread_secondary
+    # All active client labels across both sessions
+    all_clients = list(cfg.clients) + list(cfg.clients_secondary or [])
+    current_labels = {c.label for c in all_clients}
+    with connections._lock:
+        # Remove any clients that no longer exist in config
+        for stale in [lbl for lbl in list(connections._status) if lbl not in current_labels]:
+            conn = connections._pool.pop(stale, None)
+            del connections._status[stale]
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        # Seed clients as disconnected if not already tracked
+        for c in all_clients:
+            connections._status.setdefault(c.label, "disconnected")
+
+    # Primary (Axian) poller
     t = threading.Thread(target=scanner.poll_jira, args=(cfg,), daemon=True)
     t.start()
     _poller_thread = t
+
+    # Secondary (Non-Axian) poller — only if configured
+    if cfg.jira_secondary and cfg.clients_secondary:
+        t2 = threading.Thread(target=scanner.poll_jira_secondary, args=(cfg,), daemon=True)
+        t2.start()
+        _poller_thread_secondary = t2
 
 
 @app.on_event("startup")
@@ -101,21 +164,28 @@ def _start_poller():
 
 
 def reload_runtime_config():
-    """Re-read config.yaml and swap in a fresh Jira client + poller thread,
+    """Re-read config.yaml and swap in fresh Jira clients + poller threads,
     so a Settings save takes effect immediately without restarting the app."""
-    global cfg, jira
+    global cfg, jira, jira_secondary
     with _reload_lock:
+        # Stop both pollers
         scanner._poll_stop.set()
-        scanner._wake_poll.set()  # wake the old thread so it notices the stop right away
+        scanner._wake_poll.set()
+        scanner._poll_stop_secondary.set()
+        scanner._wake_poll_secondary.set()
         if _poller_thread is not None:
             _poller_thread.join(timeout=10)
+        if _poller_thread_secondary is not None:
+            _poller_thread_secondary.join(timeout=10)
 
         cfg = load_config(CONFIG_PATH)
         jira = JiraClient(cfg.jira)
+        jira_secondary = JiraClientV2(cfg.jira_secondary) if cfg.jira_secondary else None
 
         scanner._poll_stop.clear()
+        scanner._poll_stop_secondary.clear()
         _start_poller_thread()
-        scanner._app_log("Configuration reloaded — Jira client and poller restarted with new settings")
+        scanner._app_log("Configuration reloaded — Jira clients and pollers restarted with new settings")
 
 
 # ── Static / UI ────────────────────────────────────────────────────────────
@@ -157,14 +227,51 @@ def serve_setup_js():
 
 @app.get("/api/config")
 def get_config():
+    if active_session == "non_axian" and cfg.jira_secondary:
+        return {"retest_status": cfg.jira_secondary.retest_status}
     return {"retest_status": cfg.jira.retest_status}
+
+
+# ── Session switching ───────────────────────────────────────────────────────
+
+class SessionRequest(BaseModel):
+    session: str  # "axian" | "non_axian"
+
+
+@app.get("/api/session")
+def get_session():
+    return {
+        "active": active_session,
+        "non_axian_configured": bool(
+            cfg and cfg.jira_secondary
+            and cfg.jira_secondary.url
+            and cfg.jira_secondary.api_token
+            and cfg.clients_secondary
+        ),
+    }
+
+
+@app.post("/api/session")
+def set_session(req: SessionRequest):
+    global active_session
+    if req.session not in ("axian", "non_axian"):
+        raise HTTPException(400, "session must be 'axian' or 'non_axian'")
+    if req.session == "non_axian":
+        if not (cfg and cfg.jira_secondary and cfg.jira_secondary.url and cfg.jira_secondary.api_token):
+            raise HTTPException(400, "Non-Axian Jira is not configured yet — add it in Settings first.")
+        if not cfg.clients_secondary:
+            raise HTTPException(400, "No Non-Axian clients configured — add them in Settings first.")
+    active_session = req.session
+    scanner._app_log(f"Session switched to: {active_session}")
+    return {"ok": True, "active": active_session}
 
 
 # ── Clients ────────────────────────────────────────────────────────────────
 
 @app.get("/api/clients")
 def list_clients():
-    return [{"label": c.label, "name": c.name} for c in cfg.clients]
+    clients = cfg.clients if active_session == "axian" else (cfg.clients_secondary or [])
+    return [{"label": c.label, "name": c.name} for c in clients]
 
 
 # ── Jobs ───────────────────────────────────────────────────────────────────
@@ -179,7 +286,7 @@ _SLIM_JOB_FIELDS = [
     "ticket_severity", "ticket_technology", "client_label", "ip", "port",
     "rule_name", "scan_tool", "status", "verdict", "verdict_reason",
     "created_at", "completed_at", "jira_updated", "source",
-    "triage", "triage_note",
+    "triage", "triage_note", "session",
 ]
 
 
@@ -189,6 +296,7 @@ def list_jobs():
         return [
             {k: job.get(k) for k in _SLIM_JOB_FIELDS}
             for job in scanner.JOBS.values()
+            if job.get("session", "axian") == active_session
         ]
 
 
@@ -372,8 +480,10 @@ class AddTicketsRequest(BaseModel):
 def add_tickets(req: AddTicketsRequest):
     """Fetch one or more tickets from Jira by key and queue them for scanning,
     regardless of their current Jira status."""
-    if not any(c.label == req.client_label for c in cfg.clients):
+    client_cfg, client_session = _get_client(req.client_label)
+    if not client_cfg:
         raise HTTPException(400, f"Unknown client label: {req.client_label}")
+    jira_client = _jira_for_label(req.client_label)
 
     results = []
     for raw in req.keys:
@@ -390,9 +500,9 @@ def add_tickets(req: AddTicketsRequest):
             })
             continue
         try:
-            ticket = jira.get_ticket(key)
+            ticket = jira_client.get_ticket(key)
             scanner.SEEN_KEYS.add(key)
-            job_id = scanner._queue_ticket(ticket, req.client_label, source="manual")
+            job_id = scanner._queue_ticket(ticket, req.client_label, source="manual", session=client_session)
             rule = scanner.JOBS[job_id].get("rule_name")
             scanner._app_log(
                 f"Manual add: {key} ({req.client_label}) | "
@@ -428,10 +538,11 @@ def transition_ticket(req: TransitionRequest):
         raise HTTPException(404, "Job not found")
 
     ticket_key = job["ticket_key"]
+    jira_client = _jira_for_job(job)
     try:
         if req.comment:
-            jira.add_comment(ticket_key, req.comment)
-        jira.transition(ticket_key, req.to_status)
+            jira_client.add_comment(ticket_key, req.comment)
+        jira_client.transition(ticket_key, req.to_status)
         # Remove job immediately — don't wait for poll to clean it up.
         # Jira's search index lags after a transition, so the poll would
         # still see the ticket as Remediated and leave it in the queue.
@@ -452,26 +563,67 @@ class FastTrackRequest(BaseModel):
 @app.post("/api/jobs/{job_id}/fast-track")
 def fast_track_ticket(job_id: str, req: FastTrackRequest):
     """
-    Chain all intermediate Jira transitions required to reach *target* from
-    the ticket's current status, then apply *target* itself.
+    Two-phase fast-track.
 
-    Example: ticket in 'Reported' + target='Fixed'
-      → In Progress → Remediated → Fixed  (3 transitions, 1 API call)
+    Phase 1 (ticket not yet at retest/Remediated status):
+      Advance to Remediated using the right intermediate chain, then STOP.
+      Returns {ok, partial:true, current_status, message} — job stays on board.
+
+    Phase 2 (ticket already at Remediated):
+      Apply req.target (Fixed / Not Fixed) directly.
+      Returns {ok, partial:false, chain} — job removed from board.
+
+    No comment is ever posted on Jira if any transition fails.
     """
     job = scanner.JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
 
-    ticket_key = job["ticket_key"]
+    ticket_key   = job["ticket_key"]
+    jira_client  = _jira_for_job(job)
+    retest_status = jira_client.cfg.retest_status   # e.g. "Remediated"
+
+    current_status = (job.get("ticket_status") or "").strip()
+    at_remediated  = current_status.lower() == retest_status.lower()
+
+    # Phase 1 → advance to Remediated; Phase 2 → go to final target
+    effective_target = req.target if at_remediated else retest_status
+
     try:
-        completed = jira.fast_track(ticket_key, req.target, comment=req.comment or "")
-        with scanner._lock:
-            scanner.JOBS.pop(job_id, None)
-            scanner.SEEN_KEYS.discard(ticket_key)
-        scanner._app_log(
-            f"Fast-track: {ticket_key} → {' → '.join(completed)}"
+        completed = jira_client.fast_track(
+            ticket_key, effective_target, comment=req.comment or ""
         )
-        return {"ok": True, "ticket": ticket_key, "chain": completed}
+
+        if not at_remediated:
+            # Phase 1 complete — update cached status, keep job on board
+            with scanner._lock:
+                if job_id in scanner.JOBS:
+                    scanner.JOBS[job_id]["ticket_status"] = retest_status
+            scanner._app_log(
+                f"Fast-track phase 1: {ticket_key} → {' → '.join(completed)} "
+                f"[now {retest_status}]"
+            )
+            return {
+                "ok": True,
+                "partial": True,
+                "ticket": ticket_key,
+                "chain": completed,
+                "current_status": retest_status,
+                "message": (
+                    f"Ticket moved to {retest_status}. "
+                    f"Click again to mark as {req.target}."
+                ),
+            }
+        else:
+            # Phase 2 complete — remove job
+            with scanner._lock:
+                scanner.JOBS.pop(job_id, None)
+                scanner.SEEN_KEYS.discard(ticket_key)
+            scanner._app_log(
+                f"Fast-track phase 2: {ticket_key} → {' → '.join(completed)}"
+            )
+            return {"ok": True, "partial": False, "ticket": ticket_key, "chain": completed}
+
     except Exception as exc:
         completed = getattr(exc, "completed", [])
         raise HTTPException(500, {
@@ -479,6 +631,187 @@ def fast_track_ticket(job_id: str, req: FastTrackRequest):
             "completed": completed,
         })
 
+
+@app.post("/api/sweep/advance")
+def sweep_advance():
+    """
+    Advance swept tickets whose scan completed with a FIXED verdict and that are
+    not yet at the retest (Remediated) Jira status.
+
+    Only completed+fixed tickets are eligible — scanning, queued, manual, and
+    tickets with any other verdict (not_fixed, inconclusive, error) are skipped.
+    Tickets already at Remediated are also skipped.
+
+    Returns {ok, succeeded:[...], failed:[...], skipped:[...]}
+    """
+    retest_status = cfg.jira.retest_status  # "Remediated"
+
+    # Snapshot candidates so we don't iterate while modifying.
+    # Only include jobs that:
+    #   • come from the sweep section
+    #   • have a completed scan with verdict == "fixed"
+    #   • are not already at Remediated in Jira
+    candidates = [
+        j for j in list(scanner.JOBS.values())
+        if j.get("source") == "sweep"
+        and j.get("status") == "completed"
+        and j.get("verdict") == "fixed"
+        and (j.get("ticket_status") or "").lower() != retest_status.lower()
+    ]
+
+    succeeded: list = []
+    failed:    list = []
+    skipped:   list = []
+
+    def _advance(job):
+        jid = job["id"]
+        key = job["ticket_key"]
+        jira_client  = _jira_for_job(job)
+        rs = jira_client.cfg.retest_status
+        current = (job.get("ticket_status") or "").lower().strip()
+
+        if current == rs.lower():
+            skipped.append({"ticket_key": key, "reason": "already at Remediated"})
+            return
+        try:
+            completed = jira_client.fast_track(key, rs)
+            with scanner._lock:
+                if jid in scanner.JOBS:
+                    scanner.JOBS[jid]["ticket_status"] = rs
+            scanner._app_log(
+                f"Sweep advance: {key} → {' → '.join(completed)} [now {rs}]"
+            )
+            succeeded.append({"ticket_key": key, "chain": completed})
+        except Exception as exc:
+            partial = getattr(exc, "completed", [])
+            scanner._app_log(f"[ERROR] Sweep advance: {key}: {exc}")
+            failed.append({
+                "ticket_key": key,
+                "error": str(exc),
+                "completed": partial,
+            })
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(_advance, j) for j in candidates]
+        for f in as_completed(futures):
+            f.result()
+
+    scanner._app_log(
+        f"Sweep advance complete: {len(succeeded)} advanced, "
+        f"{len(failed)} failed, {len(skipped)} skipped"
+    )
+    return {"ok": True, "succeeded": succeeded, "failed": failed, "skipped": skipped}
+
+
+
+# ── Bulk fast-track ───────────────────────────────────────────────────────
+
+class BulkFastTrackRequest(BaseModel):
+    job_ids: List[str]
+    target: str  # always "Fixed"; backend applies two-phase logic per job
+
+
+@app.post("/api/jobs/bulk-fast-track")
+def bulk_fast_track_jobs(req: BulkFastTrackRequest):
+    """
+    Fast-track a list of jobs toward *target* using the same two-phase logic
+    as the single-ticket fast-track endpoint.
+
+    Phase 1 — ticket is NOT yet at Remediated:
+        Run the intermediate chain then stop at Remediated.
+        Job stays on the board with ticket_status updated to Remediated.
+        Response: partial=True, current_status="Remediated".
+
+    Phase 2 — ticket IS already at Remediated:
+        Transition directly to *target* (Fixed / Not Fixed).
+        Job is removed from the board.
+        Response: partial=False.
+    """
+    succeeded: list = []
+    failed: list = []
+
+    # Terminal Jira states — ticket is fully resolved, no more transitions needed
+    _TERMINAL = {"fixed", "not fixed", "risk accepted", "closed", "done"}
+
+    def _do(job_id: str):
+        job = scanner.JOBS.get(job_id)
+        if not job:
+            failed.append({"job_id": job_id, "error": "Job not found"})
+            return
+        key = job["ticket_key"]
+        jira_client = _jira_for_job(job)
+        retest = jira_client.cfg.retest_status
+        current = (job.get("ticket_status") or "").strip()
+        at_remediated = current.lower() == retest.lower()
+        effective_target = req.target if at_remediated else retest
+
+        try:
+            completed = jira_client.fast_track(key, effective_target)
+
+            # Fetch live status: an intermediate may have jumped the ticket past the
+            # declared target (e.g. Fix Issue → Fixed when target was Remediated).
+            try:
+                live = jira_client.get_ticket(key)
+                actual_status = (live.get("status") or effective_target).strip()
+            except Exception:
+                actual_status = effective_target
+
+            # Phase 1 (not yet at Remediated): keep job on board so the user
+            # can do phase 2 (→ Fixed / Not Fixed).  Only remove early if an
+            # intermediate jumped the ticket PAST Remediated to a different
+            # terminal state (e.g. Fix Issue → Fixed).
+            # Phase 2 (was already at Remediated): remove when at target or
+            # any terminal.
+            if at_remediated:
+                is_done = (
+                    actual_status.lower() == req.target.lower()
+                    or actual_status.lower() in _TERMINAL
+                )
+            else:
+                # Jumped past Remediated to a different terminal (e.g. → Fixed)?
+                is_done = (
+                    actual_status.lower() in _TERMINAL
+                    and actual_status.lower() != retest.lower()
+                )
+
+            with scanner._lock:
+                if is_done:
+                    # Ticket fully resolved — remove from board
+                    scanner.JOBS.pop(job_id, None)
+                    scanner.SEEN_KEYS.discard(key)
+                elif job_id in scanner.JOBS:
+                    # Phase 1 complete — update cached status, keep on board
+                    scanner.JOBS[job_id]["ticket_status"] = actual_status or retest
+
+            scanner._app_log(
+                f"Bulk fast-track: {key} → {' → '.join(completed)} [now {actual_status}]"
+            )
+            succeeded.append({
+                "job_id": job_id,
+                "ticket_key": key,
+                "chain": completed,
+                "partial": not is_done,
+                "current_status": actual_status,
+            })
+        except Exception as exc:
+            partial_chain = getattr(exc, "completed", [])
+            scanner._app_log(f"[ERROR] Bulk fast-track: {key}: {exc}")
+            failed.append({
+                "job_id": job_id,
+                "ticket_key": key,
+                "error": str(exc),
+                "completed": partial_chain,
+            })
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(_do, jid) for jid in req.job_ids]
+        for f in as_completed(futures):
+            f.result()
+
+    scanner._app_log(
+        f"Bulk fast-track complete: {len(succeeded)} advanced, {len(failed)} failed"
+    )
+    return {"ok": True, "succeeded": succeeded, "failed": failed}
 
 
 # ── Bulk transition ────────────────────────────────────────────────────────
@@ -554,10 +887,15 @@ def transition_bulk():
 
     def _do(job, target_status):
         key = job["ticket_key"]
+        jira_client = _jira_for_job(job)  # session-aware: Axian or Non-Axian
         try:
-            jira.transition(key, target_status)
+            jira_client.transition(key, target_status)
+            # Remove the job immediately so the queue clears without waiting for
+            # the next poll cycle.  SEEN_KEYS is also cleared so a future poll
+            # can re-queue the ticket if it somehow returns (e.g. Jira rejection).
             with scanner._lock:
-                scanner.JOBS[job["id"]]["jira_updated"] = True
+                scanner.JOBS.pop(job["id"], None)
+                scanner.SEEN_KEYS.discard(key)
             scanner._app_log(f"Bulk transition: {key} → {target_status}")
             succeeded.append({"ticket_key": key, "to_status": target_status})
         except Exception as exc:
@@ -618,8 +956,17 @@ def generate_report(client: str, month: str):
     start = f"{year}/{mon:02d}/01 00:00"
     end   = f"{year}/{mon:02d}/{last_day} 23:59"
 
-    base = f'project = {cfg.jira.project} AND labels = "{client}"'
-    rf   = '"vulnerability_Rating[Short text]"'
+    # Pick the right Jira client and build the right base JQL for this client.
+    # Axian:     project = AXG AND labels = "<client_label>"
+    # Non-Axian: project = <client_label>   (label IS the project key)
+    _, client_session = _get_client(client)
+    jira_client = _jira_for_label(client)
+    if client_session == "non_axian":
+        base = f'project = {client}'
+    else:
+        base = f'project = {cfg.jira.project} AND labels = "{client}"'
+
+    rf   = jira_client.severity_jql_field
     nr   = f'AND created >= "{start}" AND created <= "{end}"'
     or_  = f'AND created <= "{end}" AND status NOT IN (Fixed, "Risk Accepted")'
 
@@ -644,7 +991,7 @@ def generate_report(client: str, month: str):
 
     def run_query(key: str, extra: str) -> tuple:
         try:
-            return key, jira.count_jql(f"{base} {extra}")
+            return key, jira_client.count_jql(f"{base} {extra}")
         except Exception as exc:
             log.warning("Report query failed [%s]: %s", key, exc)
             return key, -1
@@ -663,16 +1010,16 @@ def generate_report(client: str, month: str):
     new_vulnerabilities = {"is_sample": False, "items": []}
     try:
         if results["new_total"] > 0:
-            issues = jira.search_jql(f"{base} {nr}")
+            issues = jira_client.search_jql(f"{base} {nr}")
             new_vulnerabilities["items"] = [_to_report_item(i) for i in issues]
         else:
             sample: list = []
             carry = 0
             for tier in ("critical", "high", "medium", "low"):
                 needed = 2 + carry
-                pool = jira.search_jql(f'{base} {or_} AND {rf} ~ {tier}')
-                random.shuffle(pool)
-                taken = pool[:needed]
+                tier_issues = jira_client.search_jql(f'{base} {or_} AND {rf} ~ {tier}')
+                random.shuffle(tier_issues)
+                taken = tier_issues[:needed]
                 sample.extend(taken)
                 carry = needed - len(taken)
             new_vulnerabilities["is_sample"] = True
@@ -708,11 +1055,505 @@ def generate_report(client: str, month: str):
     return report
 
 
+_weekly_report_cache: dict = {}   # (client, week_start) → result; past weeks never change
+
+
+@app.get("/api/report/weekly")
+def generate_weekly_report(client: str, day: str):
+    """
+    Run 13 JQL count queries for the ISO week that contains *day*.
+    day format: YYYY-MM-DD  (any day in the target week)
+    The week must have ended (its Sunday must be in the past).
+    """
+    try:
+        picked = datetime.strptime(day, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, "day must be YYYY-MM-DD (e.g. 2026-06-10)")
+
+    # Derive Monday–Sunday of the ISO week that contains picked
+    week_start: date = picked - timedelta(days=picked.weekday())   # Monday
+    week_end:   date = week_start + timedelta(days=6)              # Sunday
+
+    today = date.today()
+    if week_end >= today:
+        raise HTTPException(400, "Report data is only available after the week has ended")
+
+    cache_key = (client, str(week_start))
+    if cache_key in _weekly_report_cache:
+        return _weekly_report_cache[cache_key]
+
+    start = f"{week_start.year}/{week_start.month:02d}/{week_start.day:02d} 00:00"
+    end   = f"{week_end.year}/{week_end.month:02d}/{week_end.day:02d} 23:59"
+
+    # Pick the right Jira client (mirrors monthly report)
+    _, client_session = _get_client(client)
+    jira_client = _jira_for_label(client)
+    if client_session == "non_axian":
+        base = f'project = {client}'
+    else:
+        base = f'project = {cfg.jira.project} AND labels = "{client}"'
+
+    rf  = jira_client.severity_jql_field
+    nr  = f'AND created >= "{start}" AND created <= "{end}"'
+    or_ = f'AND created <= "{end}" AND status NOT IN (Fixed, "Risk Accepted")'
+
+    queries = {
+        "new_total":        nr,
+        "new_critical":     f'{nr} AND {rf} ~ critical',
+        "new_high":         f'{nr} AND {rf} ~ high',
+        "new_medium":       f'{nr} AND {rf} ~ medium',
+        "new_low":          f'{nr} AND {rf} ~ low',
+        "fixed_this_week":  f'AND resolutiondate >= "{start}" AND resolutiondate <= "{end}" AND status = Fixed',
+        "open_total":       or_,
+        "open_critical":    f'{or_} AND {rf} ~ critical',
+        "open_high":        f'{or_} AND {rf} ~ high',
+        "open_medium":      f'{or_} AND {rf} ~ medium',
+        "open_low":         f'{or_} AND {rf} ~ low',
+        "risk_accepted":    f'AND created <= "{end}" AND status = "Risk Accepted"',
+        "total_fixed":      f'AND created <= "{end}" AND status = Fixed',
+    }
+
+    results: dict = {}
+
+    def run_query(key: str, extra: str) -> tuple:
+        try:
+            return key, jira_client.count_jql(f"{base} {extra}")
+        except Exception as exc:
+            log.warning("Weekly report query failed [%s]: %s", key, exc)
+            return key, -1
+
+    with ThreadPoolExecutor(max_workers=13) as pool:
+        futures = {pool.submit(run_query, k, v): k for k, v in queries.items()}
+        for fut in as_completed(futures):
+            k, v = fut.result()
+            results[k] = v
+
+    # New vulnerabilities list (same fallback logic as monthly)
+    new_vulnerabilities = {"is_sample": False, "items": []}
+    try:
+        if results["new_total"] > 0:
+            issues = jira_client.search_jql(f"{base} {nr}")
+            new_vulnerabilities["items"] = [_to_report_item(i) for i in issues]
+        else:
+            sample: list = []
+            carry = 0
+            for tier in ("critical", "high", "medium", "low"):
+                needed = 2 + carry
+                tier_issues = jira_client.search_jql(f'{base} {or_} AND {rf} ~ {tier}')
+                random.shuffle(tier_issues)
+                taken = tier_issues[:needed]
+                sample.extend(taken)
+                carry = needed - len(taken)
+            new_vulnerabilities["is_sample"] = True
+            new_vulnerabilities["items"] = [_to_report_item(i) for i in sample]
+    except Exception as exc:
+        log.warning("Weekly report new-vulnerabilities query failed: %s", exc)
+        new_vulnerabilities["error"] = str(exc)
+
+    report = {
+        "client":  client,
+        "period":  {
+            "start":      start,
+            "end":        end,
+            "week_start": str(week_start),
+            "week_end":   str(week_end),
+        },
+        "new_vulnerabilities": new_vulnerabilities,
+        "new_tickets": {
+            "total":    results["new_total"],
+            "critical": results["new_critical"],
+            "high":     results["new_high"],
+            "medium":   results["new_medium"],
+            "low":      results["new_low"],
+        },
+        "fixed_this_week": results["fixed_this_week"],
+        "open_tickets": {
+            "total":         results["open_total"],
+            "critical":      results["open_critical"],
+            "high":          results["open_high"],
+            "medium":        results["open_medium"],
+            "low":           results["open_low"],
+            "risk_accepted": results["risk_accepted"],
+        },
+        "total_fixed_to_date": results["total_fixed"],
+    }
+    _weekly_report_cache[cache_key] = report
+    return report
+
+
+# ── Duplicate ticket detection ─────────────────────────────────────────────
+
+def _key_num(key: str) -> int:
+    """Extract numeric part of a Jira key for chronological sorting."""
+    try:
+        return int(key.split("-")[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
+@app.get("/api/duplicates")
+def find_duplicates(client: str):
+    """
+    Fetch all active (non-closed) tickets for a client and group by
+    (first_ip, summary, first_port).  Returns only groups with 2+ tickets.
+    Within each group the lowest-numbered key is the recommended keep.
+    """
+    from collections import defaultdict
+
+    _, client_session = _get_client(client)
+    jira_client = _jira_for_label(client)
+
+    if client_session == "non_axian":
+        jql = (
+            f'project = {client} '
+            f'AND status NOT IN (Fixed, "Risk Accepted", Closed, Done) '
+            f'ORDER BY created ASC'
+        )
+    else:
+        jql = (
+            f'project = {cfg.jira.project} AND labels = "{client}" '
+            f'AND status NOT IN (Fixed, "Risk Accepted", Closed, Done) '
+            f'ORDER BY created ASC'
+        )
+
+    try:
+        tickets = jira_client.search_jql(jql)
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to fetch tickets: {exc}")
+
+    # Group by (first IP, normalised summary, first port)
+    groups: dict = defaultdict(list)
+    for t in tickets:
+        ip      = (t.get("ips")   or [""])[0].strip()
+        port    = (t.get("ports") or [""])[0].strip()
+        summary = (t.get("summary") or "").strip().lower()
+        if not ip or not summary:
+            continue   # can't reliably detect duplicates without at least IP + name
+        groups[(ip, summary, port)].append(t)
+
+    jira_base_url = jira_client.cfg.url.rstrip("/")
+
+    duplicate_groups = []
+    for (ip, summary, port), members in groups.items():
+        if len(members) < 2:
+            continue
+        # Oldest key first = recommended keep
+        sorted_members = sorted(members, key=lambda t: _key_num(t["key"]))
+        duplicate_groups.append({
+            "ip":       ip,
+            "port":     port,
+            "vuln_name": sorted_members[0].get("summary", ""),
+            "keep":     sorted_members[0]["key"],
+            "tickets":  [
+                {**t, "jira_url": f"{jira_base_url}/browse/{t['key']}"}
+                for t in sorted_members
+            ],
+            "count":    len(sorted_members),
+        })
+
+    # Worst offenders first
+    duplicate_groups.sort(key=lambda g: g["count"], reverse=True)
+
+    return {
+        "client":           client,
+        "total_groups":     len(duplicate_groups),
+        "total_duplicates": sum(g["count"] - 1 for g in duplicate_groups),
+        "groups":           duplicate_groups,
+    }
+
+
+# ── Batch Scan ────────────────────────────────────────────────────────────
+
+def _parse_assets(data: bytes, filename: str = "") -> list:
+    """Read IP/Port pairs from an uploaded .xlsx or .csv file.
+    Accepts headers like 'IP', 'ip', 'IP Address' and 'Port', 'port', 'Port Number'.
+    Returns list of {"ip": str, "port": int}.
+    """
+    # Match IP column by "ip" OR "host" so headers like "Hostname", "Host",
+    # "IP Address", "IP/Hostname" are all accepted.
+    _IP_KEYWORDS = ("ip", "host")
+
+    def _find_col(header_row, keyword):
+        return next((i for i, h in enumerate(header_row) if keyword in h), None)
+
+    def _find_ip_col(header_row):
+        return next(
+            (i for i, h in enumerate(header_row)
+             if any(k in h for k in _IP_KEYWORDS)),
+            None,
+        )
+
+    def _from_xlsx(raw):
+        import openpyxl
+        wb   = openpyxl.load_workbook(filename=io.BytesIO(raw), read_only=True, data_only=True)
+        ws   = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            raise ValueError("Excel file is empty")
+        header = [str(c).strip().lower() if c is not None else "" for c in rows[0]]
+        ip_idx   = _find_ip_col(header)
+        port_idx = _find_col(header, "port")
+        if ip_idx is None or port_idx is None:
+            raise ValueError(f"Could not find IP/Host and Port columns. Found: {list(rows[0])}")
+        assets = []
+        for row in rows[1:]:
+            ip = str(row[ip_idx]).strip() if row[ip_idx] is not None else ""
+            if not ip or ip.lower() in ("none", "n/a", ""):
+                continue
+            try:
+                assets.append({"ip": ip, "port": int(row[port_idx])})
+            except (TypeError, ValueError):
+                continue
+        return assets
+
+    def _from_csv(raw):
+        text   = raw.decode("utf-8-sig", errors="replace")
+        reader = csv.DictReader(io.StringIO(text))
+        rows   = list(reader)
+        if not rows:
+            raise ValueError("CSV file is empty")
+        hmap = {k.strip().lower(): k for k in rows[0].keys()}
+        ip_key   = next((hmap[h] for h in hmap if any(k in h for k in _IP_KEYWORDS)), None)
+        port_key = next((hmap[h] for h in hmap if "port" in h), None)
+        if not ip_key or not port_key:
+            raise ValueError(f"Could not find IP/Host and Port columns. Found: {list(rows[0].keys())}")
+        assets = []
+        for row in rows:
+            ip = str(row[ip_key]).strip()
+            if not ip or ip.lower() in ("none", "n/a", ""):
+                continue
+            try:
+                assets.append({"ip": ip, "port": int(row[port_key])})
+            except (TypeError, ValueError):
+                continue
+        return assets
+
+    if (filename or "").lower().endswith(".csv"):
+        return _from_csv(data)
+    try:
+        return _from_xlsx(data)
+    except Exception:
+        return _from_csv(data)
+
+# keep old name as alias so nothing else breaks
+_parse_excel_assets = _parse_assets
+
+
+@app.get("/api/batch-scan/rules")
+def batch_scan_rules():
+    """Return the list of available scan rules for the batch scan dropdown."""
+    from .vuln_rules import RULES
+    return [{"name": r.name, "tool": r.tool} for r in RULES]
+
+
+def _batch_scan_one(kali, ip: str, port: int, rule) -> dict:
+    """Run a scan for one IP:port using the given VulnRule and return a result row."""
+    import re as _re
+    from .vuln_rules import _xml_elem
+
+    job_id   = f"batch_{ip}_{port}_{os.getpid()}"
+    xml_path = f"/tmp/batchscan_{job_id}.xml"
+
+    if rule.tool == "curl":
+        scheme = "https" if port in (443, 8443, 10443) else "http"
+        cmd = (f"curl -sk -m 15 -D - {scheme}://{ip}:{port}{rule.curl_path} 2>&1")
+        stdout, _, _ = kali.exec(cmd, timeout=20)
+        xml_out = ""
+    else:
+        parts = ["nmap", "-Pn", "-T4"]
+        if rule.nmap_script:
+            parts += ["--script", rule.nmap_script]
+        if rule.extra_args:
+            parts += rule.extra_args.split()
+        parts += ["-p", str(port), ip, "-oX", xml_path]
+        cmd = " ".join(parts) + " 2>&1"
+        stdout, _, _ = kali.exec(cmd, timeout=45)
+        xml_out, _, _ = kali.exec(f"cat {xml_path} 2>/dev/null || echo ''", timeout=10)
+        kali.exec(f"rm -f {xml_path}", timeout=5)
+
+    # Parse verdict using the rule's parse function if available
+    if rule.parse:
+        verdict, detail = rule.parse(stdout, xml_out)
+    else:
+        verdict, detail = "inconclusive", "No parser defined for this rule"
+
+    # For cert rules extract valid_to / days
+    not_after = _xml_elem(xml_out, "notAfter") if xml_out else None
+    valid_to  = None
+    days_val  = None
+    if not_after:
+        try:
+            expiry   = datetime.strptime(not_after[:10], "%Y-%m-%d")
+            valid_to = not_after[:19]
+            days_val = (expiry.date() - date.today()).days
+        except ValueError:
+            pass
+    else:
+        m = _re.search(r"Not valid after\s*:\s*(\d{4}-\d{2}-\d{2})", stdout)
+        if m:
+            try:
+                expiry   = datetime.strptime(m.group(1), "%Y-%m-%d")
+                valid_to = m.group(1)
+                days_val = (expiry.date() - date.today()).days
+            except ValueError:
+                pass
+
+    verdict_label = {"fixed": "✅ Not Vulnerable", "not_fixed": "❌ Vulnerable",
+                     "inconclusive": "⚠️ Inconclusive"}.get(verdict, verdict)
+    return {
+        "ip":       ip,
+        "port":     port,
+        "valid_to": valid_to or "N/A",
+        "days":     days_val if days_val is not None else "N/A",
+        "verdict":  verdict,
+        "status":   verdict_label,
+        "detail":   detail,
+    }
+
+
+@app.post("/api/batch-scan/run")
+async def batch_scan_run(
+    file:      UploadFile = File(...),
+    client:    str        = Form(...),
+    rule_name: str        = Form(...),
+):
+    """Parse the uploaded file, start background scanning, return a scan_id for streaming."""
+    from . import connections
+    from .vuln_rules import RULES
+
+    rule = next((r for r in RULES if r.name == rule_name), None)
+    if not rule:
+        raise HTTPException(400, f"Unknown rule: {rule_name}")
+
+    data = await file.read()
+    fname = file.filename or ""
+    try:
+        assets = _parse_assets(data, fname)
+    except Exception as exc:
+        raise HTTPException(400, f"Could not read file: {exc}")
+
+    if not assets:
+        raise HTTPException(400, "No valid IP/Port rows found in the file")
+
+    kali = connections.get_connection(client)
+    if not kali:
+        raise HTTPException(503, f"No active SSH connection for '{client}'. Connect via Shell tab first.")
+
+    scan_id   = str(uuid.uuid4())
+    q         = _queue_mod.Queue()
+    cancel_ev = threading.Event()
+
+    with _BATCH_LOCK:
+        _BATCH_QUEUES[scan_id]  = q
+        _BATCH_CANCELS[scan_id] = cancel_ev
+
+    def _run_all():
+        def _scan(asset):
+            if cancel_ev.is_set():
+                return None
+            try:
+                return _batch_scan_one(kali, asset["ip"], asset["port"], rule)
+            except Exception as exc:
+                return {
+                    "ip": asset["ip"], "port": asset["port"],
+                    "valid_to": "N/A", "days": "N/A",
+                    "verdict": "inconclusive", "status": "⚠️ Error", "detail": str(exc),
+                }
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = [pool.submit(_scan, a) for a in assets]
+            done_count = 0
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result is not None:
+                    done_count += 1
+                    q.put({"type": "result", "done": done_count, "data": result})
+        q.put({"type": "done"})
+
+    threading.Thread(target=_run_all, daemon=True).start()
+
+    return {"scan_id": scan_id, "total": len(assets), "rule": rule_name}
+
+
+@app.get("/api/batch-scan/stream/{scan_id}")
+async def batch_scan_stream(scan_id: str):
+    """SSE stream — yields one JSON event per completed asset, then a 'done' event."""
+    q = _BATCH_QUEUES.get(scan_id)
+    if q is None:
+        raise HTTPException(404, "Scan not found or already finished")
+
+    async def _gen():
+        loop = asyncio.get_event_loop()
+        try:
+            while True:
+                try:
+                    msg = await loop.run_in_executor(None, lambda: q.get(timeout=60))
+                except _queue_mod.Empty:
+                    yield "data: {\"type\":\"keepalive\"}\n\n"
+                    continue
+                yield f"data: {json.dumps(msg)}\n\n"
+                if msg.get("type") in ("done", "cancelled"):
+                    break
+        finally:
+            with _BATCH_LOCK:
+                _BATCH_QUEUES.pop(scan_id, None)
+                _BATCH_CANCELS.pop(scan_id, None)
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/batch-scan/cancel/{scan_id}")
+async def batch_scan_cancel(scan_id: str):
+    """Signal the running scan to stop."""
+    ev = _BATCH_CANCELS.get(scan_id)
+    if ev:
+        ev.set()
+    q = _BATCH_QUEUES.get(scan_id)
+    if q:
+        q.put({"type": "cancelled"})
+    return {"ok": True}
+
+
+@app.post("/api/batch-scan/export")
+async def batch_scan_export(req: dict):
+    """Download scan results as CSV."""
+    results   = req.get("results", [])
+    rule_name = req.get("rule", "batch_scan")
+    has_cert  = any(r.get("valid_to", "N/A") != "N/A" for r in results)
+
+    fields = ["ip", "port", "status", "detail"]
+    if has_cert:
+        fields = ["ip", "port", "valid_to", "days", "status", "detail"]
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in results:
+        writer.writerow({k: row.get(k, "") for k in fields})
+    buf.seek(0)
+
+    safe_name = "".join(c if c.isalnum() else "_" for c in rule_name)[:40]
+    fname = f"batch_scan_{safe_name}_{date.today().isoformat()}.csv"
+    return StreamingResponse(
+        io.BytesIO(buf.getvalue().encode()),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={fname}"},
+    )
+
+
 # ── SSH connection pool ────────────────────────────────────────────────────
 
 @app.get("/api/ssh/status")
 def ssh_status():
-    return connections.get_status()
+    all_status = connections.get_status()
+    session_labels = {c.label for c in (
+        cfg.clients if active_session == "axian" else (cfg.clients_secondary or [])
+    )}
+    return {k: v for k, v in all_status.items() if k in session_labels}
 
 
 @app.post("/api/ssh/{label}/connect")
@@ -738,11 +1579,13 @@ def ssh_disconnect(label: str):
 
 @app.get("/api/sweep/{label}/preview")
 def sweep_preview(label: str):
-    if not any(c.label == label for c in cfg.clients):
+    client_cfg, _ = _get_client(label)
+    if not client_cfg:
         raise HTTPException(400, f"Unknown client: {label}")
     from .vuln_rules import match_rule
+    jira_client = _jira_for_label(label)
     # Fetch ALL open tickets — no limit; _search_jql pages through everything
-    tickets = jira.get_sweep_tickets(label)
+    tickets = jira_client.get_sweep_tickets(label)
     by_rule: Dict[str, List[dict]] = {}
     queued_manual = 0
     skipped_queued = 0
@@ -776,15 +1619,17 @@ def sweep_preview(label: str):
 
 @app.post("/api/sweep/{label}/run")
 def sweep_run(label: str, body: Optional[SweepRunRequest] = None):
-    if not any(c.label == label for c in cfg.clients):
+    client_cfg, client_session = _get_client(label)
+    if not client_cfg:
         raise HTTPException(400, f"Unknown client: {label}")
     from .vuln_rules import match_rule
     filter_set = set(body.filter_rules) if (body and body.filter_rules) else None
+    jira_client = _jira_for_label(label)
 
     def _do():
         scanner._app_log(f"[Sweep] {label}: fetching all open tickets…")
         try:
-            tickets = jira.get_sweep_tickets(label)
+            tickets = jira_client.get_sweep_tickets(label)
         except Exception as exc:
             scanner._app_log(f"[Sweep] {label}: fetch failed — {exc}")
             return
@@ -799,7 +1644,7 @@ def sweep_run(label: str, body: Optional[SweepRunRequest] = None):
                 continue
             scanner.SEEN_KEYS.add(key)
             is_manual = rule is None
-            job_id = scanner._queue_ticket(ticket, label, source="sweep", manual=is_manual)
+            job_id = scanner._queue_ticket(ticket, label, source="sweep", manual=is_manual, session=client_session)
             if is_manual:
                 scanner._app_log(
                     f"Sweep (manual): {key} ({label}) — no matching rule"
@@ -902,6 +1747,27 @@ def nessus_scans(label: str, folder_id: Optional[int] = None):
         raise HTTPException(500, str(exc))
 
 
+@app.post("/api/nessus/{label}/host-count")
+def nessus_host_count(label: str, req: NessusPullRequest):
+    """Return total host count across selected scans without pulling all data."""
+    client_cfg = next((c for c in cfg.clients if c.label == label), None)
+    if not client_cfg:
+        raise HTTPException(400, f"Unknown client: {label}")
+    conn = connections.get_connection(label)
+    if not conn:
+        raise HTTPException(400, f"SSH not connected for '{label}'")
+    from . import nessus_client as nc
+    total = 0
+    for scan_id in req.scan_ids:
+        try:
+            total += nc.get_scan_host_count(
+                conn, client_cfg.nessus_access_key, client_cfg.nessus_secret_key, scan_id
+            )
+        except Exception:
+            pass
+    return {"total_hosts": total}
+
+
 @app.post("/api/nessus/{label}/pull")
 def nessus_pull(label: str, req: NessusPullRequest):
     """Pull hosts from selected Nessus scans and cross-reference against saved asset list."""
@@ -937,8 +1803,8 @@ def nessus_pull(label: str, req: NessusPullRequest):
 
     scanner._app_log(
         f"[Assets] {label}: {len(all_hosts)} hosts from {len(req.scan_ids)} scan(s) — "
-        f"in-scope: {result['counts']['in_scope_scanned']}, "
-        f"missed: {result['counts']['in_scope_missed']}, "
+        f"reachable: {result['counts']['reachable']}, "
+        f"not reachable: {result['counts']['not_reachable']}, "
         f"OOS: {result['counts']['out_of_scope']}"
     )
     return result
@@ -1004,17 +1870,20 @@ def nessus_export(label: str, req: NessusExportRequest):
 
 @app.post("/api/poll")
 def force_poll():
-    # Wake the background thread immediately and return — never blocks.
-    # Returns the current poll count so the frontend knows when the next
-    # cycle completes.
-    count_before = scanner._poll_count
-    scanner._wake_poll.set()
+    # Wake the active session's poller immediately and return — never blocks.
+    if active_session == "non_axian":
+        count_before = scanner._poll_count_secondary
+        scanner._wake_poll_secondary.set()
+    else:
+        count_before = scanner._poll_count
+        scanner._wake_poll.set()
     return {"ok": True, "count": count_before}
 
 
 @app.get("/api/poll/status")
 def poll_status():
-    return {"count": scanner._poll_count}
+    count = scanner._poll_count_secondary if active_session == "non_axian" else scanner._poll_count
+    return {"count": count}
 
 
 # ── Debug snapshot ────────────────────────────────────────────────────────

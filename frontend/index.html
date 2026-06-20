@@ -13,13 +13,6 @@
   <header>
     <div class="header-left">
       <span class="logo">⚡ NEMESIS</span>
-      <div class="nav-tabs">
-        <button class="nav-tab active" id="tabDashboard" onclick="switchTab('dashboard')">Dashboard</button>
-        <button class="nav-tab" id="tabReport" onclick="switchTab('report')">Monthly Report</button>
-        <button class="nav-tab" id="tabAssets" onclick="switchTab('assets')">Assets</button>
-        <button class="nav-tab" id="tabShell" onclick="switchTab('shell')">Shell</button>
-        <button class="nav-tab" id="tabSettings" onclick="switchTab('settings')">Settings</button>
-      </div>
     </div>
     <div class="header-center" id="dashboardControls">
       <select id="clientFilter">
@@ -56,6 +49,26 @@
       <button class="btn btn-secondary btn-sm" id="themeBtn" onclick="toggleTheme()" title="Toggle light/dark mode">🌙</button>
     </div>
   </header>
+
+  <!-- NAV TABS BAR -->
+  <nav class="nav-bar">
+    <button class="nav-tab active" id="tabDashboard" onclick="switchTab('dashboard')">Dashboard</button>
+    <button class="nav-tab" id="tabReport" onclick="switchTab('report')">Monthly Report</button>
+    <button class="nav-tab" id="tabWeekly" onclick="switchTab('weekly')">Weekly Report</button>
+    <button class="nav-tab" id="tabDuplicates" onclick="switchTab('duplicates')">Duplicates</button>
+    <button class="nav-tab" id="tabBatchScan" onclick="switchTab('batchscan')">Batch Scan</button>
+    <button class="nav-tab" id="tabAssets" onclick="switchTab('assets')">Assets</button>
+    <button class="nav-tab" id="tabShell" onclick="switchTab('shell')">Shell</button>
+    <button class="nav-tab" id="tabSettings" onclick="switchTab('settings')">Settings</button>
+  </nav>
+
+  <!-- SESSION SWITCHER -->
+  <div class="session-bar" id="sessionBar">
+    <span class="session-bar-label">SESSION:</span>
+    <button id="btnSessionAxian" class="session-btn active" onclick="switchSession('axian')">AXIAN</button>
+    <button id="btnSessionNonAxian" class="session-btn" onclick="switchSession('non_axian')">NON AXIAN</button>
+    <span class="session-active-label" id="sessionActiveLabel">Axian Jira</span>
+  </div>
 
   <!-- MAIN LAYOUT -->
   <div class="layout">
@@ -127,6 +140,94 @@
 
   </div>
 
+  <!-- WEEKLY REPORT VIEW -->
+  <div id="weeklyView" style="display:none; flex:1; overflow-y:auto; padding:28px 32px; background:var(--bg);">
+
+    <div class="report-controls">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div>
+          <label class="report-label">Client</label>
+          <select id="weeklyClient" class="report-select"></select>
+        </div>
+        <div>
+          <label class="report-label">Any day in the week</label>
+          <input type="date" id="weeklyWeek" class="report-month-input">
+        </div>
+        <button class="btn btn-primary" id="weeklyGenBtn" onclick="generateWeeklyReport()" style="margin-top:18px">
+          Generate Report
+        </button>
+      </div>
+    </div>
+
+    <div id="weeklyResults" style="margin-top:28px;"></div>
+
+  </div>
+
+  <!-- DUPLICATES VIEW -->
+  <div id="duplicatesView" style="display:none; flex:1; overflow-y:auto; padding:28px 32px; background:var(--bg); flex-direction:column;">
+
+    <div class="report-controls">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div>
+          <label class="report-label">Client</label>
+          <select id="duplicatesClient" class="report-select"></select>
+        </div>
+        <button class="btn btn-primary" id="duplicatesFindBtn"
+                onclick="findDuplicates()" style="margin-top:18px">
+          Find Duplicates
+        </button>
+      </div>
+    </div>
+
+    <div id="duplicatesResults" style="margin-top:28px;"></div>
+
+  </div>
+
+  <!-- BATCH SCAN VIEW -->
+  <div id="batchScanView" style="display:none; flex:1; overflow-y:auto; padding:28px 32px; background:var(--bg); flex-direction:column;">
+
+    <div class="report-controls">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div>
+          <label class="report-label">Client (SSH connection)</label>
+          <select id="batchClient" class="report-select"></select>
+        </div>
+        <div>
+          <label class="report-label">Scan Rule</label>
+          <select id="batchRule" class="report-select" style="width:280px">
+            <option value="">Loading rules…</option>
+          </select>
+        </div>
+        <div>
+          <label class="report-label">File — Excel (.xlsx) or CSV (IP/Hostname + Port columns)</label>
+          <input type="file" id="batchFile" accept=".xlsx,.xls,.csv" class="report-month-input" style="width:240px">
+        </div>
+        <button class="btn btn-primary" id="batchRunBtn" onclick="runBatchScan()" style="margin-top:18px">
+          Run Scan
+        </button>
+        <button class="btn btn-danger" id="batchStopBtn" onclick="stopBatchScan()" style="margin-top:18px;display:none">
+          ⏹ Stop
+        </button>
+        <button class="btn btn-secondary" id="batchClearBtn" onclick="clearBatchScan()" style="margin-top:18px;display:none">
+          🗑 Clear Results
+        </button>
+      </div>
+    </div>
+
+    <!-- Progress bar -->
+    <div id="batchProgress" style="display:none;margin-top:18px;">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+        <span id="batchProgressText" style="font-size:13px;color:var(--text-dim)">Scanning…</span>
+      </div>
+      <div style="background:var(--border);border-radius:6px;height:8px;overflow:hidden;width:100%;max-width:480px">
+        <div id="batchProgressBar" style="height:100%;width:0%;background:var(--accent);border-radius:6px;transition:width 0.3s ease"></div>
+      </div>
+    </div>
+
+    <div id="batchResults" style="margin-top:20px;"></div>
+
+  </div>
+
   <!-- ASSETS VIEW -->
   <div id="assetsView" style="display:none; flex:1; overflow-y:auto; padding:28px 32px; background:var(--bg); flex-direction:column;">
 
@@ -185,8 +286,8 @@
 
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
             <button class="btn btn-primary btn-sm" id="nessusPullBtn" onclick="pullNessus()" disabled>Pull &amp; Compare</button>
-            <button class="btn btn-secondary btn-sm" id="nessusExportBtn" onclick="downloadReports()" disabled>⬇ Download Reports</button>
             <span id="nessusPullStatus" style="font-size:11px;color:var(--text-dim)"></span>
+            <span id="nessusHostCount" style="font-size:11px;color:var(--cyan)"></span>
           </div>
         </div>
       </div>
@@ -242,79 +343,140 @@
   <!-- SETTINGS VIEW -->
   <div id="settingsView" style="display:none; flex:1; overflow-y:auto; padding:28px 32px; background:var(--bg);">
 
-    <div style="max-width:760px">
+    <!-- ── Two-column layout: Axian (left) | Non-Axian (right) ───────────── -->
+    <div class="settings-columns">
 
-      <div class="report-card" style="padding:16px;margin-bottom:20px">
-        <div class="report-card-header">Jira</div>
-        <div class="report-card-body" style="padding-top:14px;display:flex;flex-direction:column;gap:14px">
-          <div class="form-group">
-            <label>Jira URL</label>
-            <input type="text" id="setJiraUrl" class="text-input">
-          </div>
-          <div class="form-group">
-            <label>Email</label>
-            <input type="text" id="setJiraUsername" class="text-input">
-          </div>
-          <div class="form-group">
-            <label>API Token <span style="font-weight:400;color:var(--text-dim)" id="setJiraTokenStatus"></span></label>
-            <input type="password" id="setJiraToken" class="text-input" placeholder="Leave blank to keep the current token">
-          </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px">
-            <div class="form-group" style="margin-bottom:0">
-              <label>Project Key</label>
-              <input type="text" id="setJiraProject" class="text-input">
+      <!-- ═══ LEFT COLUMN — AXIAN ══════════════════════════════════════════ -->
+      <div class="settings-col">
+        <div class="settings-col-header">
+          <span class="settings-col-dot settings-col-dot-axian"></span>AXIAN
+        </div>
+
+        <!-- Jira (Axian) -->
+        <div class="report-card" style="padding:16px;margin-bottom:16px">
+          <div class="report-card-header">Jira</div>
+          <div class="report-card-body" style="padding-top:14px;display:flex;flex-direction:column;gap:14px">
+            <div class="form-group">
+              <label>Jira URL</label>
+              <input type="text" id="setJiraUrl" class="text-input">
             </div>
-            <div class="form-group" style="margin-bottom:0">
-              <label>Retest Status</label>
-              <input type="text" id="setJiraRetestStatus" class="text-input">
+            <div class="form-group">
+              <label>Email</label>
+              <input type="text" id="setJiraUsername" class="text-input">
             </div>
-            <div class="form-group" style="margin-bottom:0">
-              <label>Poll Interval (sec)</label>
-              <input type="number" id="setJiraPollInterval" class="text-input">
+            <div class="form-group">
+              <label>API Token <span style="font-weight:400;color:var(--text-dim)" id="setJiraTokenStatus"></span></label>
+              <input type="password" id="setJiraToken" class="text-input" placeholder="Leave blank to keep the current token">
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+              <div class="form-group" style="margin-bottom:0">
+                <label>Project Key</label>
+                <input type="text" id="setJiraProject" class="text-input">
+              </div>
+              <div class="form-group" style="margin-bottom:0">
+                <label>Retest Status</label>
+                <input type="text" id="setJiraRetestStatus" class="text-input">
+              </div>
+              <div class="form-group" style="margin-bottom:0">
+                <label>Poll Interval (sec)</label>
+                <input type="number" id="setJiraPollInterval" class="text-input">
+              </div>
             </div>
           </div>
         </div>
-      </div>
 
-      <div class="report-card" style="padding:16px;margin-bottom:20px">
-        <div class="report-card-header">Jump Server</div>
-        <div class="report-card-body" style="padding-top:14px;display:flex;flex-direction:column;gap:14px">
-          <div style="display:grid;grid-template-columns:2fr 1fr;gap:14px">
-            <div class="form-group" style="margin-bottom:0">
-              <label>Host</label>
-              <input type="text" id="setJumpHost" class="text-input">
+        <!-- Jump Server (shared infra, shown under Axian) -->
+        <div class="report-card" style="padding:16px;margin-bottom:16px">
+          <div class="report-card-header">Jump Server</div>
+          <div class="report-card-body" style="padding-top:14px;display:flex;flex-direction:column;gap:14px">
+            <div style="display:grid;grid-template-columns:2fr 1fr;gap:12px">
+              <div class="form-group" style="margin-bottom:0">
+                <label>Host</label>
+                <input type="text" id="setJumpHost" class="text-input">
+              </div>
+              <div class="form-group" style="margin-bottom:0">
+                <label>Port</label>
+                <input type="number" id="setJumpPort" class="text-input">
+              </div>
             </div>
-            <div class="form-group" style="margin-bottom:0">
-              <label>Port</label>
-              <input type="number" id="setJumpPort" class="text-input">
+            <div class="form-group">
+              <label>Username</label>
+              <input type="text" id="setJumpUser" class="text-input">
+            </div>
+            <div class="form-group">
+              <label>Password <span style="font-weight:400;color:var(--text-dim)" id="setJumpPasswordStatus"></span></label>
+              <input type="password" id="setJumpPassword" class="text-input" placeholder="Leave blank to keep the current password">
             </div>
           </div>
-          <div class="form-group">
-            <label>Username</label>
-            <input type="text" id="setJumpUser" class="text-input">
+        </div>
+
+        <!-- Clients — Axian -->
+        <div class="report-card" style="padding:16px;margin-bottom:16px">
+          <div class="report-card-header" style="display:flex;align-items:center;justify-content:space-between">
+            <span>Clients (Opcos)</span>
+            <button class="btn btn-sm btn-secondary" onclick="addSettingsClientRow()">+ Add Client</button>
           </div>
-          <div class="form-group">
-            <label>Password <span style="font-weight:400;color:var(--text-dim)" id="setJumpPasswordStatus"></span></label>
-            <input type="password" id="setJumpPassword" class="text-input" placeholder="Leave blank to keep the current password">
+          <div class="report-card-body" style="padding-top:14px">
+            <div id="settingsClientRows" style="display:flex;flex-direction:column;gap:18px"></div>
           </div>
         </div>
-      </div>
+      </div><!-- end left col -->
 
-      <div class="report-card" style="padding:16px;margin-bottom:20px">
-        <div class="report-card-header" style="display:flex;align-items:center;justify-content:space-between">
-          <span>Clients (Opcos)</span>
-          <button class="btn btn-sm btn-secondary" onclick="addSettingsClientRow()">+ Add Client</button>
+      <!-- ═══ RIGHT COLUMN — NON-AXIAN ═════════════════════════════════════ -->
+      <div class="settings-col">
+        <div class="settings-col-header">
+          <span class="settings-col-dot settings-col-dot-nonaxian"></span>NON AXIAN
         </div>
-        <div class="report-card-body" style="padding-top:14px">
-          <div id="settingsClientRows" style="display:flex;flex-direction:column;gap:18px"></div>
+
+        <!-- Non-Axian Jira -->
+        <div class="report-card" style="padding:16px;margin-bottom:16px">
+          <div class="report-card-header">Jira — Server / Data Centre</div>
+          <div class="report-card-body" style="padding-top:14px;display:flex;flex-direction:column;gap:14px">
+            <div style="font-size:11px;color:var(--text-dim)">Uses Personal Access Token (Bearer) auth</div>
+            <div class="form-group">
+              <label>Jira URL</label>
+              <input type="text" id="setJira2Url" class="text-input" placeholder="https://tickets.example.com">
+            </div>
+            <div class="form-group">
+              <label>Personal Access Token (PAT) <span style="font-weight:400;color:var(--text-dim)" id="setJira2TokenStatus"></span></label>
+              <input type="password" id="setJira2Token" class="text-input" placeholder="Leave blank to keep current">
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+              <div class="form-group" style="margin-bottom:0">
+                <label>Retest Status</label>
+                <input type="text" id="setJira2RetestStatus" class="text-input" placeholder="Remediated">
+              </div>
+              <div class="form-group" style="margin-bottom:0">
+                <label>Poll Interval (sec)</label>
+                <input type="number" id="setJira2PollInterval" class="text-input" placeholder="300">
+              </div>
+            </div>
+            <div style="font-size:11px;color:var(--text-dim);padding:4px 0">
+              💡 Leave URL blank to disable Non-Axian. Each client's <strong>label</strong> must match its Jira <strong>project key</strong> (e.g. <code>CPEL</code> → <code>project = CPEL</code>).
+            </div>
+          </div>
         </div>
-      </div>
 
-      <div style="display:flex;align-items:center;gap:12px">
-        <button class="btn btn-primary" id="settingsSaveBtn" onclick="saveSettings()">Save Settings</button>
-        <span id="settingsSaveStatus" style="font-size:12px;color:var(--text-dim)"></span>
-      </div>
+        <!-- Clients — Non-Axian -->
+        <div class="report-card" style="padding:16px;margin-bottom:16px">
+          <div class="report-card-header" style="display:flex;align-items:center;justify-content:space-between">
+            <span>Clients</span>
+            <button class="btn btn-sm btn-secondary" onclick="addSecondaryClientRow()">+ Add Client</button>
+          </div>
+          <div class="report-card-body" style="padding-top:14px">
+            <div id="settingsClientRowsSecondary" style="display:flex;flex-direction:column;gap:18px">
+              <div style="font-size:11px;color:var(--text-dim);padding:4px 0">No Non-Axian clients yet — click "+ Add Client" to add one.</div>
+            </div>
+          </div>
+        </div>
+      </div><!-- end right col -->
 
+    </div><!-- end settings-columns -->
+
+    <!-- Save button row — full width below both columns -->
+    <div style="display:flex;align-items:center;gap:12px;margin-top:8px">
+      <button class="btn btn-primary" id="settingsSaveBtn" onclick="saveSettings()">Save Settings</button>
+      <span id="settingsSaveStatus" style="font-size:12px;color:var(--text-dim)"></span>
     </div>
 
   </div>

@@ -16,6 +16,7 @@ import yaml
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+import requests as _requests
 from .setup import _test_jira, _test_jump_server
 
 log = logging.getLogger(__name__)
@@ -23,6 +24,22 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/settings")
 
 CONFIG_PATH = "config/config.yaml"
+
+
+def _test_jira_v2(url: str, token: str):
+    """Test Non-Axian Jira connectivity using Bearer (PAT) auth."""
+    try:
+        resp = _requests.get(
+            f"{url.rstrip('/')}/rest/api/2/myself",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=15,
+        )
+    except Exception as exc:
+        raise HTTPException(400, f"Could not reach Non-Axian Jira at {url}: {exc}")
+    if resp.status_code == 401:
+        raise HTTPException(400, "Non-Axian Jira login failed — check your PAT token.")
+    if not resp.ok:
+        raise HTTPException(400, f"Non-Axian Jira returned an error ({resp.status_code}).")
 
 
 def _load_raw() -> dict:
@@ -38,6 +55,8 @@ def get_settings():
     jira = data.get("jira", {})
     jump = data.get("jump_server", {})
     clients = data.get("clients", [])
+    j2 = data.get("jira_secondary", {}) or {}
+    clients2 = data.get("clients_secondary", []) or []
     return {
         "jira": {
             "url": jira.get("url", ""),
@@ -46,6 +65,12 @@ def get_settings():
             "retest_status": jira.get("retest_status", "Remediated"),
             "poll_interval": jira.get("poll_interval", 300),
             "api_token_set": bool(jira.get("api_token")),
+        },
+        "jira_secondary": {
+            "url": j2.get("url", ""),
+            "retest_status": j2.get("retest_status", "Remediated"),
+            "poll_interval": j2.get("poll_interval", 300),
+            "api_token_set": bool(j2.get("api_token")),
         },
         "jump_server": {
             "host": jump.get("host", ""),
@@ -64,6 +89,18 @@ def get_settings():
                 "nessus_secret_key_set": bool(c.get("nessus_secret_key")),
             }
             for c in clients
+        ],
+        "clients_secondary": [
+            {
+                "label": c.get("label", ""),
+                "name": c.get("name", ""),
+                "kali_port": c.get("kali_port", 22),
+                "kali_user": c.get("kali_user", ""),
+                "kali_password_set": bool(c.get("kali_password")),
+                "nessus_access_key_set": bool(c.get("nessus_access_key")),
+                "nessus_secret_key_set": bool(c.get("nessus_secret_key")),
+            }
+            for c in clients2
         ],
     }
 
@@ -94,10 +131,19 @@ class ClientSettings(BaseModel):
     nessus_secret_key: Optional[str] = None       # blank/omitted = keep existing
 
 
+class JiraSecondarySettings(BaseModel):
+    url: str = ""
+    api_token: Optional[str] = None   # blank/omitted = keep existing
+    retest_status: str = "Remediated"
+    poll_interval: int = 300
+
+
 class SettingsUpdate(BaseModel):
     jira: JiraSettings
     jump_server: JumpSettings
     clients: List[ClientSettings]
+    jira_secondary: Optional[JiraSecondarySettings] = None
+    clients_secondary: Optional[List[ClientSettings]] = None
 
 
 @router.post("")
@@ -140,6 +186,43 @@ def update_settings(req: SettingsUpdate):
     _test_jira(req.jira.url, req.jira.username, jira_token)
     _test_jump_server(req.jump_server.host, req.jump_server.port, req.jump_server.user, jump_password)
 
+    # ── Secondary Jira ──────────────────────────────────────────────────────
+    existing_j2 = existing.get("jira_secondary") or {}
+    j2_config = None
+    if req.jira_secondary and req.jira_secondary.url.strip():
+        j2_token = req.jira_secondary.api_token or existing_j2.get("api_token", "")
+        if not j2_token:
+            raise HTTPException(400, "Non-Axian Jira PAT token is required when a URL is set.")
+        _test_jira_v2(req.jira_secondary.url.strip(), j2_token)
+        j2_config = {
+            "url": req.jira_secondary.url.strip(),
+            "api_token": j2_token,
+            "retest_status": req.jira_secondary.retest_status or "Remediated",
+            "poll_interval": req.jira_secondary.poll_interval or 300,
+        }
+    elif existing_j2.get("url"):
+        # Keep existing secondary config if not being changed
+        j2_config = existing_j2
+
+    # ── Secondary clients ───────────────────────────────────────────────────
+    existing_clients2 = {c["label"]: c for c in (existing.get("clients_secondary") or [])}
+    merged_clients2 = []
+    for c in (req.clients_secondary or []):
+        label2 = c.label.strip()
+        if not label2:
+            raise HTTPException(400, "Every Non-Axian client needs a label.")
+        old2 = existing_clients2.get(label2, {})
+        kali_pass2 = c.kali_password or old2.get("kali_password", "")
+        merged_clients2.append({
+            "label": label2,
+            "name": c.name or old2.get("name") or label2,
+            "kali_port": c.kali_port,
+            "kali_user": c.kali_user,
+            "kali_password": kali_pass2,
+            "nessus_access_key": c.nessus_access_key if c.nessus_access_key is not None else old2.get("nessus_access_key", ""),
+            "nessus_secret_key": c.nessus_secret_key if c.nessus_secret_key is not None else old2.get("nessus_secret_key", ""),
+        })
+
     config = {
         "jira": {
             "url": req.jira.url,
@@ -157,6 +240,10 @@ def update_settings(req: SettingsUpdate):
         },
         "clients": merged_clients,
     }
+    if j2_config:
+        config["jira_secondary"] = j2_config
+    if merged_clients2:
+        config["clients_secondary"] = merged_clients2
     if "app" in existing:
         config["app"] = existing["app"]
 

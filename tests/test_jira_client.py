@@ -347,3 +347,18 @@ class TestCountJql:
 
         count = client.count_jql("project = TEST")
         assert count == 30
+
+
+# ---------------------------------------------------------------------------
+# severity_jql_field — Axian client always returns fixed field name
+# ---------------------------------------------------------------------------
+
+class TestSeverityJqlField:
+    def test_returns_vulnerability_rating_field_name(self):
+        client = make_client()
+        assert client.severity_jql_field == '"vulnerability_Rating[Short text]"'
+
+    def test_is_consistent_regardless_of_loaded_fields(self):
+        """Axian field is hardcoded — loaded field map has no effect."""
+        client = make_client(fields={"severity": "customfield_10050"})
+        assert client.severity_jql_field == '"vulnerability_Rating[Short text]"'

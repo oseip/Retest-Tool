@@ -78,14 +78,41 @@ async function fetchClients() {
     const res = await fetch('/api/clients');
     if (!res.ok) return;
     const clients = await res.json();
+
+    // 1. Update the main dashboard filter (keeps "All Opcos" as first option)
     const sel = $('clientFilter');
+    while (sel.options.length > 1) sel.remove(1);
     clients.forEach(c => {
       const opt = document.createElement('option');
       opt.value = c.label;
       opt.textContent = `${c.name} (${c.label})`;
       sel.appendChild(opt);
     });
+
+    // 2. Sync every other tab's client dropdown to the same list
+    _syncClientDropdowns(clients);
   } catch (e) { /* ignore */ }
+}
+
+function _syncClientDropdowns(clients) {
+  // Dropdowns in Report, Assets and Shell tabs that mirror the client list.
+  // We rebuild them completely so a session switch always shows the right set.
+  ['reportClient', 'weeklyClient', 'duplicatesClient', 'batchClient', 'assetsClient', 'shellClient', 'addTicketClient'].forEach(id => {
+    const sel = $(id);
+    if (!sel) return;
+    const prev = sel.value;
+    while (sel.options.length > 0) sel.remove(0);
+    clients.forEach(c => {
+      const o = document.createElement('option');
+      o.value = c.label;
+      o.textContent = `${c.name} (${c.label})`;
+      sel.appendChild(o);
+    });
+    // Restore prior selection if it still exists in the new list
+    if (prev && Array.from(sel.options).some(o => o.value === prev)) {
+      sel.value = prev;
+    }
+  });
 }
 
 async function fetchLogs() {
@@ -218,13 +245,19 @@ function renderJobList() {
   let hasMoreSweep = false;
   if (sweepJobs.length) {
     // --- counts for the type filter pills ---
-    const autoCount   = sweepJobs.filter(j => j.status !== 'manual').length;
-    const manualCount = sweepJobs.filter(j => j.status === 'manual').length;
+    const autoCount          = sweepJobs.filter(j => j.status !== 'manual').length;
+    const manualCount        = sweepJobs.filter(j => j.status === 'manual').length;
+    const fixedCount         = sweepJobs.filter(j => j.status === 'completed' && j.verdict === 'fixed').length;
+    const notFixedCount      = sweepJobs.filter(j => j.status === 'completed' && j.verdict === 'not_fixed').length;
+    const inconclusiveCount  = sweepJobs.filter(j => j.status === 'completed' && j.verdict === 'inconclusive').length;
 
     // --- apply type filter ---
     const tf = state.sweepTypeFilter;
-    const typeFiltered = tf === 'auto'   ? sweepJobs.filter(j => j.status !== 'manual')
-                       : tf === 'manual' ? sweepJobs.filter(j => j.status === 'manual')
+    const typeFiltered = tf === 'auto'         ? sweepJobs.filter(j => j.status !== 'manual')
+                       : tf === 'manual'       ? sweepJobs.filter(j => j.status === 'manual')
+                       : tf === 'fixed'        ? sweepJobs.filter(j => j.status === 'completed' && j.verdict === 'fixed')
+                       : tf === 'not_fixed'    ? sweepJobs.filter(j => j.status === 'completed' && j.verdict === 'not_fixed')
+                       : tf === 'inconclusive' ? sweepJobs.filter(j => j.status === 'completed' && j.verdict === 'inconclusive')
                        : sweepJobs;
 
     // --- apply text search ---
@@ -244,10 +277,8 @@ function renderJobList() {
       `style="padding:2px 8px;font-size:10px;border-radius:10px;border:1px solid var(--border);cursor:pointer;` +
       `background:${active ? 'var(--cyan)' : 'var(--bg3)'};color:${active ? '#000' : 'var(--text-dim)'};font-weight:${active ? '600' : '400'}"`;
 
-    const sweepScanning = sweepJobs.some(j => j.status === 'scanning');
     html += `<div class="queue-section-header sweep-section">⟳ SWEEP <span class="section-count">${countLabel}</span>
       <div style="display:flex;gap:5px;margin-left:auto">
-        ${sweepScanning ? `<button class="btn btn-sm btn-red" style="font-size:10px;padding:2px 8px" onclick="stopSweepScans()">⏹ Stop All</button>` : ''}
         <button class="btn btn-sm btn-red" style="font-size:10px;padding:2px 8px" onclick="clearSweepJobs()">🗑 Clear All</button>
       </div>
     </div>`;
@@ -255,10 +286,13 @@ function renderJobList() {
       <input id="sweepSearchInput" type="text" placeholder="Filter sweep tickets…" autocomplete="off"
              value="${escHtml(state.sweepSearch)}"
              style="width:100%;box-sizing:border-box;padding:4px 8px;font-size:11px;border:1px solid var(--border);border-radius:4px;background:var(--bg3);color:var(--text)">
-      <div style="display:flex;gap:5px">
-        <button ${pillStyle(tf === 'all')}    onclick="setSweepTypeFilter('all')">All (${sweepJobs.length})</button>
-        <button ${pillStyle(tf === 'auto')}   onclick="setSweepTypeFilter('auto')">⚡ Auto-scan (${autoCount})</button>
-        <button ${pillStyle(tf === 'manual')} onclick="setSweepTypeFilter('manual')">🖐 Manual (${manualCount})</button>
+      <div style="display:flex;gap:5px;flex-wrap:wrap">
+        <button ${pillStyle(tf === 'all')}          onclick="setSweepTypeFilter('all')">All (${sweepJobs.length})</button>
+        <button ${pillStyle(tf === 'auto')}         onclick="setSweepTypeFilter('auto')">⚡ Auto-scan (${autoCount})</button>
+        <button ${pillStyle(tf === 'manual')}       onclick="setSweepTypeFilter('manual')">🖐 Manual (${manualCount})</button>
+        ${fixedCount        ? `<button ${pillStyle(tf === 'fixed')}        onclick="setSweepTypeFilter('fixed')">✅ Fixed (${fixedCount})</button>` : ''}
+        ${notFixedCount     ? `<button ${pillStyle(tf === 'not_fixed')}    onclick="setSweepTypeFilter('not_fixed')">❌ Not Fixed (${notFixedCount})</button>` : ''}
+        ${inconclusiveCount ? `<button ${pillStyle(tf === 'inconclusive')} onclick="setSweepTypeFilter('inconclusive')">⚪ Inconclusive (${inconclusiveCount})</button>` : ''}
       </div>
     </div>`;
     if (visibleSweep.length) {
@@ -1124,18 +1158,21 @@ let _pendingTransition = null;
 
 // ── Fast-track helpers ─────────────────────────────────────────────────────
 
+// Intermediate steps only (not including the phase-1 target "Remediated").
+// Phase 1 always advances to Remediated; phase 2 goes Fixed/Not Fixed.
 const _FAST_TRACK_CHAINS = {
-  'reported':    ['In Progress', 'Remediated'],
-  'in progress': ['Remediated'],
-  'not fixed':   ['Remediated'],
-  'remediated':  [],
+  'reported':    ['In Progress'],          // → In Progress → Remediated (phase 1)
+  'in progress': [],                       // → Remediated directly
+  'not fixed':   ['Refix', 'Fix Issue'],   // Refix unlocks; Fix Issue reaches Remediated
+  'remediated':  [],                       // already there — phase 2: Fixed / Not Fixed
 };
 
-function fastTrackChain(ticketStatus, target) {
+/** Full display chain for phase 1 (always to Remediated). */
+function fastTrackChainToRemediated(ticketStatus) {
   const s = (ticketStatus || '').toLowerCase().trim();
-  const intermediate = _FAST_TRACK_CHAINS[s];
-  if (intermediate === undefined) return null;
-  return [...intermediate, target];
+  const intermediates = _FAST_TRACK_CHAINS[s];
+  if (intermediates === undefined) return null;
+  return [...intermediates, 'Remediated'];
 }
 
 function needsFastTrack(job) {
@@ -1143,19 +1180,21 @@ function needsFastTrack(job) {
   return s in _FAST_TRACK_CHAINS && s !== 'remediated';
 }
 
-/** Render Fixed / Not Fixed buttons — or ⚡ fast-track variants if the ticket
- *  is not yet in Remediated state and needs intermediate transitions. */
+/** Render transition buttons.
+ *  - Pre-Remediated ticket → single "⚡ → Remediated" button (phase 1).
+ *  - Remediated ticket     → ✅ Fixed / ❌ Not Fixed (phase 2, direct). */
 function renderTransitionBtns(job) {
   const jid = job.id;
   if (needsFastTrack(job)) {
-    const chain = fastTrackChain(job.ticket_status, '…');
-    const hops  = chain.slice(0, -1).join(' → ');   // show intermediates only
-    const tip   = hops ? `Via: ${hops}` : '';
+    const chain = fastTrackChainToRemediated(job.ticket_status) || [];
+    const tip   = chain.length > 1
+      ? `Via: ${chain.slice(0, -1).join(' → ')} → Remediated`
+      : 'Move to Remediated — click again to mark Fixed / Not Fixed';
+    // The "toStatus" we pass is the EVENTUAL target the user clicked;
+    // the backend will stop at Remediated for phase 1.
     return `
-      <button class="btn btn-green" onclick="openFastTrack('${jid}','Fixed')"
-              title="${escHtml(tip)}">⚡ Fast-track → Fixed</button>
-      <button class="btn btn-red" onclick="openFastTrack('${jid}','Not Fixed')"
-              title="${escHtml(tip)}">⚡ → Not Fixed</button>`;
+      <button class="btn btn-sweep" onclick="openFastTrack('${jid}','Fixed')"
+              title="${escHtml(tip)}">⚡ → Remediated</button>`;
   }
   return `
     <button class="btn btn-green" onclick="openTransition('${jid}','Fixed')">✅ Fixed</button>
@@ -1163,13 +1202,22 @@ function renderTransitionBtns(job) {
 }
 
 function openFastTrack(jobId, target) {
-  const job   = state.jobs[jobId];
-  const chain = fastTrackChain(job.ticket_status, target);
-  const chainStr = chain.join(' → ');
+  const job  = state.jobs[jobId];
+  const s    = (job.ticket_status || '').toLowerCase().trim();
+  const at_remediated = s === 'remediated';
+
+  // What will actually happen this click?
+  const chain = at_remediated
+    ? ['Remediated', target]
+    : (fastTrackChainToRemediated(job.ticket_status) || ['Remediated']);
+
   _pendingTransition = { jobId, toStatus: target, isFastTrack: true };
-  $('modalTitle').textContent    = `⚡ Fast-track → ${target}`;
-  $('modalSubtitle').textContent = `${job.ticket_key} (${job.ticket_status || '?'})  →  ${chainStr}`;
-  $('modalComment').value        = buildAutoComment(job, target);
+  $('modalTitle').textContent    = at_remediated
+    ? `⚡ Fast-track → ${target}`
+    : `⚡ Advance → Remediated`;
+  $('modalSubtitle').textContent =
+    `${job.ticket_key} (${job.ticket_status || '?'})  →  ${chain.join(' → ')}`;
+  $('modalComment').value = buildAutoComment(job, at_remediated ? target : 'Remediated');
   $('transitionModal').style.display = 'flex';
 }
 
@@ -1212,10 +1260,23 @@ async function confirmTransition() {
         return;
       }
       const data = await res.json();
-      _removeJobLocally(jobId);
-      showToast(`⚡ ${ticketKey}: ${data.chain.join(' → ')}`, 'success', 5000);
-      renderJobList();
-      updateStats();
+      if (data.partial) {
+        // Phase 1 complete — ticket now at Remediated, stays on board
+        if (state.jobs[jobId]) {
+          state.jobs[jobId].ticket_status = data.current_status;
+        }
+        showToast(
+          `⚡ ${ticketKey}: ${data.chain.join(' → ')} — now in ${data.current_status}. Click again to mark Fixed / Not Fixed.`,
+          'success', 7000
+        );
+        renderJobList();
+      } else {
+        // Phase 2 complete — remove job
+        _removeJobLocally(jobId);
+        showToast(`⚡ ${ticketKey}: ${data.chain.join(' → ')}`, 'success', 5000);
+        renderJobList();
+        updateStats();
+      }
     } catch (e) {
       showToast(e.message, 'error');
     }
@@ -1253,12 +1314,24 @@ function _removeJobLocally(jobId) {
 }
 
 // ── Bulk transition modal ─────────────────────────────────────────────────
+
+// Holds the current status groups so per-group buttons can reference them by index
+let _transitionGroups = [];
+
 async function openTransitionModal() {
   $('transitionPreviewBody').innerHTML = '<span style="color:var(--text-dim)">⏳ Loading…</span>';
   $('transitionTicketList').style.display = 'none';
   $('transitionTicketList').innerHTML = '';
   $('transitionConfirmBtn').disabled = true;
   $('bulkTransitionModal').style.display = 'flex';
+  await _loadTransitionPreview();
+}
+
+async function _loadTransitionPreview() {
+  $('transitionPreviewBody').innerHTML = '<span style="color:var(--text-dim)">⏳ Loading…</span>';
+  $('transitionTicketList').style.display = 'none';
+  $('transitionConfirmBtn').disabled = true;
+  _transitionGroups = [];
 
   try {
     const res  = await fetch('/api/jobs/transition-preview');
@@ -1273,32 +1346,154 @@ async function openTransitionModal() {
       return;
     }
 
+    // Merge all eligible tickets and group by current Jira status
+    const allTickets = [
+      ...data.to_fixed.map(t    => ({...t, verdictTarget: 'Fixed'})),
+      ...data.to_not_fixed.map(t => ({...t, verdictTarget: 'Not Fixed'})),
+    ];
+    const groupMap = {};
+    allTickets.forEach(t => {
+      const s = t.ticket_status || 'Unknown';
+      if (!groupMap[s]) groupMap[s] = { status: s, jobs: [] };
+      groupMap[s].jobs.push(t);
+    });
+
+    // Sort: Remediated last (phase 2); pre-Remediated states first (phase 1)
+    const _STATUS_ORDER = ['Reported', 'In Progress', 'Not Fixed', 'Refix', 'Remediated'];
+    _transitionGroups = Object.values(groupMap).sort((a, b) => {
+      const ai = _STATUS_ORDER.findIndex(s => s.toLowerCase() === a.status.toLowerCase());
+      const bi = _STATUS_ORDER.findIndex(s => s.toLowerCase() === b.status.toLowerCase());
+      return (ai === -1 ? 50 : ai) - (bi === -1 ? 50 : bi);
+    });
+
+    // Detect which groups are already at Remediated so we know what the button does
+    const retestStatus = (await fetch('/api/config').then(r => r.json())).retest_status || 'Remediated';
+
+    const groupsHtml = _transitionGroups.map((g, idx) => {
+      const isRemediated = g.status.toLowerCase() === retestStatus.toLowerCase();
+      const n = g.jobs.length;
+      const keys = g.jobs.map(j => j.ticket_key).join(', ');
+      const btnLabel = isRemediated
+        ? `✅ Transition ${n} → Fixed`
+        : `⚡ Advance ${n} → Remediated`;
+      const btnClass = isRemediated ? 'btn-green' : 'btn-sweep';
+      return `
+        <div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;background:var(--bg3);display:flex;flex-direction:column;gap:5px">
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:11px;font-weight:600;color:var(--text);margin-bottom:3px">
+                ${escHtml(g.status)}
+                <span style="font-weight:400;color:var(--text-dim)">(${n})</span>
+              </div>
+              <div style="font-size:11px;color:var(--cyan);user-select:all;cursor:text;word-break:break-all">${escHtml(keys)}</div>
+            </div>
+            <button class="btn btn-sm ${btnClass}" style="white-space:nowrap;flex-shrink:0"
+                    id="transGroupBtn${idx}"
+                    onclick="_advanceTransitionGroup(${idx})">${btnLabel}</button>
+          </div>
+        </div>`;
+    }).join('');
+
     $('transitionPreviewBody').innerHTML = `
       <div style="display:flex;flex-direction:column;gap:6px">
-        ${nFixed    ? `<div style="color:var(--green)">✅ <b>${nFixed}</b> ticket${nFixed!==1?'s':''} → <b>Fixed</b></div>` : ''}
-        ${nNotFixed ? `<div style="color:var(--red)">❌ <b>${nNotFixed}</b> ticket${nNotFixed!==1?'s':''} → <b>Not Fixed</b></div>` : ''}
-        <div style="color:var(--text-dim);font-size:11px;margin-top:4px">
-          Tickets marked Open+Not Fixed, Inconclusive, or Error are excluded.
+        ${groupsHtml}
+        <div style="font-size:11px;color:var(--text-dim);margin-top:2px">
+          Tickets marked Inconclusive or Error are excluded.
         </div>
       </div>`;
 
-    // Build ticket list grouped by verdict
-    const rows = [
-      ...data.to_fixed.map(t    => ({...t, target: 'Fixed',     icon: '✅'})),
-      ...data.to_not_fixed.map(t => ({...t, target: 'Not Fixed', icon: '❌'})),
-    ];
-    $('transitionTicketList').innerHTML = rows.map(t => `
-      <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid var(--border);font-size:11px">
-        <span>${t.icon}</span>
-        <span style="font-weight:600;white-space:nowrap">${escHtml(t.ticket_key)}</span>
-        <span style="flex:1;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(truncate(t.ticket_summary, 55))}</span>
-        <span style="color:var(--text-dim);white-space:nowrap">${escHtml(t.client_label)}</span>
-      </div>`).join('');
+    // Build ticket detail list
+    $('transitionTicketList').innerHTML = allTickets.map(t => {
+      const icon = t.verdictTarget === 'Fixed' ? '✅' : '❌';
+      return `
+        <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid var(--border);font-size:11px">
+          <span>${icon}</span>
+          <span style="font-weight:600;white-space:nowrap">${escHtml(t.ticket_key)}</span>
+          <span style="flex:1;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(truncate(t.ticket_summary, 55))}</span>
+          <span style="color:var(--text-dim);white-space:nowrap;font-size:10px">${escHtml(t.ticket_status || '')}</span>
+          <span style="color:var(--text-dim);white-space:nowrap">${escHtml(t.client_label)}</span>
+        </div>`;
+    }).join('');
     $('transitionTicketList').style.display = '';
-    $('transitionConfirmBtn').disabled = false;
-    $('transitionConfirmBtn').textContent = `Transition ${total} Ticket${total!==1?'s':''}`;
+
+    // Bottom button: only for Remediated tickets — the per-group ⚡ buttons handle
+    // phase-1 (advancing to Remediated first).
+    const remediatedGroup = _transitionGroups.find(g =>
+      g.status.toLowerCase() === retestStatus.toLowerCase()
+    );
+    const remCount = remediatedGroup ? remediatedGroup.jobs.length : 0;
+    const hasPreRemediated = _transitionGroups.some(g =>
+      g.status.toLowerCase() !== retestStatus.toLowerCase()
+    );
+    if (remCount > 0) {
+      $('transitionConfirmBtn').disabled = false;
+      $('transitionConfirmBtn').textContent =
+        hasPreRemediated
+          ? `Transition ${remCount} Remediated Ticket${remCount !== 1 ? 's' : ''}`
+          : `Transition ${total} Ticket${total !== 1 ? 's' : ''}`;
+    } else {
+      $('transitionConfirmBtn').disabled = true;
+      $('transitionConfirmBtn').textContent = 'Advance to Remediated first ↑';
+    }
   } catch (e) {
     $('transitionPreviewBody').innerHTML = `<span style="color:var(--red)">⚠️ ${escHtml(e.message)}</span>`;
+  }
+}
+
+async function _advanceTransitionGroup(groupIdx) {
+  const group = _transitionGroups[groupIdx];
+  if (!group) return;
+
+  // Disable all group buttons while the request is in flight
+  _transitionGroups.forEach((_, i) => {
+    const btn = $(`transGroupBtn${i}`);
+    if (btn) btn.disabled = true;
+  });
+  $('transitionConfirmBtn').disabled = true;
+
+  const jobIds = group.jobs.map(j => j.job_id);
+  try {
+    const res = await fetch('/api/jobs/bulk-fast-track', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_ids: jobIds, target: 'Fixed' }),
+    });
+    const data = await res.json();
+    const ok   = data.succeeded.length;
+    const fail = data.failed.length;
+
+    // Sync local state immediately so the job list and stats reflect reality
+    data.succeeded.forEach(s => {
+      if (s.partial) {
+        if (state.jobs[s.job_id]) state.jobs[s.job_id].ticket_status = s.current_status;
+      } else {
+        delete state.jobs[s.job_id];
+        state.checkedIds.delete(s.job_id);
+        if (state.selectedJobId === s.job_id) state.selectedJobId = null;
+      }
+    });
+
+    const retestStatus = group.status; // the label we showed on the button
+    const isPhase2 = _transitionGroups[groupIdx]?.status &&
+      data.succeeded.some(s => !s.partial);
+
+    if (ok > 0) {
+      const label = isPhase2
+        ? `✅ ${ok} ticket${ok !== 1 ? 's' : ''} → Fixed`
+        : `⚡ ${ok} ticket${ok !== 1 ? 's' : ''} → Remediated`;
+      showToast(label, 'success', 5000);
+    }
+    if (fail > 0) {
+      showToast(`${fail} failed: ${data.failed[0]?.error || 'unknown'}`, 'warn', 8000);
+    }
+
+    renderJobList();
+    updateStats();
+    // Refresh the modal groups to reflect the new ticket_status values
+    await _loadTransitionPreview();
+  } catch (e) {
+    showToast(`Failed: ${e.message}`, 'error');
+    await _loadTransitionPreview();
   }
 }
 
@@ -1461,16 +1656,8 @@ function truncate(s, n) {
 
 // ── Add Ticket ────────────────────────────────────────────────────────────
 function openAddTicket() {
-  // Populate client dropdown from clientFilter options
+  // addTicketClient is synced by _syncClientDropdowns() — no manual copy needed.
   const sel = $('addTicketClient');
-  if (sel.options.length === 0) {
-    Array.from($('clientFilter').options).slice(1).forEach(opt => {
-      const o = document.createElement('option');
-      o.value = opt.value;
-      o.textContent = opt.textContent;
-      sel.appendChild(o);
-    });
-  }
   // Pre-select the currently filtered client if any
   if (state.clientFilter) sel.value = state.clientFilter;
 
@@ -1614,12 +1801,56 @@ async function clearSweepJobs() {
   await fetchJobs();
 }
 
+async function advanceSweepAll() {
+  // Only advance swept tickets whose scan is complete with a FIXED verdict and
+  // that still need a Jira transition (pre-Remediated). Scanning/queued tickets
+  // and non-fixed verdicts are intentionally excluded.
+  const candidates = Object.values(state.jobs).filter(j =>
+    j.source === 'sweep' &&
+    j.status === 'completed' &&
+    j.verdict === 'fixed' &&
+    needsFastTrack(j)
+  );
+  if (!candidates.length) return;
+  if (!confirm(
+    `Advance ${candidates.length} completed+fixed swept ticket${candidates.length !== 1 ? 's' : ''} to Remediated?\n\n` +
+    `Each ticket's Jira status will be moved forward using the correct transition chain for its current state.`
+  )) return;
+
+  showToast(`⚡ Advancing ${candidates.length} ticket${candidates.length !== 1 ? 's' : ''} to Remediated…`, 'warn', 4000);
+  try {
+    const res  = await fetch('/api/sweep/advance', { method: 'POST' });
+    const data = await res.json();
+    await fetchJobs();
+    const ok   = data.succeeded.length;
+    const fail = data.failed.length;
+    if (fail === 0) {
+      showToast(`⚡ ${ok} ticket${ok !== 1 ? 's' : ''} advanced to Remediated`, 'success', 6000);
+    } else {
+      const firstErr = data.failed[0]?.error || 'unknown error';
+      showToast(`⚡ ${ok} advanced · ${fail} failed: ${firstErr}`, 'warn', 9000);
+    }
+  } catch (e) {
+    showToast(`Advance All failed: ${e.message}`, 'error');
+  }
+}
+
 async function stopSweepScans() {
   // Stop all actively scanning sweep jobs
   const scanningIds = Object.values(state.jobs)
     .filter(j => j.source === 'sweep' && j.status === 'scanning')
     .map(j => j.id);
   if (!scanningIds.length) return;
+
+  // Remove these sweep jobs from the global bulk-scan tracker immediately.
+  // Without this, _bulkScan holds their IDs and the header stopAllBtn stays
+  // lit after the sweep scans stop, which looks like "it started again".
+  if (_bulkScan) {
+    scanningIds.forEach(id => _bulkScan.ids.delete(id));
+    _bulkScan.total = _bulkScan.ids.size;
+    if (_bulkScan.ids.size === 0) _bulkScan = null;
+  }
+
   showToast(`Stopping ${scanningIds.length} sweep scan${scanningIds.length !== 1 ? 's' : ''}…`, 'warn', 3000);
   await Promise.allSettled(
     scanningIds.map(id => fetch(`/api/jobs/${id}/stop`, { method: 'POST' }))
@@ -1653,14 +1884,20 @@ async function runSweep() {
 
 // ── Tab switching ─────────────────────────────────────────────────────────
 function switchTab(tab) {
-  const isDash     = tab === 'dashboard';
-  const isReport   = tab === 'report';
-  const isAssets   = tab === 'assets';
-  const isShell    = tab === 'shell';
-  const isSettings = tab === 'settings';
+  const isDash       = tab === 'dashboard';
+  const isReport     = tab === 'report';
+  const isWeekly     = tab === 'weekly';
+  const isDuplicates  = tab === 'duplicates';
+  const isBatchScan   = tab === 'batchscan';
+  const isAssets     = tab === 'assets';
+  const isShell      = tab === 'shell';
+  const isSettings   = tab === 'settings';
 
   $('tabDashboard').classList.toggle('active', isDash);
   $('tabReport').classList.toggle('active', isReport);
+  $('tabWeekly').classList.toggle('active', isWeekly);
+  $('tabDuplicates').classList.toggle('active', isDuplicates);
+  $('tabBatchScan').classList.toggle('active', isBatchScan);
   $('tabAssets').classList.toggle('active', isAssets);
   $('tabShell').classList.toggle('active', isShell);
   $('tabSettings').classList.toggle('active', isSettings);
@@ -1675,6 +1912,21 @@ function switchTab(tab) {
   const rv = $('reportView');
   rv.style.display       = isReport ? 'flex' : 'none';
   rv.style.flexDirection = 'column';
+
+  // Weekly report view
+  const wv = $('weeklyView');
+  wv.style.display       = isWeekly ? 'flex' : 'none';
+  wv.style.flexDirection = 'column';
+
+  // Duplicates view
+  const dv = $('duplicatesView');
+  dv.style.display       = isDuplicates ? 'flex' : 'none';
+  dv.style.flexDirection = 'column';
+
+  const bsv = $('batchScanView');
+  bsv.style.display       = isBatchScan ? 'flex' : 'none';
+  bsv.style.flexDirection = 'column';
+  if (isBatchScan) initBatchScan();
 
   // Assets view
   const av = $('assetsView');
@@ -1692,6 +1944,7 @@ function switchTab(tab) {
   sv.style.flexDirection = 'column';
 
   if (isReport) initReportControls();
+  if (isWeekly) initWeeklyReportControls();
   if (isAssets) initAssetsTab();
   if (isShell) initShellTab(); else stopTunnelPolling();
   if (isSettings) initSettingsTab();
@@ -1702,14 +1955,8 @@ let _assetsCurrentLabel = '';
 
 function initAssetsTab() {
   const sel = $('assetsClient');
-  if (sel.options.length === 0) {
-    Array.from($('clientFilter').options).slice(1).forEach(opt => {
-      const o = document.createElement('option');
-      o.value = opt.value;
-      o.textContent = opt.textContent;
-      sel.appendChild(o);
-    });
-  }
+  // Options are kept in sync by _syncClientDropdowns() via fetchClients().
+  // Just trigger a load for whatever client is currently selected.
   if (sel.value) { _assetsCurrentLabel = sel.value; loadAssetsForClient(sel.value); }
 }
 
@@ -1745,7 +1992,7 @@ async function saveAssets() {
   const label = $('assetsClient').value;
   if (!label) { showToast('Select a client first', 'warn'); return; }
   const raw     = $('assetsTextarea').value;
-  const entries = raw.split('\n').map(s => s.trim()).filter(Boolean);
+  const entries = raw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
   if (!entries.length) { showToast('No entries to save', 'warn'); return; }
 
   try {
@@ -1868,7 +2115,7 @@ async function onNessusFolderToggle(folderId, checked) {
         : '';
       return `
         <label style="display:flex;align-items:center;gap:8px;padding:4px 2px;cursor:pointer;border-bottom:1px solid var(--border)">
-          <input type="checkbox" class="nessus-scan-check" value="${s.id}" onchange="_updateNessusPullBtn()" ${s.status === 'completed' ? 'checked' : ''}>
+          <input type="checkbox" class="nessus-scan-check" value="${s.id}" data-hosts="${s.total_hosts || 0}" onchange="_updateNessusPullBtn()" ${s.status === 'completed' ? 'checked' : ''}>
           <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(s.name)}</span>
           ${hostCount}
           <span style="color:${stColor};flex-shrink:0;font-size:10px">${escHtml(s.status)}</span>
@@ -1885,9 +2132,23 @@ async function onNessusFolderToggle(folderId, checked) {
 }
 
 function _updateNessusPullBtn() {
-  const any = document.querySelectorAll('.nessus-scan-check:checked').length > 0;
+  const checked = document.querySelectorAll('.nessus-scan-check:checked');
+  const any = checked.length > 0;
   $('nessusPullBtn').disabled = !any;
-  $('nessusExportBtn').disabled = !any;
+  if (!any) { $('nessusHostCount').textContent = ''; return; }
+
+  // Show loading then fetch actual count from Nessus scan details
+  $('nessusHostCount').textContent = '🖥 counting hosts…';
+  const label   = $('assetsClient').value;
+  const scanIds = Array.from(checked).map(cb => parseInt(cb.value, 10));
+  fetch(`/api/nessus/${encodeURIComponent(label)}/host-count`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ scan_ids: scanIds }),
+  })
+  .then(r => r.json())
+  .then(d => { $('nessusHostCount').textContent = `🖥 ${(d.total_hosts || 0).toLocaleString()} hosts in selected scans`; })
+  .catch(() => { $('nessusHostCount').textContent = ''; });
 }
 
 const NESSUS_PORT = 8834;
@@ -2042,29 +2303,29 @@ function renderAssetsResults(data) {
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px">
       <div class="report-card" style="padding:14px">
         <div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Reachable (In Scope)</div>
-        <div style="font-size:32px;font-weight:700;color:var(--green)">${c.in_scope_scanned || 0}</div>
-        <div style="font-size:11px;color:var(--text-dim)">in asset list + found by Nessus</div>
+        <div style="font-size:32px;font-weight:700;color:var(--green)">${c.reachable || 0}</div>
+        <div style="font-size:11px;color:var(--text-dim)">scope entries with hosts found by Nessus</div>
       </div>
       <div class="report-card" style="padding:14px">
-        <div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Not Found in Scans (In Scope)</div>
-        <div style="font-size:32px;font-weight:700;color:var(--orange)">${c.in_scope_missed || 0}</div>
-        <div style="font-size:11px;color:var(--text-dim)">in asset list + absent from selected scans</div>
+        <div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Not Reachable (In Scope)</div>
+        <div style="font-size:32px;font-weight:700;color:var(--orange)">${c.not_reachable || 0}</div>
+        <div style="font-size:11px;color:var(--text-dim)">scope entries (IPs/subnets) with no hosts found</div>
       </div>
       <div class="report-card" style="padding:14px">
         <div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Out of Scope</div>
         <div style="font-size:32px;font-weight:700;color:var(--purple)">${c.out_of_scope || 0}</div>
-        <div style="font-size:11px;color:var(--text-dim)">in Nessus scan + NOT in asset list</div>
+        <div style="font-size:11px;color:var(--text-dim)">hosts Nessus found outside scope</div>
       </div>
     </div>
 
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
       <div class="report-card" style="padding:14px">
-        <div style="font-size:11px;font-weight:600;color:var(--green);margin-bottom:10px">✅ Reachable — In Scope (${c.in_scope_scanned || 0})</div>
-        <div style="line-height:2">${ipChips(data.in_scope_scanned, 'var(--green)')}</div>
+        <div style="font-size:11px;font-weight:600;color:var(--green);margin-bottom:10px">✅ Reachable — In Scope (${c.reachable || 0})</div>
+        <div style="line-height:2">${ipChips(data.reachable, 'var(--green)')}</div>
       </div>
       <div class="report-card" style="padding:14px">
-        <div style="font-size:11px;font-weight:600;color:var(--orange);margin-bottom:10px">⚠️ Not Found in Selected Scans — In Scope (${c.in_scope_missed || 0})</div>
-        <div style="line-height:2">${ipChips(data.in_scope_missed, 'var(--orange)')}</div>
+        <div style="font-size:11px;font-weight:600;color:var(--orange);margin-bottom:10px">⚠️ Not Reachable — In Scope (${c.not_reachable || 0})</div>
+        <div style="line-height:2">${ipChips(data.not_reachable, 'var(--orange)')}</div>
       </div>
       <div class="report-card" style="padding:14px">
         <div style="font-size:11px;font-weight:600;color:var(--purple);margin-bottom:10px">🔍 Out of Scope (${c.out_of_scope || 0})</div>
@@ -2080,10 +2341,10 @@ function downloadAssetsCSV() {
   const data = $('assetsResults')._lastResult;
   if (!data) return;
 
-  const rows = [['IP', 'Category']];
-  (data.in_scope_scanned || []).forEach(ip => rows.push([ip, 'Reachable - In Scope']));
-  (data.in_scope_missed  || []).forEach(ip => rows.push([ip, 'Not Found in Selected Scans - In Scope']));
-  (data.out_of_scope     || []).forEach(ip => rows.push([ip, 'Out of Scope']));
+  const rows = [['IP / Subnet', 'Category']];
+  (data.reachable     || []).forEach(ip => rows.push([ip, 'Reachable - In Scope']));
+  (data.not_reachable || []).forEach(ip => rows.push([ip, 'Not Reachable - In Scope']));
+  (data.out_of_scope  || []).forEach(ip => rows.push([ip, 'Out of Scope']));
 
   const csv  = rows.map(r => r.join(',')).join('\n');
   const blob = new Blob([csv], { type: 'text/csv' });
@@ -2099,72 +2360,16 @@ function downloadAssetsCSV() {
 
 // ── Nessus CSV export (bulk ZIP download) ────────────────────────────────────
 
-async function downloadReports() {
-  const label = $('assetsClient').value;
-  if (!label) { showToast('Select a client first', 'warn'); return; }
-
-  const checked  = [...document.querySelectorAll('.nessus-scan-check:checked')];
-  const scanIds  = checked.map(cb => parseInt(cb.value, 10));
-  if (!scanIds.length) { showToast('No scans selected', 'warn'); return; }
-
-  const btn    = $('nessusExportBtn');
-  const status = $('nessusPullStatus');
-  btn.disabled    = true;
-  btn.textContent = 'Exporting…';
-  status.textContent = `Generating CSV report${scanIds.length > 1 ? 's' : ''} for ${scanIds.length} scan(s) — this can take a minute…`;
-
-  try {
-    const res = await fetch(`/api/nessus/${encodeURIComponent(label)}/export`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scan_ids: scanIds }),
-    });
-    if (!res.ok) {
-      const d = await res.json().catch(() => ({}));
-      throw new Error(d.detail || 'Export failed');
-    }
-
-    const errCount = parseInt(res.headers.get('X-Export-Errors') || '0', 10);
-    const blob = await res.blob();
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href     = url;
-    a.download = `nessus_reports_${new Date().toISOString().slice(0, 10)}.zip`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-
-    if (errCount > 0) {
-      showToast(`Downloaded with ${errCount} export error(s) — some scans may be missing`, 'warn', 8000);
-    } else {
-      showToast(`✅ Downloaded ${scanIds.length} report(s)`, 'success');
-    }
-    status.textContent = '';
-  } catch (e) {
-    showToast(e.message, 'error');
-    status.textContent = '';
-  } finally {
-    btn.disabled    = false;
-    btn.textContent = '⬇ Download Reports';
-  }
-}
 
 // ── Monthly Report ────────────────────────────────────────────────────────
+let _reportListenersAdded = false;
 function initReportControls() {
-  // Populate client dropdown once
-  const sel = $('reportClient');
-  if (sel.options.length === 0) {
-    const srcSel = $('clientFilter');
-    Array.from(srcSel.options).slice(1).forEach(opt => {
-      const o = document.createElement('option');
-      o.value = opt.value;
-      o.textContent = opt.textContent;
-      sel.appendChild(o);
-    });
-    // Auto-generate when client or month changes
-    sel.addEventListener('change', generateReport);
+  // Options are kept in sync by _syncClientDropdowns() via fetchClients().
+  // Only attach the change listeners once.
+  if (!_reportListenersAdded) {
+    $('reportClient').addEventListener('change', generateReport);
     $('reportMonth').addEventListener('change', generateReport);
+    _reportListenersAdded = true;
   }
 
   // Set max month to last completed month
@@ -2297,6 +2502,485 @@ function renderReport(d) {
   $('reportResults').innerHTML = html;
 }
 
+// ── Weekly Report ─────────────────────────────────────────────────────────
+let _weeklyListenersAdded = false;
+
+function initWeeklyReportControls() {
+  if (!_weeklyListenersAdded) {
+    $('weeklyClient').addEventListener('change', generateWeeklyReport);
+    $('weeklyWeek').addEventListener('change', generateWeeklyReport);
+    _weeklyListenersAdded = true;
+  }
+
+  // Max date = last Sunday that has fully passed
+  // (dow 0=Sun: go back 7; Mon-Sat: go back dow days to reach last Sun)
+  const inp = $('weeklyWeek');
+  const today = new Date();
+  const dow = today.getDay();
+  const lastSunday = new Date(today);
+  lastSunday.setDate(today.getDate() - (dow === 0 ? 7 : dow));
+  const maxDate = lastSunday.toISOString().slice(0, 10);
+  inp.max = maxDate;
+  if (!inp.value) inp.value = maxDate;
+}
+
+async function generateWeeklyReport() {
+  const client = $('weeklyClient').value;
+  const day    = $('weeklyWeek').value;
+
+  if (!client) { showToast('Please select a client', 'warn'); return; }
+  if (!day)    { showToast('Please select a date',   'warn'); return; }
+
+  const btn = $('weeklyGenBtn');
+  btn.disabled = true;
+  btn.textContent = 'Loading…';
+  $('weeklyResults').innerHTML = '<div class="report-loading">⏳ Fetching data from Jira…</div>';
+
+  try {
+    const res = await fetch(`/api/report/weekly?client=${encodeURIComponent(client)}&day=${encodeURIComponent(day)}`);
+    const data = await res.json();
+    if (!res.ok) {
+      $('weeklyResults').innerHTML = `<div class="report-error">⚠️ ${escHtml(data.detail || 'Unknown error')}</div>`;
+      return;
+    }
+    renderWeeklyReport(data);
+  } catch (e) {
+    $('weeklyResults').innerHTML = `<div class="report-error">⚠️ Request failed: ${escHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Generate Report';
+  }
+}
+
+function renderWeeklyReport(d) {
+  const p = d.period;
+  // Format e.g. "Mon 8 Jun" / "Sun 14 Jun 2026"
+  const fmtDate = iso => {
+    const dt = new Date(iso + 'T00:00:00');
+    return dt.toLocaleDateString('default', { weekday: 'short', day: 'numeric', month: 'short' });
+  };
+  const endYear = new Date(p.week_end + 'T00:00:00').getFullYear();
+  const title = `Week of ${fmtDate(p.week_start)} – ${fmtDate(p.week_end)} ${endYear} — ${d.client}`;
+
+  function val(n) {
+    return n === -1 ? '<span style="color:var(--text-dim)">ERR</span>' : n;
+  }
+
+  function card(header, sub, rows) {
+    const rowsHtml = rows.map(([label, value, cls]) => `
+      <div class="report-row ${cls || ''}">
+        <span class="report-row-label">${label}</span>
+        <span class="report-row-value">${val(value)}</span>
+      </div>`).join('');
+    const subHtml = sub ? `<div class="report-card-sub">${escHtml(sub)}</div>` : '';
+    return `
+      <div class="report-card">
+        <div class="report-card-header">${escHtml(header)}${subHtml}</div>
+        <div class="report-card-body">${rowsHtml}</div>
+      </div>`;
+  }
+
+  const nt = d.new_tickets;
+  const ot = d.open_tickets;
+  const nv = d.new_vulnerabilities || { is_sample: false, items: [] };
+
+  function ratingClass(rating) {
+    const v = (rating || '').toLowerCase();
+    return ['critical', 'high', 'medium', 'low'].includes(v) ? `rating-${v}` : '';
+  }
+
+  function vulnTable() {
+    const sub = nv.is_sample
+      ? `No tickets created this week — random sample of currently open vulnerabilities`
+      : `Created ${fmtDate(p.week_start)} – ${fmtDate(p.week_end)}`;
+    const bodyHtml = nv.items.length
+      ? nv.items.map(it => `
+        <tr>
+          <td>${escHtml(it.vuln_name)}</td>
+          <td class="vuln-key">${escHtml(it.key)}</td>
+          <td class="vuln-ip">${escHtml(it.ip || '—')}</td>
+          <td class="vuln-rating ${ratingClass(it.rating)}">${escHtml(it.rating || '—')}</td>
+        </tr>`).join('')
+      : `<tr><td colspan="4" class="report-vuln-empty">No vulnerabilities to show</td></tr>`;
+    return `
+      <div class="report-vuln-card">
+        <div class="report-card-header">New Discovered Vulnerabilities<div class="report-card-sub">${escHtml(sub)}</div></div>
+        <table class="report-vuln-table">
+          <thead><tr><th>Vulnerability</th><th>Issue Key</th><th>IP Address</th><th>Rating</th></tr></thead>
+          <tbody>${bodyHtml}</tbody>
+        </table>
+      </div>`;
+  }
+
+  const html = `
+    <div style="margin-bottom:18px;font-size:15px;font-weight:700;color:var(--text)">${escHtml(title)}</div>
+
+    ${vulnTable()}
+
+    <div class="report-grid">
+
+      ${card('New Tickets', `Created ${fmtDate(p.week_start)} – ${fmtDate(p.week_end)}`, [
+        ['New Tickets', nt.total,    'row-total'],
+        ['Critical',   nt.critical, 'row-critical'],
+        ['High',       nt.high,     'row-high'],
+        ['Medium',     nt.medium,   'row-medium'],
+        ['Low',        nt.low,      'row-low'],
+      ])}
+
+      ${card('Fixed This Week', `Resolved ${fmtDate(p.week_start)} – ${fmtDate(p.week_end)}`, [
+        ['Fixed & Closed', d.fixed_this_week, 'row-total'],
+      ])}
+
+      ${card('Total Open Tickets', `As of ${fmtDate(p.week_end)}`, [
+        ['Total Open',    ot.total,         'row-total'],
+        ['Critical',      ot.critical,      'row-critical'],
+        ['High',          ot.high,          'row-high'],
+        ['Medium',        ot.medium,        'row-medium'],
+        ['Low',           ot.low,           'row-low'],
+        ['Risk Accepted', ot.risk_accepted, 'row-risk'],
+      ])}
+
+    </div>
+
+    <div class="report-footer">
+      <span class="report-footer-label">Total Fixed as of ${fmtDate(p.week_end)}</span>
+      <span class="report-footer-value">${val(d.total_fixed_to_date)}</span>
+    </div>`;
+
+  $('weeklyResults').innerHTML = html;
+}
+
+// ── Duplicate Detection ───────────────────────────────────────────────────
+
+async function findDuplicates() {
+  const client = $('duplicatesClient').value;
+  if (!client) { showToast('Please select a client', 'warn'); return; }
+
+  const btn = $('duplicatesFindBtn');
+  btn.disabled = true;
+  btn.textContent = 'Searching…';
+  $('duplicatesResults').innerHTML = '<div class="report-loading">⏳ Scanning Jira for duplicate tickets…</div>';
+
+  try {
+    const res  = await fetch(`/api/duplicates?client=${encodeURIComponent(client)}`);
+    const data = await res.json();
+    if (!res.ok) {
+      $('duplicatesResults').innerHTML = `<div class="report-error">⚠️ ${escHtml(data.detail || 'Unknown error')}</div>`;
+      return;
+    }
+    renderDuplicates(data);
+  } catch (e) {
+    $('duplicatesResults').innerHTML = `<div class="report-error">⚠️ Request failed: ${escHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Find Duplicates';
+  }
+}
+
+function renderDuplicates(data) {
+  const container = $('duplicatesResults');
+
+  if (data.total_groups === 0) {
+    container.innerHTML = `
+      <div class="report-card" style="padding:20px;text-align:center;color:var(--text-dim)">
+        ✅ No duplicate tickets found for <strong>${escHtml(data.client)}</strong>
+      </div>`;
+    return;
+  }
+
+  const summary = `
+    <div style="margin-bottom:20px">
+      <span style="font-size:15px;font-weight:700;color:var(--text)">
+        ${data.total_groups} duplicate group${data.total_groups !== 1 ? 's' : ''}
+        &nbsp;·&nbsp; ${data.total_duplicates} extra ticket${data.total_duplicates !== 1 ? 's' : ''}
+      </span>
+      <div style="margin-top:6px;font-size:12px;color:var(--text-dim)">
+        Click any ticket key to open it in Jira — handle deletion or closure there manually.
+      </div>
+    </div>`;
+
+  const groupsHtml = data.groups.map((g, gi) => {
+    const ticketsHtml = g.tickets.map(t => {
+      const isKeep = t.key === g.keep;
+      return `
+        <div class="dup-ticket-row ${isKeep ? 'dup-keep' : ''}">
+          <a class="dup-key" href="${escHtml(t.jira_url)}" target="_blank" rel="noopener"
+             title="Open in Jira">${escHtml(t.key)} ↗</a>
+          <span class="dup-status">${escHtml(t.status || '—')}</span>
+          ${isKeep
+            ? '<span class="dup-badge dup-badge-keep">keep</span>'
+            : '<span class="dup-badge dup-badge-dup">duplicate</span>'}
+        </div>`;
+    }).join('');
+
+    return `
+      <div class="report-card dup-group" style="margin-bottom:16px">
+        <div class="report-card-header">${escHtml(g.vuln_name)}</div>
+        <div class="report-card-body" style="padding-top:10px">${ticketsHtml}</div>
+      </div>`;
+  }).join('');
+
+  container.innerHTML = summary + groupsHtml;
+}
+
+// ── Batch Scan ────────────────────────────────────────────────────────────
+let _batchResults   = [];
+let _batchRulesLoaded = false;
+let _batchScanId    = null;   // active scan_id for streaming / cancel
+let _batchTotal     = 0;
+let _batchRuleName  = '';
+let _batchHasCert   = false;
+
+async function initBatchScan() {
+  if (_batchRulesLoaded) return;
+  try {
+    const res   = await fetch('/api/batch-scan/rules');
+    const rules = await res.json();
+    const sel   = $('batchRule');
+    sel.innerHTML = '<option value="">— Select a scan rule —</option>';
+    rules.forEach(r => {
+      const opt = document.createElement('option');
+      opt.value = r.name;
+      opt.textContent = r.name;
+      sel.appendChild(opt);
+    });
+    _batchRulesLoaded = true;
+  } catch (e) {
+    log.warn('Could not load scan rules:', e);
+  }
+}
+
+async function runBatchScan() {
+  const client   = $('batchClient').value;
+  const ruleName = $('batchRule').value;
+  const file     = $('batchFile').files[0];
+  if (!client)   { showToast('Please select a client', 'warn');       return; }
+  if (!ruleName) { showToast('Please select a scan rule', 'warn');    return; }
+  if (!file)     { showToast('Please select an Excel or CSV file', 'warn'); return; }
+
+  // ── Phase 1: POST to start scan, get scan_id + total ──────────────────
+  const runBtn  = $('batchRunBtn');
+  const stopBtn = $('batchStopBtn');
+  runBtn.disabled   = true;
+  runBtn.textContent = 'Starting…';
+  stopBtn.style.display = '';
+  $('batchProgress').style.display = '';
+  $('batchProgressBar').style.width = '0%';
+  $('batchProgressText').textContent = 'Starting scan…';
+  $('batchResults').innerHTML = '';
+  _batchResults  = [];
+  _batchScanId   = null;
+
+  let scanId, total;
+  try {
+    const form = new FormData();
+    form.append('client',    client);
+    form.append('rule_name', ruleName);
+    form.append('file',      file);
+    const res  = await fetch('/api/batch-scan/run', { method: 'POST', body: form });
+    const data = await res.json();
+    if (!res.ok) {
+      $('batchProgress').style.display = 'none';
+      stopBtn.style.display = 'none';
+      $('batchResults').innerHTML = `<div class="report-error">⚠️ ${escHtml(data.detail || 'Unknown error')}</div>`;
+      runBtn.disabled   = false;
+      runBtn.textContent = 'Run Scan';
+      return;
+    }
+    scanId         = data.scan_id;
+    total          = data.total;
+    _batchScanId   = scanId;
+    _batchTotal    = total;
+    _batchRuleName = data.rule;
+  } catch (e) {
+    $('batchProgress').style.display = 'none';
+    stopBtn.style.display = 'none';
+    $('batchResults').innerHTML = `<div class="report-error">⚠️ Request failed: ${escHtml(e.message)}</div>`;
+    runBtn.disabled   = false;
+    runBtn.textContent = 'Run Scan';
+    return;
+  }
+
+  runBtn.textContent = `Scanning…`;
+
+  // Seed the results table structure immediately
+  _batchHasCert = false;
+  _batchResults = [];
+  $('batchResults').innerHTML = _batchTableShell(ruleName, total, false);
+
+  // ── Phase 2: Stream results via SSE ────────────────────────────────────
+  try {
+    const resp   = await fetch(`/api/batch-scan/stream/${scanId}`);
+    const reader = resp.body.getReader();
+    const dec    = new TextDecoder();
+    let   buf    = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let msg;
+        try { msg = JSON.parse(line.slice(6)); } catch { continue; }
+
+        if (msg.type === 'result') {
+          const r = msg.data;
+          _batchResults.push(r);
+
+          // Detect cert columns on first cert-bearing row
+          if (!_batchHasCert && r.valid_to && r.valid_to !== 'N/A') {
+            _batchHasCert = true;
+            // Rebuild table with cert headers
+            $('batchResults').innerHTML = _batchTableShell(ruleName, total, true);
+            // Re-append all previous rows
+            const tbody = document.querySelector('#batchResults tbody');
+            _batchResults.slice(0, -1).forEach(prev => {
+              tbody.insertAdjacentHTML('beforeend', _batchRow(prev, true));
+            });
+          }
+
+          // Append this row
+          const tbody = document.querySelector('#batchResults tbody');
+          if (tbody) tbody.insertAdjacentHTML('beforeend', _batchRow(r, _batchHasCert));
+
+          // Update summary counters
+          _batchUpdateCounts();
+
+          // Progress bar
+          const done_count = msg.done || _batchResults.length;
+          const pct = Math.round((done_count / total) * 100);
+          $('batchProgressBar').style.width = pct + '%';
+          $('batchProgressText').textContent = `Scanning ${done_count} of ${total} assets…`;
+
+        } else if (msg.type === 'done' || msg.type === 'cancelled') {
+          const label = msg.type === 'cancelled' ? 'Scan stopped' : 'Scan complete';
+          $('batchProgressText').textContent = `${label} — ${_batchResults.length} of ${total} assets`;
+          $('batchProgressBar').style.width  = '100%';
+          // Show export button in summary
+          const expBtn = document.getElementById('batchExportBtn');
+          if (expBtn) expBtn.style.display = '';
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    if (_batchScanId) {  // not a user cancel
+      $('batchResults').insertAdjacentHTML('beforeend',
+        `<div class="report-error" style="margin-top:8px">⚠️ Stream error: ${escHtml(e.message)}</div>`);
+    }
+  } finally {
+    _batchScanId = null;
+    runBtn.disabled    = false;
+    runBtn.textContent = 'Run Scan';
+    stopBtn.style.display = 'none';
+    if (_batchResults.length) $('batchClearBtn').style.display = '';
+  }
+}
+
+async function stopBatchScan() {
+  if (!_batchScanId) return;
+  const id = _batchScanId;
+  _batchScanId = null;   // prevent error toast in catch block above
+  try {
+    await fetch(`/api/batch-scan/cancel/${id}`, { method: 'POST' });
+  } catch { /* ignore */ }
+  showToast('Scan stopped', 'warn');
+}
+
+function clearBatchScan() {
+  _batchResults  = [];
+  _batchScanId   = null;
+  _batchTotal    = 0;
+  _batchRuleName = '';
+  _batchHasCert  = false;
+  $('batchResults').innerHTML   = '';
+  $('batchProgress').style.display  = 'none';
+  $('batchProgressBar').style.width = '0%';
+  $('batchClearBtn').style.display  = 'none';
+  $('batchFile').value = '';
+}
+
+// Build the empty table shell (summary row + table headers + empty tbody)
+function _batchTableShell(ruleName, total, hasCert) {
+  const certHdr = hasCert ? '<th>Valid To</th><th>Days</th>' : '';
+  return `
+    <div style="margin-bottom:12px">
+      <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">
+        ${escHtml(ruleName)} — ${total} assets
+      </div>
+      <div id="batchCounts" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <span class="ssl-badge ssl-valid"  id="bc-fixed">✅ 0 Not Vulnerable</span>
+        <span class="ssl-badge ssl-expired" id="bc-notfixed">❌ 0 Vulnerable</span>
+        <span class="ssl-badge ssl-nocert" id="bc-inconclusive">⚠️ 0 Inconclusive</span>
+        <button id="batchExportBtn" class="btn btn-secondary btn-sm" onclick="exportBatchCsv()"
+                style="margin-left:auto;display:none">⬇ Export CSV</button>
+      </div>
+    </div>
+    <div class="report-vuln-card">
+      <table class="report-vuln-table">
+        <thead><tr><th>IP</th><th>Port</th>${certHdr}<th>Status</th><th>Detail</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>`;
+}
+
+function _batchRow(r, hasCert) {
+  const cls  = { fixed: 'ssl-valid', not_fixed: 'ssl-expired', inconclusive: 'ssl-nocert' }[r.verdict] || 'ssl-nocert';
+  const days = typeof r.days === 'number'
+    ? (r.days < 0 ? `<span style="color:var(--red)">${r.days}</span>` : r.days)
+    : escHtml(String(r.days));
+  const certCols = hasCert
+    ? `<td>${escHtml(r.valid_to)}</td><td>${days}</td>`
+    : '';
+  return `<tr>
+    <td>${escHtml(r.ip)}</td>
+    <td>${escHtml(String(r.port))}</td>
+    ${certCols}
+    <td><span class="ssl-status-badge ${cls}">${escHtml(r.status)}</span></td>
+    <td style="font-size:11px;color:var(--text-dim)">${escHtml(r.detail)}</td>
+  </tr>`;
+}
+
+function _batchUpdateCounts() {
+  const counts = { fixed: 0, not_fixed: 0, inconclusive: 0 };
+  _batchResults.forEach(r => {
+    const k = r.verdict;
+    if (k in counts) counts[k]++; else counts.inconclusive++;
+  });
+  const f = document.getElementById('bc-fixed');
+  const n = document.getElementById('bc-notfixed');
+  const i = document.getElementById('bc-inconclusive');
+  if (f) f.textContent = `✅ ${counts.fixed} Not Vulnerable`;
+  if (n) n.textContent = `❌ ${counts.not_fixed} Vulnerable`;
+  if (i) i.textContent = `⚠️ ${counts.inconclusive} Inconclusive`;
+}
+
+async function exportBatchCsv() {
+  if (!_batchResults.length) { showToast('No results to export', 'warn'); return; }
+  try {
+    const rule = _batchRuleName || $('batchRule').value;
+    const res  = await fetch('/api/batch-scan/export', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ results: _batchResults, rule }),
+    });
+    if (!res.ok) { showToast('Export failed', 'error'); return; }
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = res.headers.get('Content-Disposition')?.match(/filename=(.+)/)?.[1] || 'batch_scan.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    showToast(`Export failed: ${e.message}`, 'error');
+  }
+}
+
 // ── Theme ─────────────────────────────────────────────────────────────────
 function toggleTheme() {
   const isLight = document.documentElement.getAttribute('data-theme') === 'light';
@@ -2326,15 +3010,7 @@ let _shellSocket = null;
 let _shellResizeListenerAdded = false;
 
 function initShellTab() {
-  const sel = $('shellClient');
-  if (sel.options.length === 0) {
-    Array.from($('clientFilter').options).slice(1).forEach(opt => {
-      const o = document.createElement('option');
-      o.value = opt.value;
-      o.textContent = opt.textContent;
-      sel.appendChild(o);
-    });
-  }
+  // Options are kept in sync by _syncClientDropdowns() via fetchClients().
 
   if (!_shellTerm) {
     _shellTerm = new Terminal({
@@ -2540,20 +3216,20 @@ async function refreshTunnels() {
 let _settingsLoaded = false;
 let _settingsRowSeq = 0;
 
-function settingsClientRowHtml(c) {
+function settingsClientRowHtml(c, session = 'axian') {
   const rowId = `set-client-${_settingsRowSeq++}`;
-  const labelLocked = !!c.label; // existing clients keep a fixed label (key into config)
+  const labelLocked = !!c.label;
   return `
-    <div class="settings-client-row" id="${rowId}" data-orig-label="${escHtml(c.label || '')}">
+    <div class="settings-client-row" id="${rowId}" data-orig-label="${escHtml(c.label || '')}" data-session="${session}">
       <button type="button" class="settings-remove-client" onclick="removeSettingsClientRow('${rowId}')" title="Remove client">✕</button>
       <div class="settings-client-row-grid">
         <div>
-          <label>Label</label>
-          <input type="text" class="text-input set-c-label" value="${escHtml(c.label || '')}" ${labelLocked ? 'readonly' : ''} placeholder="ClientA">
+          <label>Label${session === 'non_axian' ? ' (= project key)' : ''}</label>
+          <input type="text" class="text-input set-c-label" value="${escHtml(c.label || '')}" ${labelLocked ? 'readonly' : ''} placeholder="${session === 'non_axian' ? 'CPEL' : 'ClientA'}">
         </div>
         <div>
           <label>Display Name</label>
-          <input type="text" class="text-input set-c-name" value="${escHtml(c.name || '')}" placeholder="Client A">
+          <input type="text" class="text-input set-c-name" value="${escHtml(c.name || '')}" placeholder="${session === 'non_axian' ? 'CPEL Project' : 'Client A'}">
         </div>
         <div>
           <label>Kali Port</label>
@@ -2569,7 +3245,6 @@ function settingsClientRowHtml(c) {
           <label>Kali Password ${c.kali_password_set ? '<span style="color:var(--green)">(set)</span>' : '<span style="color:var(--orange)">(not set)</span>'}</label>
           <input type="password" class="text-input set-c-kalipass" placeholder="Leave blank to keep current">
         </div>
-        <div></div>
         <div>
           <label>Nessus Access Key ${c.nessus_access_key_set ? '<span style="color:var(--green)">(set)</span>' : '<span style="color:var(--text-dim)">(not set)</span>'}</label>
           <input type="password" class="text-input set-c-nessusaccess" placeholder="Leave blank to keep current">
@@ -2594,6 +3269,16 @@ function renderSettings(data) {
     ? '<span style="color:var(--green)">(set — leave blank to keep)</span>'
     : '<span style="color:var(--orange)">(not set)</span>';
 
+  // Non-Axian Jira
+  const j2 = data.jira_secondary || {};
+  $('setJira2Url').value          = j2.url || '';
+  $('setJira2RetestStatus').value = j2.retest_status || 'Remediated';
+  $('setJira2PollInterval').value = j2.poll_interval || 300;
+  $('setJira2Token').value        = '';
+  $('setJira2TokenStatus').innerHTML = j2.api_token_set
+    ? '<span style="color:var(--green)">(set — leave blank to keep)</span>'
+    : '<span style="color:var(--text-dim)">(not set)</span>';
+
   $('setJumpHost').value     = data.jump_server.host;
   $('setJumpPort').value     = data.jump_server.port;
   $('setJumpUser').value     = data.jump_server.user;
@@ -2602,8 +3287,11 @@ function renderSettings(data) {
     ? '<span style="color:var(--green)">(set — leave blank to keep)</span>'
     : '<span style="color:var(--orange)">(not set)</span>';
 
-  $('settingsClientRows').innerHTML = data.clients.map(settingsClientRowHtml).join('')
+  $('settingsClientRows').innerHTML = (data.clients || []).map(c => settingsClientRowHtml(c, 'axian')).join('')
     || '<span style="color:var(--text-dim);font-size:12px">No clients configured yet — click "+ Add Client".</span>';
+
+  $('settingsClientRowsSecondary').innerHTML = (data.clients_secondary || []).map(c => settingsClientRowHtml(c, 'non_axian')).join('')
+    || '<div style="font-size:11px;color:var(--text-dim);padding:4px 0">No Non-Axian clients yet — click "+ Add Client" to add one.</div>';
 }
 
 async function initSettingsTab() {
@@ -2622,7 +3310,13 @@ async function initSettingsTab() {
 }
 
 function addSettingsClientRow() {
-  $('settingsClientRows').insertAdjacentHTML('beforeend', settingsClientRowHtml({}));
+  $('settingsClientRows').insertAdjacentHTML('beforeend', settingsClientRowHtml({}, 'axian'));
+}
+
+function addSecondaryClientRow() {
+  $('settingsClientRowsSecondary').innerHTML =
+    $('settingsClientRowsSecondary').innerHTML.replace(/<div style="font-size:11px.*?<\/div>/, '');
+  $('settingsClientRowsSecondary').insertAdjacentHTML('beforeend', settingsClientRowHtml({}, 'non_axian'));
 }
 
 function removeSettingsClientRow(rowId) {
@@ -2633,8 +3327,59 @@ function removeSettingsClientRow(rowId) {
   row.remove();
 }
 
+// ── Session switcher ──────────────────────────────────────────────────────
+
+async function initSessionBar() {
+  try {
+    const res = await fetch('/api/session');
+    if (!res.ok) return;
+    const data = await res.json();
+    _applySessionUI(data.active, data.non_axian_configured);
+  } catch (e) { /* ignore */ }
+}
+
+function _applySessionUI(session, nonAxianConfigured) {
+  const btnA = $('btnSessionAxian');
+  const btnB = $('btnSessionNonAxian');
+  const lbl  = $('sessionActiveLabel');
+  if (!btnA || !btnB) return;
+  btnA.classList.toggle('active', session === 'axian');
+  btnB.classList.toggle('active', session === 'non_axian');
+  btnB.disabled = !nonAxianConfigured;
+  btnB.title = nonAxianConfigured ? '' : 'Configure Non-Axian Jira in Settings first';
+  lbl.textContent = session === 'axian' ? 'Axian Jira' : 'Non-Axian Jira';
+  lbl.style.color = session === 'non_axian' ? 'var(--blue)' : 'var(--text-dim)';
+}
+
+async function switchSession(session) {
+  try {
+    const res = await fetch('/api/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(data.detail || 'Failed to switch session', 'error');
+      return;
+    }
+    _applySessionUI(session, true);
+    // Refresh everything for the new session
+    await fetchClients();
+    await fetchSshStatus();
+    await fetchJobs();
+    await fetchConfig();
+    showToast(
+      session === 'axian' ? 'Switched to Axian Jira' : 'Switched to Non-Axian Jira',
+      'success', 3000
+    );
+  } catch (e) {
+    showToast('Failed to switch session', 'error');
+  }
+}
+
 async function saveSettings() {
-  const clientRows = Array.from(document.querySelectorAll('.settings-client-row'));
+  const clientRows = Array.from(document.querySelectorAll('.settings-client-row[data-session="axian"]'));
   const clients = clientRows.map(row => {
     const v = sel => row.querySelector(sel).value;
     return {
@@ -2648,15 +3393,34 @@ async function saveSettings() {
     };
   });
 
+  const secondaryRows = Array.from(document.querySelectorAll('.settings-client-row[data-session="non_axian"]'));
+  const clients_secondary = secondaryRows.map(row => {
+    const v = sel => row.querySelector(sel).value;
+    return {
+      label: v('.set-c-label').trim(),
+      name: v('.set-c-name').trim(),
+      kali_port: parseInt(v('.set-c-kaliport'), 10) || 22,
+      kali_user: v('.set-c-kaliuser').trim() || 'kali',
+      kali_password: v('.set-c-kalipass') || null,
+      nessus_access_key: v('.set-c-nessusaccess') || null,
+      nessus_secret_key: v('.set-c-nessussecret') || null,
+    };
+  });
+
   if (!clients.length) {
-    showToast('Add at least one client before saving.', 'error');
+    showToast('Add at least one Axian client before saving.', 'error');
     return;
   }
   if (clients.some(c => !c.label)) {
-    showToast('Every client needs a label.', 'error');
+    showToast('Every Axian client needs a label.', 'error');
+    return;
+  }
+  if (clients_secondary.some(c => !c.label)) {
+    showToast('Every Non-Axian client needs a label.', 'error');
     return;
   }
 
+  const j2Url = $('setJira2Url').value.trim();
   const body = {
     jira: {
       url: $('setJiraUrl').value.trim(),
@@ -2666,6 +3430,12 @@ async function saveSettings() {
       retest_status: $('setJiraRetestStatus').value.trim() || 'Remediated',
       poll_interval: parseInt($('setJiraPollInterval').value, 10) || 300,
     },
+    jira_secondary: j2Url ? {
+      url: j2Url,
+      api_token: $('setJira2Token').value || null,
+      retest_status: $('setJira2RetestStatus').value.trim() || 'Remediated',
+      poll_interval: parseInt($('setJira2PollInterval').value, 10) || 300,
+    } : null,
     jump_server: {
       host: $('setJumpHost').value.trim(),
       port: parseInt($('setJumpPort').value, 10) || 22,
@@ -2673,6 +3443,7 @@ async function saveSettings() {
       password: $('setJumpPassword').value || null,
     },
     clients,
+    clients_secondary,
   };
 
   const btn = $('settingsSaveBtn');
@@ -2710,6 +3481,7 @@ async function saveSettings() {
     $('themeBtn').textContent = '☀️';
   }
 
+  await initSessionBar();
   await fetchConfig();
   await fetchClients();
   await fetchJobs();

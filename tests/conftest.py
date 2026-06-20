@@ -11,6 +11,7 @@ import pytest
 from unittest.mock import patch
 
 from src.config import Config, JiraConfig, JumpServerConfig, ClientConfig
+from src.config import load_config as _real_load_config  # captured before any patch is applied
 
 
 # ---------------------------------------------------------------------------

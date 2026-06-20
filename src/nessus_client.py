@@ -74,6 +74,15 @@ def get_scans(conn, access_key: str, secret_key: str, folder_id: Optional[int] =
     ]
 
 
+def get_scan_host_count(conn, access_key: str, secret_key: str, scan_id: int) -> int:
+    """Return just the host count for a scan without fetching all host details."""
+    data = _req(conn, "GET", f"/scans/{scan_id}", access_key, secret_key)
+    hosts = data.get("hosts") or []
+    info  = data.get("info") or {}
+    # Try info.hosts_total first (faster), fall back to counting hosts array
+    return info.get("hosts_total") or len(hosts)
+
+
 def get_scan_hosts(conn, access_key: str, secret_key: str, scan_id: int) -> List[Dict]:
     """Return all hosts found in a completed Nessus scan."""
     data = _req(conn, "GET", f"/scans/{scan_id}", access_key, secret_key)

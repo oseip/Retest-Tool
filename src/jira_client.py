@@ -36,6 +36,7 @@ class JiraClient:
         self._j = JIRA(
             server=cfg.url,
             basic_auth=self._auth,
+            get_server_info=False,
         )
         self._session = requests.Session()
         self._session.auth = self._auth
@@ -64,6 +65,11 @@ class JiraClient:
 
     def _fid(self, name: str) -> Optional[str]:
         return self._fields.get(name.lower())
+
+    @property
+    def severity_jql_field(self) -> str:
+        """JQL field reference for severity/vulnerability rating filtering."""
+        return '"vulnerability_Rating[Short text]"'
 
     # TestTypes that support automated scanning (nmap / curl)
     SCANNABLE_TYPES = {"SCN", "IPT"}
@@ -198,13 +204,20 @@ class JiraClient:
         },
     }
 
-    # Fast-track chains: what intermediate transitions are needed before the
-    # final Fixed / Not Fixed step, keyed by current ticket status (lower-case).
+    # Fast-track chains: ONLY the intermediate steps needed to escape the current
+    # status. The actual target ("Remediated" or "Fixed"/"Not Fixed") is appended
+    # by fast_track() via  full_chain = chain + [target].
+    #
+    # Phase-1 target is always "Remediated" (advance to it, then stop).
+    # Phase-2 target is "Fixed" or "Not Fixed" (only when already at Remediated).
+    #
+    # "Not Fixed" → "Refix" unlocks the ticket back to In Progress, then
+    #   "Remediated" completes phase 1.
     FAST_TRACK_CHAINS: Dict[str, List[str]] = {
-        "reported":    ["In Progress", "Remediated"],
-        "in progress": ["Remediated"],
-        "not fixed":   ["Remediated"],
-        "remediated":  [],   # direct — no intermediates needed
+        "reported":    ["In Progress"],          # → Remediated (phase 1 target)
+        "in progress": [],                       # → Remediated directly
+        "not fixed":   ["Refix", "Fix Issue"],   # Refix unlocks; Fix Issue reaches Remediated
+        "remediated":  [],                       # → Fixed / Not Fixed directly (phase 2)
     }
 
     def fast_track(self, key: str, target: str, comment: str = "") -> List[str]:
@@ -212,9 +225,22 @@ class JiraClient:
         Chain all intermediate transitions required to reach *target* from the
         ticket's current status, then apply *target* itself.
 
+        Intermediate steps are non-fatal — if one is unavailable for this
+        ticket's workflow (e.g. "Fix Issue" not present in every Jira instance)
+        it is skipped and the chain continues.
+
+        Before applying the final target transition, the live Jira status is
+        re-checked: if an intermediate already landed the ticket at *target*
+        (common when "Fix Issue" → Remediated), we stop early and return
+        without error.  This also handles stale-cache: if the ticket was
+        manually moved to *target* in Jira, the early-exit fires cleanly.
+
+        The comment (if any) is only posted AFTER all transitions succeed so
+        that a failed transition does not leave a spurious comment on the ticket.
+
         Returns the list of transition names that were successfully applied.
-        Raises ValueError if any step fails, with the completed list attached
-        as the ``completed`` attribute so callers can report partial progress.
+        Raises ValueError if the final target step fails, with the completed
+        list attached as the ``completed`` attribute.
         """
         current_status = self._j.issue(key).fields.status.name.lower().strip()
         chain = self.FAST_TRACK_CHAINS.get(current_status)
@@ -224,24 +250,54 @@ class JiraClient:
                 f"Defined for: {list(self.FAST_TRACK_CHAINS)}"
             )
 
+        # States that mean "the ticket is fully resolved" — used to detect when
+        # an intermediate transition (e.g. Fix Issue) jumped past the target.
+        _TERMINAL = {"fixed", "not fixed", "risk accepted", "closed", "done"}
+
         full_chain = chain + [target]
         completed: List[str] = []
 
-        # Optional comment goes on the ticket before any transitions fire
-        if comment:
-            self.add_comment(key, comment)
+        for i, step in enumerate(full_chain):
+            is_final = (i == len(full_chain) - 1)
 
-        for step in full_chain:
+            # Before the final (target) step, re-check live status.
+            # An intermediate (e.g. "Fix Issue") may have already landed
+            # the ticket at *target* or even past it — stop cleanly.
+            # Only treat a _TERMINAL status as "done" if the ticket actually
+            # moved away from its starting state; if it's still at the starting
+            # state we should proceed and apply the target normally.
+            if is_final:
+                live = self._j.issue(key).fields.status.name.lower().strip()
+                if live == target.lower() or (live in _TERMINAL and live != current_status):
+                    break  # already at/past target — done
+
             try:
                 self.transition(key, step)
                 completed.append(step)
             except Exception as exc:
-                err = ValueError(
-                    f"Fast-track failed at step '{step}' "
-                    f"(completed: {completed}): {exc}"
-                )
-                err.completed = completed  # type: ignore[attr-defined]
-                raise err
+                if is_final:
+                    # Before raising, do one last live check: the ticket may have
+                    # reached a terminal state via the intermediates even though the
+                    # target transition is not available (e.g. Fix Issue → Fixed
+                    # when the declared target was Remediated).
+                    try:
+                        live_after = self._j.issue(key).fields.status.name.lower().strip()
+                        if live_after == target.lower() or live_after in _TERMINAL:
+                            break  # already done — swallow the error
+                    except Exception:
+                        pass
+                    err = ValueError(
+                        f"Fast-track failed at step '{step}' "
+                        f"(completed: {completed}): {exc}"
+                    )
+                    err.completed = completed  # type: ignore[attr-defined]
+                    raise err
+                # Intermediate step unavailable in this Jira workflow — skip it.
+                # The subsequent steps (including the target) will still be tried.
+
+        # Comment is posted only after every transition has succeeded
+        if comment:
+            self.add_comment(key, comment)
 
         return completed
 
