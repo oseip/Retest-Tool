@@ -8,9 +8,16 @@
 </head>
 <body>
 
+  <!-- Theme toggle — fixed top-right corner -->
+  <button onclick="toggleSetupTheme()" title="Toggle theme"
+          style="position:fixed;top:14px;right:16px;z-index:999;background:transparent;border:1px solid var(--border);
+                 border-radius:6px;padding:5px 10px;cursor:pointer;font-size:14px;color:var(--text-dim)">
+    🌙
+  </button>
+
   <div class="setup-page">
     <div class="setup-card">
-      <div class="logo" style="margin-bottom:4px">⚡ NEMESIS</div>
+      <div class="logo" style="margin-bottom:4px">NEMESIS</div>
       <h3>Welcome — let's set up your account</h3>
       <p class="modal-subtitle">
         This runs once. Everything you enter is saved only to your own
@@ -36,6 +43,61 @@
             <div class="form-group" style="margin-bottom:0">
               <label>Jira Project Key</label>
               <input type="text" id="jiraProject" class="text-input" placeholder="PROJ" required>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── Non-Axian Jira (optional, collapsible) ── -->
+        <div class="report-card" style="padding:16px;margin-bottom:18px">
+          <div class="report-card-header"
+               style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none"
+               onclick="toggleNonAxian()">
+            <span style="display:flex;align-items:center;gap:10px">
+              Non-Axian Jira
+              <span style="font-weight:500;font-size:10px;background:rgba(255,255,255,0.25);color:#fff;
+                           padding:2px 8px;border-radius:10px;letter-spacing:0.3px">optional</span>
+            </span>
+            <span id="nonAxianChevron" style="font-size:14px;color:#fff;transition:transform 0.2s;display:inline-block">▶</span>
+          </div>
+
+          <div id="nonAxianSection" style="display:none">
+            <div class="report-card-body" style="padding-top:14px;display:flex;flex-direction:column;gap:14px">
+              <div style="font-size:11px;color:var(--text-dim)">
+                For a Jira Server / Data Centre instance. Uses Personal Access Token (Bearer) auth.
+                Leave URL blank to skip.
+              </div>
+
+              <div class="form-group" style="margin-bottom:0">
+                <label>Jira URL</label>
+                <input type="text" id="naJiraUrl" class="text-input" placeholder="https://tickets.example.com">
+              </div>
+              <div class="form-group" style="margin-bottom:0">
+                <label>Personal Access Token (PAT)</label>
+                <input type="password" id="naJiraToken" class="text-input" placeholder="Your PAT from Jira → Profile → Personal Access Tokens">
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+                <div class="form-group" style="margin-bottom:0">
+                  <label>Retest Status</label>
+                  <input type="text" id="naRetestStatus" class="text-input" placeholder="Remediated">
+                </div>
+                <div class="form-group" style="margin-bottom:0">
+                  <label>Poll Interval (sec)</label>
+                  <input type="number" id="naPollInterval" class="text-input" placeholder="300">
+                </div>
+              </div>
+              <div style="font-size:11px;color:var(--text-dim)">
+                💡 Each client's <strong>label</strong> must match its Jira <strong>project key</strong>
+                (e.g. <code>CPEL</code> → <code>project = CPEL</code>).
+              </div>
+
+              <!-- Non-Axian clients -->
+              <div style="border-top:1px solid var(--border);padding-top:14px;margin-top:2px">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+                  <span style="font-size:12px;font-weight:600;color:var(--text)">Clients / Kali Boxes</span>
+                  <button type="button" class="btn btn-sm btn-secondary" onclick="addSetupSecondaryClientRow()">+ Add Client</button>
+                </div>
+                <div id="setupSecondaryClientRows" style="display:flex;flex-direction:column;gap:18px"></div>
+              </div>
             </div>
           </div>
         </div>
