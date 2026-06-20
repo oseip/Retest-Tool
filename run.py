@@ -2,7 +2,7 @@
 Nemesis Retest Tool — standalone entry point.
 
 Development:  python run.py
-Frozen binary: ./retest-tool   (built by PyInstaller)
+Frozen .app:  double-click Nemesis.app  (built by PyInstaller)
 """
 import multiprocessing
 import os
@@ -11,9 +11,9 @@ import sys
 
 def _setup_frozen_env():
     """
-    When running as a PyInstaller bundle:
+    When running as a PyInstaller onefile binary:
       - Change to the directory containing the executable so that relative
-        paths for config/ and data/ point to a writable location.
+        paths for config/ and data/ point to a writable location next to it.
       - sys._MEIPASS holds the read-only bundled resources (frontend/, src/).
     """
     if not getattr(sys, "frozen", False):
@@ -22,7 +22,6 @@ def _setup_frozen_env():
     exe_dir = os.path.dirname(sys.executable)
     os.chdir(exe_dir)
 
-    # Ensure writable runtime directories exist next to the binary
     for d in ["config", "data/logs", "data/assets"]:
         os.makedirs(d, exist_ok=True)
 
