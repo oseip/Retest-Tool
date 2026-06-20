@@ -4,7 +4,7 @@ function toggleSetupTheme() {
   const html = document.documentElement;
   const isLight = html.getAttribute('data-theme') === 'light';
   html.setAttribute('data-theme', isLight ? '' : 'light');
-  document.querySelector('[onclick="toggleSetupTheme()"]').textContent = isLight ? '🌙' : '☀️';
+  document.querySelector('[onclick="toggleSetupTheme()"]').textContent = isLight ? '☀️' : '🌙';
 }
 
 function escHtml(s) {
