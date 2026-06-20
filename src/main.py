@@ -45,18 +45,24 @@ def _resource_path(*parts: str) -> str:
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, *parts)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        RotatingFileHandler(
-            os.path.join(LOG_DIR, "nemesis.log"),
-            maxBytes=5_000_000,
-            backupCount=5,
-        ),
-    ],
+# Console: WARNING+ only (clean terminal — errors/warnings surface immediately)
+# File:    INFO+    (full detail for debugging)
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.WARNING)
+_console_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+
+_file_handler = RotatingFileHandler(
+    os.path.join(LOG_DIR, "nemesis.log"),
+    maxBytes=5_000_000,
+    backupCount=5,
 )
+_file_handler.setLevel(logging.INFO)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
+
+# Suppress uvicorn's per-request access log in the terminal (still goes to file)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/config.yaml"
