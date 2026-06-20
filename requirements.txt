@@ -4,6 +4,10 @@ paramiko==3.4.0
 jira==3.8.0
 pyyaml==6.0.1
 python-multipart==0.0.9
+openpyxl==3.1.5
+requests==2.34.2
+pydantic==2.13.4
+anyio==4.13.0
 
 # Test dependencies
 pytest==9.1.0

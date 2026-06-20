@@ -11,6 +11,14 @@ Output:  dist/Nemesis.app   (macOS)
 import sys as _sys
 from PyInstaller.utils.hooks import collect_all
 
+# Output binary name — platform-aware so each runner produces the right name
+if _sys.platform == "darwin":
+    _bin_name = "retest-tool-macos"
+elif _sys.platform == "win32":
+    _bin_name = "retest-tool-windows"
+else:
+    _bin_name = "retest-tool-linux"
+
 block_cipher = None
 
 # ── Collect everything for packages that need full submodule trees ────────────
@@ -94,7 +102,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="retest-tool-macos",
+    name=_bin_name,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
