@@ -262,4 +262,4 @@ def update_settings(req: SettingsUpdate):
             "message": f"Settings saved, but applying them live failed ({exc}) — restart the app to be safe.",
         }
 
-    return {"ok": True, "message": "Settings saved and applied — no restart needed."}
+    return {"ok": True, "message": "Settings saved and applied — refresh page."}
