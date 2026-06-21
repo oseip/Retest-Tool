@@ -152,19 +152,29 @@ function setStatus(msg, type) {
 async function handleSubmit(ev) {
   ev.preventDefault();
 
-  const clientRows = Array.from(document.querySelectorAll('.settings-client-row'));
-  const clients = clientRows.map(row => {
-    const v = sel => row.querySelector(sel).value;
-    return {
-      label: v('.su-c-label').trim(),
-      name: v('.su-c-name').trim(),
-      kali_port: parseInt(v('.su-c-kaliport'), 10) || 22,
-      kali_user: v('.su-c-kaliuser').trim() || 'kali',
-      kali_password: v('.su-c-kalipass'),
-      nessus_access_key: v('.su-c-nessusaccess') || null,
-      nessus_secret_key: v('.su-c-nessussecret') || null,
-    };
-  });
+  // Catch any JS error early so it's always visible rather than silently swallowed
+  let clients;
+  try {
+    const clientRows = Array.from(document.querySelectorAll('#setupClientRows .settings-client-row'));
+    clients = clientRows.map(row => {
+      const v = (sel, fallback = '') => {
+        const el = row.querySelector(sel);
+        return el ? el.value : fallback;
+      };
+      return {
+        label:            v('.su-c-label').trim(),
+        name:             v('.su-c-name').trim(),
+        kali_port:        parseInt(v('.su-c-kaliport', '22'), 10) || 22,
+        kali_user:        v('.su-c-kaliuser').trim() || 'kali',
+        kali_password:    v('.su-c-kalipass'),
+        nessus_access_key: v('.su-c-nessusaccess') || null,
+        nessus_secret_key: v('.su-c-nessussecret') || null,
+      };
+    });
+  } catch (e) {
+    setStatus(`Error reading form fields: ${e.message}`, 'error');
+    return;
+  }
 
   if (!clients.length) {
     setStatus('Add at least one client.', 'error');
