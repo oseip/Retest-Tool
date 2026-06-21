@@ -17,11 +17,11 @@ jobs:
       matrix:
         include:
           - os: macos-latest
-            artifact: retest-tool-macos
+            artifact: nemesis-tool-macos
           - os: ubuntu-latest
-            artifact: retest-tool-linux
+            artifact: nemesis-tool-linux
           - os: windows-latest
-            artifact: retest-tool-windows.exe
+            artifact: nemesis-tool-windows.exe
 
     steps:
       - name: Checkout code

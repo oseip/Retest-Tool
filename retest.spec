@@ -13,11 +13,11 @@ from PyInstaller.utils.hooks import collect_all
 
 # Output binary name — platform-aware so each runner produces the right name
 if _sys.platform == "darwin":
-    _bin_name = "retest-tool-macos"
+    _bin_name = "nemesis-tool-macos"
 elif _sys.platform == "win32":
-    _bin_name = "retest-tool-windows"
+    _bin_name = "nemesis-tool-windows"
 else:
-    _bin_name = "retest-tool-linux"
+    _bin_name = "nemesis-tool-linux"
 
 block_cipher = None
 
