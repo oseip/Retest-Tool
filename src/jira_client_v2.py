@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from .config import JiraSecondaryConfig
+from .jira_client import _extract_tester
 
 log = logging.getLogger(__name__)
 
@@ -75,10 +76,12 @@ class JiraClientV2:
             log.warning("Secondary Jira: could not load field map: %s", e)
 
     def _build_fetch_fields(self) -> str:
-        standard = ["summary", "status", "priority", "assignee",
+        standard = ["summary", "status", "priority", "assignee", "reporter",
                     "updated", "labels", "description"]
         custom_names = ["cvss", "severity", "technology", "vulnerability_rating",
-                        "testtype[short text]", "testtype"]
+                        "testtype[short text]", "testtype", "tester",
+                        "otherinformation[paragraph]", "otherinformation",
+                        "other information"]
         custom_ids = [self._fid(n) for n in custom_names if self._fid(n)]
         return ",".join(standard + custom_ids)
 
@@ -308,7 +311,12 @@ class JiraClientV2:
                 return None
             val = f.get(fid)
             if isinstance(val, dict):
-                return val.get("value") or val.get("name")
+                simple = val.get("value") or val.get("name")
+                if simple:
+                    return simple
+                # ADF rich-text fields (paragraph, text area)
+                from .jira_client import _adf_to_text
+                return _adf_to_text(val) or None
             return val
 
         # v2 description is a plain string (not ADF)
@@ -324,6 +332,7 @@ class JiraClientV2:
             "status":      (f.get("status") or {}).get("name"),
             "priority":    (f.get("priority") or {}).get("name"),
             "assignee":    (f.get("assignee") or {}).get("displayName"),
+            "reporter":    (f.get("reporter") or {}).get("displayName"),
             "updated":     str(f.get("updated", "")),
             "labels":      labels,
             "ips":         ips,
@@ -334,5 +343,11 @@ class JiraClientV2:
             "rating":      get_custom("vulnerability_rating"),
             "technology":  get_custom("technology"),
             "testtype":    get_custom("testtype[short text]") or get_custom("testtype"),
+            "tester":      _extract_tester(f, self._fid("tester")),
+            "other_information": (
+                get_custom("otherinformation[paragraph]")
+                or get_custom("otherinformation")
+                or get_custom("other information")
+            ),
             "description": desc,
         }

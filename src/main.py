@@ -5,6 +5,7 @@ import logging
 import os
 import queue as _queue_mod
 import random
+import re
 import sys
 import threading
 import uuid
@@ -1197,6 +1198,45 @@ def _key_num(key: str) -> int:
         return 0
 
 
+# Parses tester email from OtherInformation[Paragraph] field.
+# Field value looks like: "Tester \nprince.osei-kwakye@cyberteq.com\n Date Started ..."
+# Try email pattern first, then fall back to any non-whitespace token.
+_TESTER_EMAIL_RE = re.compile(r'Tester\s+([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})', re.IGNORECASE)
+_TESTER_TOKEN_RE = re.compile(r'Tester\s+(\S+)', re.IGNORECASE)
+
+def _tester_from_other_info(text: str) -> Optional[str]:
+    """Extract tester email from the OtherInformation[Paragraph] field text block."""
+    if not text:
+        return None
+    m = _TESTER_EMAIL_RE.search(text) or _TESTER_TOKEN_RE.search(text)
+    return m.group(1).strip() if m else None
+
+
+@app.get("/api/debug/jira-fields")
+def debug_jira_fields(client: str, ticket: str = ""):
+    """
+    Debug: show the raw search-JQL response for customfield_10057 to diagnose format issues.
+    """
+    jira_client = _jira_for_label(client)
+
+    result = {
+        "fetch_fields": getattr(jira_client, "_fetch_fields", "NOT SET"),
+        "fid_otherinformation": getattr(jira_client, "_fields", {}).get("otherinformation"),
+    }
+
+    if ticket:
+        try:
+            serialized = jira_client.search_jql(f'issue = {ticket}', max_results=1)
+            if serialized:
+                t = serialized[0]
+                result["other_information"] = t.get("other_information")
+                result["tester_extracted"] = _tester_from_other_info(t.get("other_information") or "")
+        except Exception as exc:
+            result["error"] = str(exc)
+
+    return result
+
+
 @app.get("/api/duplicates")
 def find_duplicates(client: str):
     """
@@ -1245,16 +1285,23 @@ def find_duplicates(client: str):
             continue
         # Oldest key first = recommended keep
         sorted_members = sorted(members, key=lambda t: _key_num(t["key"]))
+
+        def _enrich(t):
+            """Resolve tester: OtherInformation field → tester custom field → reporter."""
+            tester = (
+                _tester_from_other_info(t.get("other_information", ""))
+                or t.get("tester")
+                or t.get("reporter")
+            )
+            return {**t, "jira_url": f"{jira_base_url}/browse/{t['key']}", "tester": tester}
+
         duplicate_groups.append({
-            "ip":       ip,
-            "port":     port,
+            "ip":        ip,
+            "port":      port,
             "vuln_name": sorted_members[0].get("summary", ""),
-            "keep":     sorted_members[0]["key"],
-            "tickets":  [
-                {**t, "jira_url": f"{jira_base_url}/browse/{t['key']}"}
-                for t in sorted_members
-            ],
-            "count":    len(sorted_members),
+            "keep":      sorted_members[0]["key"],
+            "tickets":   [_enrich(t) for t in sorted_members],
+            "count":     len(sorted_members),
         })
 
     # Worst offenders first
@@ -1715,6 +1762,41 @@ def save_assets(label: str, req: AssetListRequest):
 
 class NessusPullRequest(BaseModel):
     scan_ids: List[int]
+
+
+class NessusFetchKeysRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/nessus/{label}/fetch-keys")
+def nessus_fetch_keys(label: str, req: NessusFetchKeysRequest):
+    """
+    Use the Nessus username+password to auto-generate a new access/secret key
+    pair via the Nessus REST API (running on Kali at localhost:8834).
+    Requires an active SSH connection for this client label.
+    """
+    client_cfg = next((c for c in cfg.clients if c.label == label), None)
+    if not client_cfg:
+        # Also check secondary clients
+        client_cfg = next(
+            (c for c in getattr(cfg, "clients_secondary", []) if c.label == label),
+            None,
+        )
+    if not client_cfg:
+        raise HTTPException(400, f"Unknown client: {label}")
+    conn = connections.get_connection(label)
+    if not conn:
+        raise HTTPException(
+            400,
+            f"SSH not connected for '{label}' — connect in the SSH panel first, then retry",
+        )
+    from . import nessus_client as nc
+    try:
+        access_key, secret_key = nc.fetch_api_keys(conn, req.username, req.password)
+        return {"access_key": access_key, "secret_key": secret_key}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
 
 
 @app.get("/api/nessus/{label}/folders")

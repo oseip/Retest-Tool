@@ -14,6 +14,32 @@ _PORT_RE = re.compile(r'^\d{2,5}$')
 _CVE_RE = re.compile(r'^CVE-\d{4}-\d+$', re.I)
 
 
+def _extract_tester(fields: dict, field_id: Optional[str]) -> Optional[str]:
+    """
+    Extract the 'tester' custom field value.
+    Handles: user object {displayName/name}, plain string, or list of the above.
+    """
+    if not field_id:
+        return None
+    val = fields.get(field_id)
+    if not val:
+        return None
+    # List of users (multi-user picker)
+    if isinstance(val, list):
+        names = []
+        for item in val:
+            if isinstance(item, dict):
+                names.append(item.get("displayName") or item.get("name") or "")
+            elif isinstance(item, str):
+                names.append(item)
+        return ", ".join(n for n in names if n) or None
+    # Single user object
+    if isinstance(val, dict):
+        return val.get("displayName") or val.get("name")
+    # Plain string
+    return str(val) if val else None
+
+
 def _adf_to_text(node) -> str:
     """Recursively extract plain text from Atlassian Document Format (ADF) JSON."""
     if not node:
@@ -56,10 +82,12 @@ class JiraClient:
 
     def _build_fetch_fields(self) -> str:
         """Minimal field list so search/issue responses are small and fast."""
-        standard = ["summary", "status", "priority", "assignee",
+        standard = ["summary", "status", "priority", "assignee", "reporter",
                     "updated", "labels", "description"]
         custom_names = ["cvss", "severity", "technology", "vulnerability_rating",
-                        "testtype[short text]", "testtype"]
+                        "testtype[short text]", "testtype", "tester",
+                        "otherinformation[paragraph]", "otherinformation",
+                        "other information"]
         custom_ids = [self._fid(n) for n in custom_names if self._fid(n)]
         return ",".join(standard + custom_ids)
 
@@ -338,7 +366,13 @@ class JiraClient:
                 return None
             val = f.get(fid)
             if isinstance(val, dict):
-                return val.get("value") or val.get("name")
+                # Simple select / radio fields
+                simple = val.get("value") or val.get("name")
+                if simple:
+                    return simple
+                # ADF (Atlassian Document Format) — paragraph / rich text fields
+                # e.g. OtherInformation[Paragraph] comes back as ADF from search API
+                return _adf_to_text(val) or None
             return val
 
         return {
@@ -347,6 +381,7 @@ class JiraClient:
             "status": (f.get("status") or {}).get("name"),
             "priority": (f.get("priority") or {}).get("name"),
             "assignee": (f.get("assignee") or {}).get("displayName"),
+            "reporter": (f.get("reporter") or {}).get("displayName"),
             "updated": str(f.get("updated", "")),
             "labels": labels,
             "ips": ips,
@@ -357,5 +392,11 @@ class JiraClient:
             "rating": get_custom("vulnerability_rating"),
             "technology": get_custom("technology"),
             "testtype": get_custom("testtype[short text]") or get_custom("testtype"),
+            "tester": _extract_tester(f, self._fid("tester")),
+            "other_information": (
+                get_custom("otherinformation[paragraph]")
+                or get_custom("otherinformation")
+                or get_custom("other information")
+            ),
             "description": _adf_to_text(f.get("description")) if isinstance(f.get("description"), dict) else (f.get("description") or ""),
         }

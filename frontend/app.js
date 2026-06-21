@@ -2677,6 +2677,13 @@ async function findDuplicates() {
   }
 }
 
+// Holds all duplicate (non-keep) tickets from the last scan
+let _dupUrlsToClose = [];
+// Maps tester name → array of {key, url} for their duplicate tickets
+let _dupByTester = {};
+// Sorted [name, tickets] pairs — index used by per-tester open buttons
+let _dupTesterList = [];
+
 function renderDuplicates(data) {
   const container = $('duplicatesResults');
 
@@ -2685,21 +2692,75 @@ function renderDuplicates(data) {
       <div class="report-card" style="padding:20px;text-align:center;color:var(--text-dim)">
         ✅ No duplicate tickets found for <strong>${escHtml(data.client)}</strong>
       </div>`;
+    _dupUrlsToClose = [];
+    _dupByTester = {};
+    _dupTesterList = [];
     return;
   }
 
+  // Collect every duplicate (non-keep) — build global list and per-tester map
+  _dupUrlsToClose = [];
+  _dupByTester = {};
+  data.groups.forEach(g => {
+    g.tickets.forEach(t => {
+      if (t.key !== g.keep) {
+        _dupUrlsToClose.push({ key: t.key, url: t.jira_url });
+        const name = t.tester || t.reporter || 'Unknown';
+        if (!_dupByTester[name]) _dupByTester[name] = [];
+        _dupByTester[name].push({ key: t.key, url: t.jira_url });
+      }
+    });
+  });
+
+  // Tester breakdown — sorted by count desc, with per-tester open button
+  // Store sorted entries so buttons can reference by index (avoids quoting issues in onclick)
+  _dupTesterList = Object.entries(_dupByTester).sort((a, b) => b[1].length - a[1].length);
+
+  const reporterRows = _dupTesterList
+    .map(([name, tickets], idx) => `
+      <tr>
+        <td style="padding:5px 10px 5px 0;color:var(--text)">${escHtml(name)}</td>
+        <td style="padding:5px 0;font-weight:600;color:var(--orange);text-align:right">${tickets.length}</td>
+        <td style="padding:5px 0 5px 8px;color:var(--text-dim);font-size:11px">
+          ticket${tickets.length !== 1 ? 's' : ''}
+        </td>
+        <td style="padding:5px 0 5px 12px">
+          <button class="btn btn-sm btn-secondary"
+                  onclick="openDuplicatesForTester(${idx})"
+                  style="font-size:11px;white-space:nowrap">
+            🔗 Open ${tickets.length} in Jira
+          </button>
+        </td>
+      </tr>`).join('');
+
+  const n = _dupUrlsToClose.length;
   const summary = `
     <div style="margin-bottom:20px">
-      <span style="font-size:15px;font-weight:700;color:var(--text)">
-        ${data.total_groups} duplicate group${data.total_groups !== 1 ? 's' : ''}
-        &nbsp;·&nbsp; ${data.total_duplicates} extra ticket${data.total_duplicates !== 1 ? 's' : ''}
-      </span>
-      <div style="margin-top:6px;font-size:12px;color:var(--text-dim)">
-        Click any ticket key to open it in Jira — handle deletion or closure there manually.
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:14px">
+        <div>
+          <span style="font-size:15px;font-weight:700;color:var(--text)">
+            ${data.total_groups} duplicate group${data.total_groups !== 1 ? 's' : ''}
+            &nbsp;·&nbsp; ${data.total_duplicates} extra ticket${data.total_duplicates !== 1 ? 's' : ''}
+          </span>
+          <div style="margin-top:4px;font-size:12px;color:var(--text-dim)">
+            Tickets marked <strong>duplicate</strong> are the ones to close/delete in Jira.
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="openAllDuplicates()" style="white-space:nowrap">
+          🔗 Open All ${n} Duplicate${n !== 1 ? 's' : ''} in Jira
+        </button>
+      </div>
+      <div class="report-card" style="padding:14px;margin-bottom:0">
+        <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:10px">
+          👤 Tester (duplicate tickets only)
+        </div>
+        <table style="border-collapse:collapse;width:100%;font-size:13px">
+          ${reporterRows}
+        </table>
       </div>
     </div>`;
 
-  const groupsHtml = data.groups.map((g, gi) => {
+  const groupsHtml = data.groups.map(g => {
     const ticketsHtml = g.tickets.map(t => {
       const isKeep = t.key === g.keep;
       return `
@@ -2707,6 +2768,7 @@ function renderDuplicates(data) {
           <a class="dup-key" href="${escHtml(t.jira_url)}" target="_blank" rel="noopener"
              title="Open in Jira">${escHtml(t.key)} ↗</a>
           <span class="dup-status">${escHtml(t.status || '—')}</span>
+          ${(t.tester || t.reporter) ? `<span style="font-size:11px;color:var(--text-dim)">by ${escHtml(t.tester || t.reporter)}</span>` : ''}
           ${isKeep
             ? '<span class="dup-badge dup-badge-keep">keep</span>'
             : '<span class="dup-badge dup-badge-dup">duplicate</span>'}
@@ -2721,6 +2783,29 @@ function renderDuplicates(data) {
   }).join('');
 
   container.innerHTML = summary + groupsHtml;
+}
+
+function _jiraSearchUrl(tickets) {
+  const firstUrl = tickets[0].url;
+  const browseIdx = firstUrl.indexOf('/browse/');
+  const baseUrl = browseIdx !== -1 ? firstUrl.substring(0, browseIdx) : firstUrl;
+  const keys = tickets.map(d => d.key).join(', ');
+  return `${baseUrl}/issues/?jql=${encodeURIComponent(`issueKey IN (${keys})`)}`;
+}
+
+function openAllDuplicates() {
+  if (!_dupUrlsToClose.length) { showToast('No duplicates to open.', 'warn'); return; }
+  window.open(_jiraSearchUrl(_dupUrlsToClose), '_blank', 'noopener');
+  showToast(`Opened Jira filter for all ${_dupUrlsToClose.length} duplicate tickets.`, 'success');
+}
+
+function openDuplicatesForTester(idx) {
+  const entry = _dupTesterList[idx];
+  if (!entry) { showToast('No tickets found.', 'warn'); return; }
+  const [name, tickets] = entry;
+  if (!tickets.length) { showToast('No tickets found for this tester.', 'warn'); return; }
+  window.open(_jiraSearchUrl(tickets), '_blank', 'noopener');
+  showToast(`Opened ${tickets.length} ticket${tickets.length !== 1 ? 's' : ''} for ${name}.`, 'success');
 }
 
 // ── Batch Scan ────────────────────────────────────────────────────────────
@@ -3254,8 +3339,107 @@ function settingsClientRowHtml(c, session = 'axian') {
           <input type="password" class="text-input set-c-nessussecret" placeholder="Leave blank to keep current">
         </div>
       </div>
+
+      <!-- Nessus fetch-keys helper (collapsed by default) -->
+      <div class="set-c-fetchkeys-wrap" style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">
+        <button type="button" class="btn btn-sm btn-secondary set-c-fetchkeys-toggle"
+                onclick="toggleNessusFetchKeys('${rowId}')"
+                style="font-size:11px">
+          🔑 Auto-fetch Nessus Keys
+        </button>
+        <div id="${rowId}-fetchkeys" style="display:none;margin-top:10px">
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">
+            Enter your Nessus credentials — the app will log in via SSH and generate a new key pair automatically.
+            <strong>SSH must be connected for this client first.</strong>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:flex-end">
+            <div>
+              <label style="font-size:11px">Nessus Username</label>
+              <input type="text" class="text-input set-c-nessususer" placeholder="admin" autocomplete="off"
+                     style="font-size:12px;padding:6px 8px">
+            </div>
+            <div>
+              <label style="font-size:11px">Nessus Password</label>
+              <input type="password" class="text-input set-c-nessuspass" placeholder="••••••••"
+                     style="font-size:12px;padding:6px 8px">
+            </div>
+            <button type="button" class="btn btn-primary btn-sm set-c-fetchkeys-btn"
+                    onclick="fetchNessusKeys('${rowId}')"
+                    style="font-size:11px;white-space:nowrap">
+              Fetch Keys
+            </button>
+          </div>
+          <div class="set-c-fetchkeys-status" style="font-size:11px;margin-top:6px;display:none"></div>
+        </div>
+      </div>
     </div>
   `;
+}
+
+function toggleNessusFetchKeys(rowId) {
+  const panel = document.getElementById(rowId + '-fetchkeys');
+  if (!panel) return;
+  const hidden = panel.style.display === 'none';
+  panel.style.display = hidden ? '' : 'none';
+  const row = document.getElementById(rowId);
+  if (!row) return;
+  const btn = row.querySelector('.set-c-fetchkeys-toggle');
+  if (btn) btn.textContent = hidden ? '🔑 Hide Nessus Key Fetch' : '🔑 Auto-fetch Nessus Keys';
+}
+
+async function fetchNessusKeys(rowId) {
+  const row = document.getElementById(rowId);
+  if (!row) return;
+
+  const label   = row.querySelector('.set-c-label')?.value?.trim();
+  const user    = row.querySelector('.set-c-nessususer')?.value?.trim();
+  const pass    = row.querySelector('.set-c-nessuspass')?.value;
+  const statusEl = row.querySelector('.set-c-fetchkeys-status');
+  const btn      = row.querySelector('.set-c-fetchkeys-btn');
+
+  if (!label) { showToast('Save settings with a client label first, then retry.', 'warn'); return; }
+  if (!user)  { showToast('Enter the Nessus username.', 'warn'); return; }
+  if (!pass)  { showToast('Enter the Nessus password.', 'warn'); return; }
+
+  const setStatus = (msg, color) => {
+    if (!statusEl) return;
+    statusEl.style.display = '';
+    statusEl.style.color = color || 'var(--text-dim)';
+    statusEl.textContent = msg;
+  };
+
+  btn.disabled = true;
+  btn.textContent = 'Fetching…';
+  setStatus('Connecting to Nessus via SSH…', 'var(--text-dim)');
+
+  try {
+    const res = await fetch(`/api/nessus/${encodeURIComponent(label)}/fetch-keys`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user, password: pass }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Key fetch failed');
+
+    // Fill in the key inputs
+    const accInput = row.querySelector('.set-c-nessusaccess');
+    const secInput = row.querySelector('.set-c-nessussecret');
+    if (accInput) accInput.value = data.access_key;
+    if (secInput) secInput.value = data.secret_key;
+
+    setStatus('✅ Keys fetched — click Save Settings to persist them.', 'var(--green)');
+    showToast('Nessus keys fetched — save settings to apply.', 'success');
+
+    // Clear the credentials from the form
+    row.querySelector('.set-c-nessususer').value = '';
+    row.querySelector('.set-c-nessuspass').value = '';
+  } catch (exc) {
+    setStatus(`❌ ${exc.message}`, 'var(--red)');
+    showToast(exc.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Fetch Keys';
+  }
 }
 
 function renderSettings(data) {

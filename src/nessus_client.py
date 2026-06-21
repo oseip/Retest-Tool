@@ -146,3 +146,65 @@ def export_scan_csv(
         raise ValueError(f"Empty CSV downloaded for scan '{scan_name}'")
 
     return csv_text, scan_name
+
+
+# ── API key generation via username/password ──────────────────────────────────
+
+def fetch_api_keys(conn, username: str, password: str) -> Tuple[str, str]:
+    """
+    Log in to Nessus with username+password, generate a new API key pair,
+    then destroy the session.  Returns (access_key, secret_key).
+
+    Requires Nessus 8.x+.  Runs all calls as curl over the existing SSH
+    connection to Kali (Nessus listens on localhost:8834 on that box).
+    """
+    # Escape single-quotes in credentials for shell safety
+    def _sh(s: str) -> str:
+        return s.replace("'", r"'\''")
+
+    # 1. Create session → token
+    login_cmd = (
+        f"curl -sk --connect-timeout 10 -m 30 -X POST "
+        f"https://localhost:8834/session "
+        f"-H 'Content-Type: application/json' "
+        f"-d '{{\"username\":\"{_sh(username)}\",\"password\":\"{_sh(password)}\"}}'")
+    out, _err, _code = conn.exec(login_cmd, timeout=35)
+    try:
+        session = json.loads(out.strip())
+    except json.JSONDecodeError:
+        raise ValueError(f"Nessus login returned non-JSON: {out[:200]!r}")
+
+    token = session.get("token")
+    if not token:
+        err_msg = session.get("error", session.get("message", "invalid credentials"))
+        raise ValueError(f"Nessus login failed: {err_msg}")
+
+    try:
+        # 2. Generate new API keys
+        keys_cmd = (
+            f"curl -sk --connect-timeout 10 -m 30 -X PUT "
+            f"https://localhost:8834/session/keys "
+            f"-H 'X-Cookie: token={_sh(token)}' "
+            f"-H 'Content-Type: application/json'")
+        out2, _err2, _code2 = conn.exec(keys_cmd, timeout=35)
+        try:
+            keys = json.loads(out2.strip())
+        except json.JSONDecodeError:
+            raise ValueError(f"Nessus key generation returned non-JSON: {out2[:200]!r}")
+
+        access_key = keys.get("accessKey") or keys.get("access_key")
+        secret_key = keys.get("secretKey") or keys.get("secret_key")
+        if not access_key or not secret_key:
+            raise ValueError(f"Nessus did not return access/secret keys: {keys}")
+
+        return str(access_key), str(secret_key)
+    finally:
+        # 3. Always clean up the session
+        try:
+            del_cmd = (
+                f"curl -sk --connect-timeout 10 -m 15 -X DELETE "
+                f"https://localhost:8834/session "
+                f"-H 'X-Cookie: token={_sh(token)}'")
+            conn.exec(del_cmd, timeout=20)
+        except Exception:
+            pass
