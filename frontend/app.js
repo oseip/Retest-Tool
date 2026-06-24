@@ -3103,6 +3103,7 @@ function initShellTab() {
       fontSize: 13,
       fontFamily: 'Menlo, Consolas, monospace',
       theme: { background: '#0d1117', foreground: '#e6edf3' },
+      scrollback: 5000,
     });
     _shellFit = new FitAddon.FitAddon();
     _shellTerm.loadAddon(_shellFit);

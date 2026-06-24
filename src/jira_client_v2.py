@@ -151,10 +151,28 @@ class JiraClientV2:
         issues = self._search_jql(jql, max_results=max_results)
         return [self._serialize(i) for i in issues]
 
+    _v2_search_gone: bool = False
+
     def count_jql(self, jql: str) -> int:
+        if not self._v2_search_gone:
+            try:
+                resp = self._session.get(
+                    f"{self.cfg.url}/rest/api/2/search",
+                    params={"jql": jql, "maxResults": 0, "fields": ""},
+                    timeout=30,
+                )
+                if resp.status_code == 410:
+                    self.__class__._v2_search_gone = True
+                else:
+                    resp.raise_for_status()
+                    return resp.json().get("total", 0)
+            except Exception:
+                self.__class__._v2_search_gone = True
+
+        # v3 fallback — also returns 'total' on first page
         resp = self._session.get(
-            f"{self.cfg.url}/rest/api/2/search",
-            params={"jql": jql, "maxResults": 0, "fields": ""},
+            f"{self.cfg.url}/rest/api/3/search/jql",
+            params={"jql": jql, "maxResults": 1, "fields": "id"},
             timeout=30,
         )
         resp.raise_for_status()

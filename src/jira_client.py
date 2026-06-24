@@ -154,29 +154,55 @@ class JiraClient:
         issues = self._search_jql(jql, max_results=max_results)
         return [self._serialize(issue) for issue in issues]
 
+    # Set to True the first time v2 /search returns 410 so we never retry it.
+    _v2_search_gone: bool = False
+
     def count_jql(self, jql: str) -> int:
         """
-        Count issues matching a JQL query in a single HTTP request.
-        v2 /search returns a 'total' field even with maxResults=0 so we get
-        the count without transferring any issue data. Falls back to cursor
-        pagination if the v2 endpoint is unavailable (HTTP 410).
+        Count issues matching a JQL query.
+
+        Tries v2 /search (returns 'total' with maxResults=0 — one cheap request).
+        If v2 is gone (HTTP 410) we remember that for the lifetime of this
+        instance and switch permanently to v3, which also returns 'total' on
+        the first page so we still only need one request.
         """
+        if not self._v2_search_gone:
+            try:
+                resp = self._session.get(
+                    f"{self.cfg.url}/rest/api/2/search",
+                    params={"jql": jql, "maxResults": 0, "fields": ""},
+                    timeout=30,
+                )
+                if resp.status_code == 410:
+                    log.warning("count_jql: v2 /search returned 410 — switching permanently to v3")
+                    JiraClient._v2_search_gone = True
+                else:
+                    resp.raise_for_status()
+                    return resp.json()["total"]
+            except requests.HTTPError:
+                JiraClient._v2_search_gone = True
+            except Exception as exc:
+                log.warning("count_jql v2 error (%s) — falling back to v3 for this call", exc)
+
+        # v3 also returns 'total' — fetch just 1 issue to get it cheaply
         try:
             resp = self._session.get(
-                f"{self.cfg.url}/rest/api/2/search",
-                params={"jql": jql, "maxResults": 0, "fields": ""},
+                f"{self.cfg.url}/rest/api/3/search/jql",
+                params={"jql": jql, "maxResults": 1, "fields": "id"},
                 timeout=30,
             )
-            if resp.status_code == 410:
-                raise requests.HTTPError("v2 gone")
             resp.raise_for_status()
-            return resp.json()["total"]
-        except Exception as exc:
-            log.warning("count_jql v2 failed (%s) — cursor fallback", exc)
+            data = resp.json()
+            # v3 cursor-based API may not include 'total'; fall back to counting
+            if "total" in data:
+                return data["total"]
             return self._count_cursor(jql)
+        except Exception as exc:
+            log.warning("count_jql v3 also failed (%s) — returning 0", exc)
+            return 0
 
     def _count_cursor(self, jql: str) -> int:
-        """Cursor-based page-counting fallback for count_jql."""
+        """Full cursor pagination — only used when 'total' is unavailable from v3."""
         url = f"{self.cfg.url}/rest/api/3/search/jql"
         count = 0
         params: dict = {"jql": jql, "maxResults": 200, "fields": "id"}

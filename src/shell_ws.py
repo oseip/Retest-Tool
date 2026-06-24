@@ -39,7 +39,8 @@ async def shell_websocket(websocket: WebSocket, label: str):
         await websocket.close()
         return
 
-    client_cfg = next((c for c in cfg.clients if c.label == label), None)
+    all_clients = list(cfg.clients) + list(getattr(cfg, "clients_secondary", []) or [])
+    client_cfg = next((c for c in all_clients if c.label == label), None)
     if not client_cfg:
         await send({"type": "error", "data": f"Unknown client: {label}"})
         await websocket.close()

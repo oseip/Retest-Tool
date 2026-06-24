@@ -22,7 +22,8 @@ def get_status() -> Dict[str, str]:
 
 
 def connect(cfg: Config, label: str) -> None:
-    client_cfg = next((c for c in cfg.clients if c.label == label), None)
+    all_clients = list(cfg.clients) + list(cfg.clients_secondary or [])
+    client_cfg = next((c for c in all_clients if c.label == label), None)
     if not client_cfg:
         raise ValueError(f"Unknown client: {label}")
 

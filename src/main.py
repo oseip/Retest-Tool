@@ -131,6 +131,12 @@ def _get_client(label: str):
     return None, None
 
 
+def _find_client(label: str):
+    """Return ClientConfig for label from either primary or secondary clients, or None."""
+    client_cfg, _ = _get_client(label)
+    return client_cfg
+
+
 def _start_poller_thread():
     global _poller_thread, _poller_thread_secondary
     # All active client labels across both sessions
@@ -1742,7 +1748,7 @@ class AssetListRequest(BaseModel):
 
 @app.get("/api/assets/{label}")
 def get_assets(label: str):
-    if not any(c.label == label for c in cfg.clients):
+    if not _find_client(label):
         raise HTTPException(400, f"Unknown client: {label}")
     from . import assets as assets_mod
     return assets_mod.load_asset_list(label)
@@ -1750,7 +1756,7 @@ def get_assets(label: str):
 
 @app.post("/api/assets/{label}")
 def save_assets(label: str, req: AssetListRequest):
-    if not any(c.label == label for c in cfg.clients):
+    if not _find_client(label):
         raise HTTPException(400, f"Unknown client: {label}")
     from . import assets as assets_mod
     count = assets_mod.save_asset_list(label, req.entries)
@@ -1776,13 +1782,7 @@ def nessus_fetch_keys(label: str, req: NessusFetchKeysRequest):
     pair via the Nessus REST API (running on Kali at localhost:8834).
     Requires an active SSH connection for this client label.
     """
-    client_cfg = next((c for c in cfg.clients if c.label == label), None)
-    if not client_cfg:
-        # Also check secondary clients
-        client_cfg = next(
-            (c for c in getattr(cfg, "clients_secondary", []) if c.label == label),
-            None,
-        )
+    client_cfg = _find_client(label)
     if not client_cfg:
         raise HTTPException(400, f"Unknown client: {label}")
     conn = connections.get_connection(label)
@@ -1801,7 +1801,7 @@ def nessus_fetch_keys(label: str, req: NessusFetchKeysRequest):
 
 @app.get("/api/nessus/{label}/folders")
 def nessus_folders(label: str):
-    client_cfg = next((c for c in cfg.clients if c.label == label), None)
+    client_cfg = _find_client(label)
     if not client_cfg:
         raise HTTPException(400, f"Unknown client: {label}")
     if not getattr(client_cfg, "nessus_access_key", None):
@@ -1819,7 +1819,7 @@ def nessus_folders(label: str):
 
 @app.get("/api/nessus/{label}/scans")
 def nessus_scans(label: str, folder_id: Optional[int] = None):
-    client_cfg = next((c for c in cfg.clients if c.label == label), None)
+    client_cfg = _find_client(label)
     if not client_cfg:
         raise HTTPException(400, f"Unknown client: {label}")
     if not getattr(client_cfg, "nessus_access_key", None):
@@ -1838,7 +1838,7 @@ def nessus_scans(label: str, folder_id: Optional[int] = None):
 @app.post("/api/nessus/{label}/host-count")
 def nessus_host_count(label: str, req: NessusPullRequest):
     """Return total host count across selected scans without pulling all data."""
-    client_cfg = next((c for c in cfg.clients if c.label == label), None)
+    client_cfg = _find_client(label)
     if not client_cfg:
         raise HTTPException(400, f"Unknown client: {label}")
     conn = connections.get_connection(label)
@@ -1859,7 +1859,7 @@ def nessus_host_count(label: str, req: NessusPullRequest):
 @app.post("/api/nessus/{label}/pull")
 def nessus_pull(label: str, req: NessusPullRequest):
     """Pull hosts from selected Nessus scans and cross-reference against saved asset list."""
-    client_cfg = next((c for c in cfg.clients if c.label == label), None)
+    client_cfg = _find_client(label)
     if not client_cfg:
         raise HTTPException(400, f"Unknown client: {label}")
     if not getattr(client_cfg, "nessus_access_key", None):
@@ -1911,7 +1911,7 @@ def nessus_export(label: str, req: NessusExportRequest):
     import re
     import zipfile
 
-    client_cfg = next((c for c in cfg.clients if c.label == label), None)
+    client_cfg = _find_client(label)
     if not client_cfg:
         raise HTTPException(400, f"Unknown client: {label}")
     if not getattr(client_cfg, "nessus_access_key", None):

@@ -137,7 +137,8 @@ def _run_tunnel(tunnel_id: str, cfg: Config, client_cfg, target_host: str,
 def start_tunnel(cfg: Config, label: str, target_host: str, target_port: int, local_port: int) -> str:
     """local_port=0 means "pick any free port" — the actual bound port is
     read back from the socket and used as the tunnel's local_port."""
-    client_cfg = next((c for c in cfg.clients if c.label == label), None)
+    all_clients = list(cfg.clients) + list(getattr(cfg, "clients_secondary", []) or [])
+    client_cfg = next((c for c in all_clients if c.label == label), None)
     if not client_cfg:
         raise ValueError(f"Unknown client: {label}")
 

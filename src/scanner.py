@@ -187,7 +187,8 @@ def run_scan(job_id: str, cfg: Config):
     """Run a single scan job. Called sequentially by the per-client worker."""
     job = JOBS[job_id]
     client_label = job["client_label"]
-    client_cfg = next((c for c in cfg.clients if c.label == client_label), None)
+    all_clients = list(cfg.clients) + list(cfg.clients_secondary or [])
+    client_cfg = next((c for c in all_clients if c.label == client_label), None)
     if not client_cfg:
         with _lock:
             JOBS[job_id]["status"] = "error"
