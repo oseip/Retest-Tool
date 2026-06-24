@@ -101,6 +101,9 @@ app.include_router(shell_ws.router)
 from . import tunnel_api
 app.include_router(tunnel_api.router)
 
+from . import intake as intake_mod
+app.include_router(intake_mod.router)
+
 _poller_thread: Optional[threading.Thread] = None
 _poller_thread_secondary: Optional[threading.Thread] = None
 _reload_lock = threading.Lock()
@@ -234,6 +237,10 @@ def serve_style_css():
 @app.get("/static/setup.js")
 def serve_setup_js():
     return FileResponse(_resource_path("frontend", "setup.js"), headers=_NO_CACHE)
+
+@app.get("/static/intake.js")
+def serve_intake_js():
+    return FileResponse(_resource_path("frontend", "intake.js"), headers=_NO_CACHE)
 
 
 # ── Config ─────────────────────────────────────────────────────────────────

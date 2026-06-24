@@ -97,7 +97,7 @@ async function fetchClients() {
 function _syncClientDropdowns(clients) {
   // Dropdowns in Report, Assets and Shell tabs that mirror the client list.
   // We rebuild them completely so a session switch always shows the right set.
-  ['reportClient', 'weeklyClient', 'duplicatesClient', 'batchClient', 'assetsClient', 'shellClient', 'addTicketClient'].forEach(id => {
+  ['reportClient', 'weeklyClient', 'duplicatesClient', 'batchClient', 'assetsClient', 'shellClient', 'intakeClient', 'addTicketClient'].forEach(id => {
     const sel = $(id);
     if (!sel) return;
     const prev = sel.value;
@@ -1891,6 +1891,7 @@ function switchTab(tab) {
   const isBatchScan   = tab === 'batchscan';
   const isAssets     = tab === 'assets';
   const isShell      = tab === 'shell';
+  const isIntake     = tab === 'intake';
   const isSettings   = tab === 'settings';
 
   $('tabDashboard').classList.toggle('active', isDash);
@@ -1900,6 +1901,7 @@ function switchTab(tab) {
   $('tabBatchScan').classList.toggle('active', isBatchScan);
   $('tabAssets').classList.toggle('active', isAssets);
   $('tabShell').classList.toggle('active', isShell);
+  $('tabIntake').classList.toggle('active', isIntake);
   $('tabSettings').classList.toggle('active', isSettings);
 
   // Dashboard elements
@@ -1943,10 +1945,16 @@ function switchTab(tab) {
   sv.style.display       = isSettings ? 'flex' : 'none';
   sv.style.flexDirection = 'column';
 
+  // Intake view
+  const iv = $('intakeView');
+  iv.style.display       = isIntake ? 'flex' : 'none';
+  iv.style.flexDirection = 'column';
+
   if (isReport) initReportControls();
   if (isWeekly) initWeeklyReportControls();
   if (isAssets) initAssetsTab();
   if (isShell) initShellTab(); else stopTunnelPolling();
+  if (isIntake) initIntakeTab();
   if (isSettings) initSettingsTab();
 }
 
