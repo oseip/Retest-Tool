@@ -9,11 +9,14 @@ const state = {
   triageFilter: '',
   remExpanded: true,      // collapsed/expanded state of the REMEDIATED pane
   remTypeFilter: 'all',   // 'all' | 'auto' | 'manual'  — remediated section
+  manualExpanded: true,
+  manualTypeFilter: 'all',
   sweepSearch: '',
   sweepTypeFilter: 'all', // 'all' | 'auto' | 'manual'  — sweep section
   sweepRenderLimit: 100,  // grows as the user scrolls — see _sweepObserver
   checkedIds: new Set(),
   activeStreams: {},  // jobId → EventSource
+  lastScanningTime: 0,
 };
 
 // ── DOM refs ──────────────────────────────────────────────────────────────
@@ -24,6 +27,24 @@ let _retestStatus = '';
 
 // Bulk scan tracking — set while a Scan All batch is in progress, null otherwise
 let _bulkScan = null; // { total: int, ids: Set<string> }
+try {
+  const stored = localStorage.getItem('bulkScan');
+  if (stored) {
+    const parsed = JSON.parse(stored);
+    _bulkScan = { total: parsed.total, ids: new Set(parsed.ids) };
+  }
+} catch (_) {}
+
+function setBulkScan(val) {
+  _bulkScan = val;
+  try {
+    if (_bulkScan) {
+      localStorage.setItem('bulkScan', JSON.stringify({ total: _bulkScan.total, ids: Array.from(_bulkScan.ids) }));
+    } else {
+      localStorage.removeItem('bulkScan');
+    }
+  } catch (_) {}
+}
 
 // Bulk triage tracking — set while a Triage All batch is in progress, null otherwise
 let _bulkTriage = null; // { total: int, ids: Set<string> }
@@ -171,7 +192,7 @@ function renderJobCard(j) {
       <input class="job-item-check" type="checkbox" data-id="${j.id}"
              ${checked ? 'checked' : ''}
              onclick="toggleCheck(event,'${j.id}')"
-             ${j.status === 'queued' ? '' : 'disabled'}>
+             ${(j.status === 'queued' || j.status === 'error') ? '' : 'disabled'}>
       <div class="job-item-body">
         <div class="job-key">
           ${escHtml(j.ticket_key)}
@@ -198,8 +219,9 @@ function renderJobList() {
   const list = $('jobList');
   const jobs = filteredJobs();
 
-  const remJobs   = jobs.filter(j => j.source !== 'sweep');
-  const sweepJobs = jobs.filter(j => j.source === 'sweep');
+  const remJobs    = jobs.filter(j => j.source !== 'sweep' && j.source !== 'manual');
+  const manualJobs = jobs.filter(j => j.source === 'manual');
+  const sweepJobs  = jobs.filter(j => j.source === 'sweep');
 
   if (!jobs.length) {
     list.innerHTML = `<div style="padding:24px;text-align:center;color:var(--text-dim);font-size:12px;">
@@ -227,10 +249,18 @@ function renderJobList() {
       `style="padding:2px 8px;font-size:10px;border-radius:10px;border:1px solid var(--border);cursor:pointer;` +
       `background:${active ? 'var(--cyan)' : 'var(--bg3)'};color:${active ? '#000' : 'var(--text-dim)'};font-weight:${active ? '600' : '400'}"`;
 
+    const remQueuedIds = filteredRem.filter(j => j.status === 'queued' && j.triage !== 'closed').map(j => j.id);
+    const allRemChecked = remQueuedIds.length > 0 && remQueuedIds.every(id => state.checkedIds.has(id));
+
     const remChevron = state.remExpanded ? '▼' : '▶';
     html += `<div class="queue-section-header" style="cursor:pointer" onclick="toggleRemPane()">
       📋 REMEDIATED <span class="section-count">${remCountLabel}</span>
-      <span style="margin-left:auto;font-size:10px;color:var(--text-dim)">${remChevron}</span>
+      <div style="display:flex;align-items:center;gap:8px;margin-left:auto" onclick="event.stopPropagation()">
+        <label style="display:flex;align-items:center;gap:4px;font-size:10px;font-weight:normal;cursor:pointer;color:var(--text)">
+          <input type="checkbox" onchange="toggleSelectAllRem(this.checked, event)" ${allRemChecked ? 'checked' : ''}> Select All
+        </label>
+      </div>
+      <span style="margin-left:8px;font-size:10px;color:var(--text-dim)">${remChevron}</span>
     </div>`;
 
     if (state.remExpanded) {
@@ -240,6 +270,48 @@ function renderJobList() {
         <button ${remPill(rtf === 'manual')} onclick="setRemTypeFilter('manual')">🖐 Manual (${manualRemCount})</button>
       </div>`;
       html += filteredRem.map(renderJobCard).join('');
+    }
+  }
+  
+  if (manualJobs.length) {
+    const autoManualCount   = manualJobs.filter(j => j.status !== 'manual').length;
+    const manualManualCount = manualJobs.filter(j => j.status === 'manual').length;
+
+    const mtf = state.manualTypeFilter;
+    const filteredManual = mtf === 'auto'   ? manualJobs.filter(j => j.status !== 'manual')
+                         : mtf === 'manual' ? manualJobs.filter(j => j.status === 'manual')
+                         : manualJobs;
+
+    const manualCountLabel = mtf !== 'all'
+      ? `${filteredManual.length} of ${manualJobs.length}`
+      : manualJobs.length;
+
+    const manualPill = (active) =>
+      `style="padding:2px 8px;font-size:10px;border-radius:10px;border:1px solid var(--border);cursor:pointer;` +
+      `background:${active ? 'var(--cyan)' : 'var(--bg3)'};color:${active ? '#000' : 'var(--text-dim)'};font-weight:${active ? '600' : '400'}"`;
+
+    const manualQueuedIds = filteredManual.filter(j => j.status === 'queued' && j.triage !== 'closed').map(j => j.id);
+    const allManualChecked = manualQueuedIds.length > 0 && manualQueuedIds.every(id => state.checkedIds.has(id));
+
+    const manualChevron = state.manualExpanded ? '▼' : '▶';
+    html += `<div class="queue-section-header" style="cursor:pointer" onclick="toggleManualPane()">
+      ➕ MANUAL <span class="section-count">${manualCountLabel}</span>
+      <div style="display:flex;align-items:center;gap:8px;margin-left:auto" onclick="event.stopPropagation()">
+        <label style="display:flex;align-items:center;gap:4px;font-size:10px;font-weight:normal;cursor:pointer;color:var(--text)">
+          <input type="checkbox" onchange="toggleSelectAllManual(this.checked, event)" ${allManualChecked ? 'checked' : ''}> Select All
+        </label>
+        <button class="btn btn-sm btn-red" style="font-size:10px;padding:2px 8px;margin-left:4px" onclick="clearManualJobs()">🗑 Clear All</button>
+      </div>
+      <span style="margin-left:8px;font-size:10px;color:var(--text-dim)">${manualChevron}</span>
+    </div>`;
+
+    if (state.manualExpanded) {
+      html += `<div style="padding:5px 8px;border-bottom:1px solid var(--border);background:var(--bg2);display:flex;gap:5px">
+        <button ${manualPill(mtf === 'all')}    onclick="setManualTypeFilter('all')">All (${manualJobs.length})</button>
+        <button ${manualPill(mtf === 'auto')}   onclick="setManualTypeFilter('auto')">⚡ Auto-scan (${autoManualCount})</button>
+        <button ${manualPill(mtf === 'manual')} onclick="setManualTypeFilter('manual')">🖐 Manual (${manualManualCount})</button>
+      </div>`;
+      html += filteredManual.map(renderJobCard).join('');
     }
   }
   let hasMoreSweep = false;
@@ -277,9 +349,15 @@ function renderJobList() {
       `style="padding:2px 8px;font-size:10px;border-radius:10px;border:1px solid var(--border);cursor:pointer;` +
       `background:${active ? 'var(--cyan)' : 'var(--bg3)'};color:${active ? '#000' : 'var(--text-dim)'};font-weight:${active ? '600' : '400'}"`;
 
+    const sweepQueuedIds = filteredSweep.filter(j => j.status === 'queued' && j.triage !== 'closed').map(j => j.id);
+    const allSweepChecked = sweepQueuedIds.length > 0 && sweepQueuedIds.every(id => state.checkedIds.has(id));
+
     html += `<div class="queue-section-header sweep-section">⟳ SWEEP <span class="section-count">${countLabel}</span>
-      <div style="display:flex;gap:5px;margin-left:auto">
-        <button class="btn btn-sm btn-red" style="font-size:10px;padding:2px 8px" onclick="clearSweepJobs()">🗑 Clear All</button>
+      <div style="display:flex;align-items:center;gap:8px;margin-left:auto" onclick="event.stopPropagation()">
+        <label style="display:flex;align-items:center;gap:4px;font-size:10px;font-weight:normal;cursor:pointer;color:var(--text)">
+          <input type="checkbox" onchange="toggleSelectAllSweep(this.checked, event)" ${allSweepChecked ? 'checked' : ''}> Select All
+        </label>
+        <button class="btn btn-sm btn-red" style="font-size:10px;padding:2px 8px;margin-left:4px" onclick="clearSweepJobs()">🗑 Clear All</button>
       </div>
     </div>`;
     html += `<div style="padding:5px 8px;border-bottom:1px solid var(--border);background:var(--bg2);display:flex;flex-direction:column;gap:5px">
@@ -350,6 +428,16 @@ function toggleRemPane() {
   renderJobList();
 }
 
+function setManualTypeFilter(type) {
+  state.manualTypeFilter = type;
+  renderJobList();
+}
+
+function toggleManualPane() {
+  state.manualExpanded = !state.manualExpanded;
+  renderJobList();
+}
+
 function setSweepTypeFilter(type) {
   state.sweepTypeFilter  = type;
   state.sweepRenderLimit = 100;
@@ -399,6 +487,23 @@ function updateStats() {
   $('statScanning').textContent = `🔍 ${all.filter(j => j.status === 'scanning').length}`;
   $('statDone').textContent     = `✅ ${all.filter(j => j.status === 'completed').length}`;
   $('statErr').textContent      = `❌ ${all.filter(j => j.status === 'error').length}`;
+
+  const isScanning = all.some(j => j.status === 'scanning');
+  if (isScanning) {
+    state.lastScanningTime = Date.now();
+  }
+
+  const stopBtn = $('stopAllBtn');
+  if (stopBtn) {
+    // Show stop button if bulk scan is active, if any job is scanning, or if it was recently scanning and there are still queued jobs (avoids flickering during fast job transitions)
+    const hasActiveScan = _bulkScan || isScanning || (Date.now() - state.lastScanningTime < 8000 && all.some(j => j.status === 'queued'));
+    if (hasActiveScan) {
+      stopBtn.style.display = '';
+    } else {
+      stopBtn.style.display = 'none';
+    }
+  }
+
   updateTransitionReadyBtn();
   updateScanAllBtn();
   updateVerdictStats();
@@ -468,7 +573,7 @@ function updateScanAllBtn() {
     // Excludes triage="closed" — for most rules a closed port still parses to
     // "inconclusive" in the full scan too, so bulk-scanning them just burns the
     // per-job SSH/PTY overhead for no new verdict. Scan them individually if needed.
-    const count = filteredJobs().filter(j => j.status === 'queued' && j.triage !== 'closed').length;
+    const count = filteredJobs().filter(j => (j.status === 'queued' || j.status === 'error') && j.triage !== 'closed').length;
     const btn = $('scanAllBtn');
     if (btn) {
       if (count > 0) {
@@ -692,7 +797,7 @@ function updateBulkProgress() {
   if (stopBtn) stopBtn.style.display = '';
 
   if (done >= total) {
-    _bulkScan = null;
+    setBulkScan(null);
     if (stopBtn) stopBtn.style.display = 'none';
     showToast(`Bulk scan complete — ${done} jobs processed`, 'success', 5000);
     updateScanAllBtn(); // Restore normal button state
@@ -704,7 +809,7 @@ async function stopAllScans() {
   if (stopBtn) { stopBtn.disabled = true; stopBtn.textContent = 'Stopping…'; }
   try {
     await fetch('/api/jobs/stop-all', { method: 'POST' });
-    _bulkScan = null;
+    setBulkScan(null);
     if (stopBtn) { stopBtn.style.display = 'none'; stopBtn.disabled = false; stopBtn.textContent = '⏹ Stop All'; }
     showToast('All scans stopped — queued jobs remain and can be restarted', 'warn', 5000);
     await fetchJobs();
@@ -715,38 +820,39 @@ async function stopAllScans() {
 }
 
 async function scanAll() {
-  const ids = filteredJobs().filter(j => j.status === 'queued' && j.triage !== 'closed').map(j => j.id);
+  const ids = filteredJobs().filter(j => (j.status === 'queued' || j.status === 'error') && j.triage !== 'closed').map(j => j.id);
   if (!ids.length) return;
   const btn = $('scanAllBtn');
   if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
-  showToast(`Starting ${ids.length} scan${ids.length !== 1 ? 's' : ''}…`, 'info', 2500);
 
-  // Dispatch all scan requests in parallel — never sequential (blocks UI for 300 jobs)
-  const results = await Promise.allSettled(
-    ids.map(id => fetch(`/api/jobs/${id}/scan`, { method: 'POST' }))
-  );
-  let ok = 0, fail = 0;
-  const startedIds = new Set();
-  results.forEach((r, i) => {
-    if (r.status === 'fulfilled' && r.value.ok) {
-      // _full=true prevents fetchJobs polls from wiping output_lines with the
-      // slim list response while the scan is in progress — same protection as
-      // scanSelected and triggerScan.
-      if (state.jobs[ids[i]]) { state.jobs[ids[i]]._full = true; state.jobs[ids[i]].status = 'scanning'; state.jobs[ids[i]].output_lines = []; }
-      startedIds.add(ids[i]);
-      ok++;
-    } else { fail++; }
-  });
-
-  if (ok > 0) _bulkScan = { total: ok, ids: startedIds };
-
-  renderJobList();
-  updateStats();
-  // Only open a stream for the currently selected job — never bulk-open streams
-  const _sel = state.selectedJobId && state.jobs[state.selectedJobId];
-  if (_sel && _sel.status === 'scanning' && !state.activeStreams[_sel.id]) openStream(_sel.id);
-  if (fail === 0) showToast(`${ok} scan${ok !== 1 ? 's' : ''} started`, 'success');
-  else showToast(`${ok} started · ${fail} failed to start`, 'warn');
+  try {
+    const res = await fetch('/api/jobs/scan-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_ids: ids })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(data.detail || 'Failed to start scans', 'error');
+      if (btn) { btn.disabled = false; btn.textContent = '▶▶ Scan All'; }
+      return;
+    }
+    const enqueued = data.enqueued || 0;
+    // Track bulk scan progress — jobs transition queued→scanning→completed via the worker
+    if (enqueued > 0) {
+      // Optimistically update status so updateBulkProgress doesn't instantly consider them done
+      ids.forEach(id => {
+        if (state.jobs[id]) state.jobs[id].status = 'queued';
+      });
+      setBulkScan({ total: enqueued, ids: new Set(ids) });
+    }
+    showToast(`${enqueued} scan${enqueued !== 1 ? 's' : ''} queued — processing 1 by 1`, 'success');
+    renderJobList();
+    updateStats();
+  } catch (e) {
+    showToast('Failed to start scans: ' + e.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = '▶▶ Scan All'; }
+  }
 }
 
 // ── Copy terminal output ───────────────────────────────────────────────────
@@ -803,11 +909,123 @@ function toggleCheck(e, jobId) {
   updateScanSelectedBtn();
 }
 
+function toggleSelectAll(checked) {
+  const remJobs = filteredJobs().filter(j => j.source !== 'sweep' && j.source !== 'manual');
+  const rtf = state.remTypeFilter;
+  const filteredRem = rtf === 'auto'   ? remJobs.filter(j => j.status !== 'manual')
+                    : rtf === 'manual' ? remJobs.filter(j => j.status === 'manual')
+                    : remJobs;
+
+  const manualJobs = filteredJobs().filter(j => j.source === 'manual');
+  const mtf = state.manualTypeFilter;
+  const filteredManual = mtf === 'auto'   ? manualJobs.filter(j => j.status !== 'manual')
+                       : mtf === 'manual' ? manualJobs.filter(j => j.status === 'manual')
+                       : manualJobs;
+
+  const sweepJobs = filteredJobs().filter(j => j.source === 'sweep');
+  const tf = state.sweepTypeFilter;
+  const typeFiltered = tf === 'auto'         ? sweepJobs.filter(j => j.status !== 'manual')
+                     : tf === 'manual'       ? sweepJobs.filter(j => j.status === 'manual')
+                     : tf === 'fixed'        ? sweepJobs.filter(j => j.status === 'completed' && j.verdict === 'fixed')
+                     : tf === 'not_fixed'    ? sweepJobs.filter(j => j.status === 'completed' && j.verdict === 'not_fixed')
+                     : tf === 'inconclusive' ? sweepJobs.filter(j => j.status === 'completed' && j.verdict === 'inconclusive')
+                     : sweepJobs;
+  const q = (state.sweepSearch || '').toLowerCase();
+  const filteredSweep = q
+    ? typeFiltered.filter(j =>
+        (j.ticket_key && j.ticket_key.toLowerCase().includes(q)) ||
+        (j.ticket_summary && j.ticket_summary.toLowerCase().includes(q)) ||
+        (j.vulnerability_title && j.vulnerability_title.toLowerCase().includes(q))
+      )
+    : typeFiltered;
+
+  const visibleIds = [...filteredRem, ...filteredManual, ...filteredSweep]
+    .filter(j => (j.status === 'queued' || j.status === 'error') && j.triage !== 'closed')
+    .map(j => j.id);
+
+  if (checked) {
+    visibleIds.forEach(id => state.checkedIds.add(id));
+  } else {
+    visibleIds.forEach(id => state.checkedIds.delete(id));
+  }
+  updateScanSelectedBtn();
+  renderJobList();
+}
+
+function toggleSelectAllSweep(checked, event) {
+  if (event) {
+    event.stopPropagation();
+  }
+  const sweepJobs = filteredJobs().filter(j => j.source === 'sweep');
+  const tf = state.sweepTypeFilter;
+  const typeFiltered = tf === 'auto'         ? sweepJobs.filter(j => j.status !== 'manual')
+                     : tf === 'manual'       ? sweepJobs.filter(j => j.status === 'manual')
+                     : tf === 'fixed'        ? sweepJobs.filter(j => j.status === 'completed' && j.verdict === 'fixed')
+                     : tf === 'not_fixed'    ? sweepJobs.filter(j => j.status === 'completed' && j.verdict === 'not_fixed')
+                     : tf === 'inconclusive' ? sweepJobs.filter(j => j.status === 'completed' && j.verdict === 'inconclusive')
+                     : sweepJobs;
+  const q = (state.sweepSearch || '').toLowerCase();
+  const filteredSweep = q
+    ? typeFiltered.filter(j =>
+        (j.ticket_key && j.ticket_key.toLowerCase().includes(q)) ||
+        (j.ticket_summary && j.ticket_summary.toLowerCase().includes(q)) ||
+        (j.vulnerability_title && j.vulnerability_title.toLowerCase().includes(q))
+      )
+    : typeFiltered;
+
+  const ids = filteredSweep.filter(j => (j.status === 'queued' || j.status === 'error') && j.triage !== 'closed').map(j => j.id);
+  if (checked) {
+    ids.forEach(id => state.checkedIds.add(id));
+  } else {
+    ids.forEach(id => state.checkedIds.delete(id));
+  }
+  updateScanSelectedBtn();
+  renderJobList();
+}
+
+function toggleSelectAllRem(checked, event) {
+  if (event) {
+    event.stopPropagation();
+  }
+  const remJobs = filteredJobs().filter(j => j.source !== 'sweep' && j.source !== 'manual');
+  const rtf = state.remTypeFilter;
+  const filteredRem = rtf === 'auto'   ? remJobs.filter(j => j.status !== 'manual')
+                    : rtf === 'manual' ? remJobs.filter(j => j.status === 'manual')
+                    : remJobs;
+  const ids = filteredRem.filter(j => (j.status === 'queued' || j.status === 'error') && j.triage !== 'closed').map(j => j.id);
+  if (checked) {
+    ids.forEach(id => state.checkedIds.add(id));
+  } else {
+    ids.forEach(id => state.checkedIds.delete(id));
+  }
+  updateScanSelectedBtn();
+  renderJobList();
+}
+
+function toggleSelectAllManual(checked, event) {
+  if (event) {
+    event.stopPropagation();
+  }
+  const manualJobs = filteredJobs().filter(j => j.source === 'manual');
+  const mtf = state.manualTypeFilter;
+  const filteredManual = mtf === 'auto'   ? manualJobs.filter(j => j.status !== 'manual')
+                       : mtf === 'manual' ? manualJobs.filter(j => j.status === 'manual')
+                       : manualJobs;
+  const ids = filteredManual.filter(j => (j.status === 'queued' || j.status === 'error') && j.triage !== 'closed').map(j => j.id);
+  if (checked) {
+    ids.forEach(id => state.checkedIds.add(id));
+  } else {
+    ids.forEach(id => state.checkedIds.delete(id));
+  }
+  updateScanSelectedBtn();
+  renderJobList();
+}
+
 function updateScanSelectedBtn() {
   const btn = $('scanSelectedBtn');
   const count = [...state.checkedIds].filter(id => {
     const j = state.jobs[id];
-    return j && j.status === 'queued';
+    return j && (j.status === 'queued' || j.status === 'error');
   }).length;
   btn.disabled = count === 0;
   btn.textContent = count > 0 ? `▶ Scan Selected (${count})` : '▶ Scan Selected';
@@ -1059,28 +1277,38 @@ async function triggerScan(jobId) {
 }
 
 async function scanSelected() {
-  const ids = [...state.checkedIds].filter(id => state.jobs[id]?.status === 'queued');
+  const ids = [...state.checkedIds].filter(id => {
+    const status = state.jobs[id]?.status;
+    return status === 'queued' || status === 'error';
+  });
   if (!ids.length) return;
 
-  // Parallel dispatch — no sequential await loops
-  const results = await Promise.allSettled(
-    ids.map(id => fetch(`/api/jobs/${id}/scan`, { method: 'POST' }))
-  );
-  const startedIds = new Set();
-  results.forEach((r, i) => {
-    const id = ids[i];
-    if (r.status === 'fulfilled' && r.value.ok) {
-      if (state.jobs[id]) { state.jobs[id]._full = true; state.jobs[id].status = 'scanning'; state.jobs[id].output_lines = []; }
-      state.checkedIds.delete(id);
-      startedIds.add(id);
+  try {
+    const res = await fetch('/api/jobs/scan-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_ids: ids })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(data.detail || 'Failed to start scans', 'error');
+      return;
     }
-  });
-
-  // Track as bulk scan so the Stop All button appears
-  if (startedIds.size > 0) _bulkScan = { total: startedIds.size, ids: startedIds };
-
-  renderJobList();
-  updateStats();
+    const enqueued = data.enqueued || 0;
+    if (enqueued > 0) {
+      // Optimistically update status so updateBulkProgress doesn't instantly consider them done
+      ids.forEach(id => {
+        if (state.jobs[id]) state.jobs[id].status = 'queued';
+        state.checkedIds.delete(id);
+      });
+      setBulkScan({ total: enqueued, ids: new Set(ids) });
+    }
+    showToast(`${enqueued} scan${enqueued !== 1 ? 's' : ''} queued`, 'success');
+    renderJobList();
+    updateStats();
+  } catch (e) {
+    showToast('Failed to start scans: ' + e.message, 'error');
+  }
   // Only open stream for the selected job
   const _sel = state.selectedJobId && state.jobs[state.selectedJobId];
   if (_sel && _sel.status === 'scanning' && !state.activeStreams[_sel.id]) {
@@ -1186,6 +1414,10 @@ function needsFastTrack(job) {
 function renderTransitionBtns(job) {
   const jid = job.id;
   if (needsFastTrack(job)) {
+    // For sweeped/pre-remediated tickets, do not show the option to move to Remediated if the scan has run and the verdict is not fixed.
+    if ((job.status === 'completed' || job.status === 'error') && job.verdict !== 'fixed') {
+      return '';
+    }
     const chain = fastTrackChainToRemediated(job.ticket_status) || [];
     const tip   = chain.length > 1
       ? `Via: ${chain.slice(0, -1).join(' → ')} → Remediated`
@@ -1801,6 +2033,14 @@ async function clearSweepJobs() {
   await fetchJobs();
 }
 
+async function clearManualJobs() {
+  const count = Object.values(state.jobs).filter(j => j.source === 'manual' && j.status !== 'scanning').length;
+  if (!count) return;
+  if (!confirm(`Remove all ${count} manual ticket(s) from the queue?`)) return;
+  await fetch('/api/manual/jobs', { method: 'DELETE' });
+  await fetchJobs();
+}
+
 async function advanceSweepAll() {
   // Only advance swept tickets whose scan is complete with a FIXED verdict and
   // that still need a Jira transition (pre-Remediated). Scanning/queued tickets
@@ -1848,7 +2088,8 @@ async function stopSweepScans() {
   if (_bulkScan) {
     scanningIds.forEach(id => _bulkScan.ids.delete(id));
     _bulkScan.total = _bulkScan.ids.size;
-    if (_bulkScan.ids.size === 0) _bulkScan = null;
+    if (_bulkScan.ids.size === 0) setBulkScan(null);
+    else setBulkScan(_bulkScan);
   }
 
   showToast(`Stopping ${scanningIds.length} sweep scan${scanningIds.length !== 1 ? 's' : ''}…`, 'warn', 3000);
@@ -1947,7 +2188,7 @@ function switchTab(tab) {
 
   // Intake view
   const iv = $('intakeView');
-  iv.style.display       = isIntake ? 'flex' : 'none';
+  if (iv) iv.style.display = isIntake ? 'block' : 'none';
   iv.style.flexDirection = 'column';
 
   if (isReport) initReportControls();
@@ -2139,24 +2380,33 @@ async function onNessusFolderToggle(folderId, checked) {
   }
 }
 
+let _nessusHostCountDebounce = null;
 function _updateNessusPullBtn() {
   const checked = document.querySelectorAll('.nessus-scan-check:checked');
   const any = checked.length > 0;
   $('nessusPullBtn').disabled = !any;
-  if (!any) { $('nessusHostCount').textContent = ''; return; }
+  if (!any) { 
+    $('nessusHostCount').textContent = ''; 
+    if (_nessusHostCountDebounce) clearTimeout(_nessusHostCountDebounce);
+    return; 
+  }
 
   // Show loading then fetch actual count from Nessus scan details
   $('nessusHostCount').textContent = '🖥 counting hosts…';
   const label   = $('assetsClient').value;
   const scanIds = Array.from(checked).map(cb => parseInt(cb.value, 10));
-  fetch(`/api/nessus/${encodeURIComponent(label)}/host-count`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ scan_ids: scanIds }),
-  })
-  .then(r => r.json())
-  .then(d => { $('nessusHostCount').textContent = `🖥 ${(d.total_hosts || 0).toLocaleString()} hosts in selected scans`; })
-  .catch(() => { $('nessusHostCount').textContent = ''; });
+  
+  if (_nessusHostCountDebounce) clearTimeout(_nessusHostCountDebounce);
+  _nessusHostCountDebounce = setTimeout(() => {
+    fetch(`/api/nessus/${encodeURIComponent(label)}/host-count`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scan_ids: scanIds }),
+    })
+    .then(r => r.json())
+    .then(d => { $('nessusHostCount').textContent = `🖥 ${(d.total_hosts || 0).toLocaleString()} hosts in selected scans`; })
+    .catch(() => { $('nessusHostCount').textContent = ''; });
+  }, 600);
 }
 
 const NESSUS_PORT = 8834;
@@ -2472,6 +2722,26 @@ function renderReport(d) {
       </div>`;
   }
 
+  function osTable(data) {
+    const osData = data || d.os_breakdown || { items: [] };
+    const items = osData.items;
+    if (!items || !items.length) return '';
+    const bodyHtml = items.map(it => `
+      <tr>
+        <td>${escHtml(it.os)}</td>
+        <td style="text-align:right">${it.issues}</td>
+        <td style="text-align:right">${it.ips}</td>
+      </tr>`).join('');
+    return `
+      <div class="report-vuln-card" style="margin-top:20px">
+        <div class="report-card-header">Open issues by OS</div>
+        <table class="report-vuln-table">
+          <thead><tr><th>OS</th><th style="text-align:right">Issues</th><th style="text-align:right">IPs</th></tr></thead>
+          <tbody>${bodyHtml}</tbody>
+        </table>
+      </div>`;
+  }
+
   const html = `
     <div style="margin-bottom:18px;font-size:15px;font-weight:700;color:var(--text)">${escHtml(title)}</div>
 
@@ -2505,7 +2775,9 @@ function renderReport(d) {
     <div class="report-footer">
       <span class="report-footer-label">Total Fixed as of ${monthName} ${d.period.last_day}, ${year}</span>
       <span class="report-footer-value">${val(d.total_fixed_to_date)}</span>
-    </div>`;
+    </div>
+    ${osTable()}
+  `;
 
   $('reportResults').innerHTML = html;
 }
@@ -2620,6 +2892,26 @@ function renderWeeklyReport(d) {
       </div>`;
   }
 
+  function osTable(data) {
+    const osData = data || d.os_breakdown || { items: [] };
+    const items = osData.items;
+    if (!items || !items.length) return '';
+    const bodyHtml = items.map(it => `
+      <tr>
+        <td>${escHtml(it.os)}</td>
+        <td style="text-align:right">${it.issues}</td>
+        <td style="text-align:right">${it.ips}</td>
+      </tr>`).join('');
+    return `
+      <div class="report-vuln-card" style="margin-top:20px">
+        <div class="report-card-header">Open issues by OS</div>
+        <table class="report-vuln-table">
+          <thead><tr><th>OS</th><th style="text-align:right">Issues</th><th style="text-align:right">IPs</th></tr></thead>
+          <tbody>${bodyHtml}</tbody>
+        </table>
+      </div>`;
+  }
+
   const html = `
     <div style="margin-bottom:18px;font-size:15px;font-weight:700;color:var(--text)">${escHtml(title)}</div>
 
@@ -2653,7 +2945,9 @@ function renderWeeklyReport(d) {
     <div class="report-footer">
       <span class="report-footer-label">Total Fixed as of ${fmtDate(p.week_end)}</span>
       <span class="report-footer-value">${val(d.total_fixed_to_date)}</span>
-    </div>`;
+    </div>
+    ${osTable()}
+  `;
 
   $('weeklyResults').innerHTML = html;
 }
@@ -2687,6 +2981,8 @@ async function findDuplicates() {
 
 // Holds all duplicate (non-keep) tickets from the last scan
 let _dupUrlsToClose = [];
+// Holds all keep (old) tickets from the last scan
+let _keepUrls = [];
 // Maps tester name → array of {key, url} for their duplicate tickets
 let _dupByTester = {};
 // Sorted [name, tickets] pairs — index used by per-tester open buttons
@@ -2701,13 +2997,15 @@ function renderDuplicates(data) {
         ✅ No duplicate tickets found for <strong>${escHtml(data.client)}</strong>
       </div>`;
     _dupUrlsToClose = [];
+    _keepUrls = [];
     _dupByTester = {};
     _dupTesterList = [];
     return;
   }
 
-  // Collect every duplicate (non-keep) — build global list and per-tester map
+  // Collect every duplicate (non-keep) and keep (old) — build global lists and per-tester map
   _dupUrlsToClose = [];
+  _keepUrls = [];
   _dupByTester = {};
   data.groups.forEach(g => {
     g.tickets.forEach(t => {
@@ -2716,6 +3014,8 @@ function renderDuplicates(data) {
         const name = t.tester || t.reporter || 'Unknown';
         if (!_dupByTester[name]) _dupByTester[name] = [];
         _dupByTester[name].push({ key: t.key, url: t.jira_url });
+      } else {
+        _keepUrls.push({ key: t.key, url: t.jira_url });
       }
     });
   });
@@ -2742,6 +3042,7 @@ function renderDuplicates(data) {
       </tr>`).join('');
 
   const n = _dupUrlsToClose.length;
+  const k = _keepUrls.length;
   const summary = `
     <div style="margin-bottom:20px">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:14px">
@@ -2754,9 +3055,14 @@ function renderDuplicates(data) {
             Tickets marked <strong>duplicate</strong> are the ones to close/delete in Jira.
           </div>
         </div>
-        <button class="btn btn-primary" onclick="openAllDuplicates()" style="white-space:nowrap">
-          🔗 Open All ${n} Duplicate${n !== 1 ? 's' : ''} in Jira
-        </button>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-secondary" onclick="openAllKeeps()" style="white-space:nowrap">
+            🔗 Open All ${k} Keep${k !== 1 ? '' : ''} (Old) in Jira
+          </button>
+          <button class="btn btn-primary" onclick="openAllDuplicates()" style="white-space:nowrap">
+            🔗 Open All ${n} Duplicate${n !== 1 ? 's' : ''} in Jira
+          </button>
+        </div>
       </div>
       <div class="report-card" style="padding:14px;margin-bottom:0">
         <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:10px">
@@ -2805,6 +3111,12 @@ function openAllDuplicates() {
   if (!_dupUrlsToClose.length) { showToast('No duplicates to open.', 'warn'); return; }
   window.open(_jiraSearchUrl(_dupUrlsToClose), '_blank', 'noopener');
   showToast(`Opened Jira filter for all ${_dupUrlsToClose.length} duplicate tickets.`, 'success');
+}
+
+function openAllKeeps() {
+  if (!_keepUrls.length) { showToast('No keep tickets to open.', 'warn'); return; }
+  window.open(_jiraSearchUrl(_keepUrls), '_blank', 'noopener');
+  showToast(`Opened Jira filter for all ${_keepUrls.length} keep (old) tickets.`, 'success');
 }
 
 function openDuplicatesForTester(idx) {

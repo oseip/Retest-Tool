@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pkill -f \"uvicorn src.main\")",
+      "Bash(nohup .venv/bin/python -m uvicorn src.main:app --port 8000 --host 0.0.0.0)",
+      "Bash(curl -s http://localhost:8000/api/jobs)",
+      "Bash(python3 -c \"import sys,json; print\\('server up'\\)\")"
+    ]
+  }
+}

@@ -81,7 +81,9 @@ class JiraClientV2:
         custom_names = ["cvss", "severity", "technology", "vulnerability_rating",
                         "testtype[short text]", "testtype", "tester",
                         "otherinformation[paragraph]", "otherinformation",
-                        "other information"]
+                        "other information",
+                        "affected_system[paragraph]", "affected_system", "affected system",
+                        "os[short text]", "os"]
         custom_ids = [self._fid(n) for n in custom_names if self._fid(n)]
         return ",".join(standard + custom_ids)
 
@@ -151,28 +153,10 @@ class JiraClientV2:
         issues = self._search_jql(jql, max_results=max_results)
         return [self._serialize(i) for i in issues]
 
-    _v2_search_gone: bool = False
-
     def count_jql(self, jql: str) -> int:
-        if not self._v2_search_gone:
-            try:
-                resp = self._session.get(
-                    f"{self.cfg.url}/rest/api/2/search",
-                    params={"jql": jql, "maxResults": 0, "fields": ""},
-                    timeout=30,
-                )
-                if resp.status_code == 410:
-                    self.__class__._v2_search_gone = True
-                else:
-                    resp.raise_for_status()
-                    return resp.json().get("total", 0)
-            except Exception:
-                self.__class__._v2_search_gone = True
-
-        # v3 fallback — also returns 'total' on first page
         resp = self._session.get(
-            f"{self.cfg.url}/rest/api/3/search/jql",
-            params={"jql": jql, "maxResults": 1, "fields": "id"},
+            f"{self.cfg.url}/rest/api/2/search",
+            params={"jql": jql, "maxResults": 0, "fields": ""},
             timeout=30,
         )
         resp.raise_for_status()
@@ -367,5 +351,11 @@ class JiraClientV2:
                 or get_custom("otherinformation")
                 or get_custom("other information")
             ),
+            "affected_system": (
+                get_custom("affected_system[paragraph]")
+                or get_custom("affected_system")
+                or get_custom("affected system")
+            ),
+            "os": get_custom("os[short text]") or get_custom("os"),
             "description": desc,
         }

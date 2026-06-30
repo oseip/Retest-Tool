@@ -7,6 +7,7 @@ import queue as _queue
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +28,14 @@ SEEN_KEYS: set = set()
 
 # System-level application logs
 APP_LOGS: List[str] = []
+
+@dataclass
+class SweepState:
+    status: str = "stopped"  # stopped, running, paused
+    pending_job_ids: List[str] = field(default_factory=list)
+
+# Sweep states keyed by client_label
+SWEEPS: Dict[str, SweepState] = {}
 
 # Signals the background poll thread to wake up immediately
 _wake_poll = threading.Event()
@@ -50,6 +59,7 @@ _scan_workers: Dict[str, threading.Thread] = {}
 
 # Stop events keyed by job_id — kept separate so JOBS stays JSON-serialisable
 _stop_events: Dict[str, threading.Event] = {}
+_sweep_stop_events: Dict[str, threading.Event] = {}
 
 # Job IDs that should be skipped by the scan worker (stop-all was called)
 _cancelled_ids: set = set()
@@ -353,6 +363,15 @@ def run_scan(job_id: str, cfg: Config):
     except Exception as exc:
         log.exception("Scan job %s failed", job_id)
         emit(f"[ERROR] {exc}")
+        
+        # Check if it's an SSH/connection error
+        exc_str = str(exc).lower()
+        if "ssh" in exc_str or "connection" in exc_str or "socket" in exc_str or "eof" in exc_str:
+            emit("[SYSTEM] SSH error detected. Pausing queue to prevent cascading failures.")
+            emit("[SYSTEM] Please reconnect via the SSH panel and restart this scan manually.")
+            with _lock:
+                _worker_paused[client_label] = True
+        
         with _lock:
             JOBS[job_id]["status"] = "error"
             JOBS[job_id]["error"] = str(exc)
@@ -410,12 +429,18 @@ def run_triage(job_id: str, cfg: Config):
             JOBS[job_id]["triage_note"] = str(exc)
 
 
-def _scan_worker(scan_q: _queue.Queue, triage_q: _queue.Queue):
+_worker_paused: Dict[str, bool] = {}
+
+def _scan_worker(client_label: str, scan_q: _queue.Queue, triage_q: _queue.Queue):
     """Worker thread: one job at a time per client. Always prefers the scan
     queue over the triage queue, so a manually-triggered scan only ever
     waits behind the single triage check currently in flight (if any),
     never the whole triage backlog."""
     while True:
+        if _worker_paused.get(client_label):
+            time.sleep(1)
+            continue
+            
         try:
             job_id, cfg = scan_q.get_nowait()
             kind = "scan"
@@ -436,7 +461,9 @@ def _scan_worker(scan_q: _queue.Queue, triage_q: _queue.Queue):
         try:
             if job_id in _cancelled_ids:
                 _cancelled_ids.discard(job_id)
-                # Leave the job as "queued" so user can restart it
+                with _lock:
+                    JOBS[job_id]["status"] = "error"
+                    JOBS[job_id]["error"] = "Cancelled by user"
             elif kind == "triage":
                 run_triage(job_id, cfg)
             else:
@@ -461,7 +488,7 @@ def _ensure_worker(client_label: str):
             triage_q: _queue.Queue = _queue.Queue()
             _scan_queues[client_label] = scan_q
             _triage_queues[client_label] = triage_q
-            t = threading.Thread(target=_scan_worker, args=(scan_q, triage_q), daemon=True)
+            t = threading.Thread(target=_scan_worker, args=(client_label, scan_q, triage_q), daemon=True)
             _scan_workers[client_label] = t
             t.start()
 
@@ -472,6 +499,100 @@ def trigger_scan(job_id: str, cfg: Config):
     client_label = job["client_label"]
     _ensure_worker(client_label)
     _scan_queues[client_label].put((job_id, cfg))
+
+def _sweep_driver(client_label: str, cfg: Config, stop_event: threading.Event):
+    """Driver thread for running a sweep batch serially with health checks."""
+    _app_log(f"[Sweep Driver] Started for {client_label}")
+    while True:
+        with _lock:
+            state = SWEEPS.get(client_label)
+            if not state or state.status != "running" or not state.pending_job_ids:
+                if state and state.status == "running":
+                    state.status = "completed"
+                    _app_log(f"[Sweep Driver] {client_label}: Sweep completed.")
+                else:
+                    _app_log(f"[Sweep Driver] {client_label}: Exiting loop (state={state.status if state else 'None'}, pending={len(state.pending_job_ids) if state else 0})")
+                break
+            job_id = state.pending_job_ids[0]
+
+        # Check SSH before sending to scan queue
+        _app_log(f"[Sweep Driver] {client_label}: Checking SSH for job {job_id}...")
+        kali = connections.get_connection(client_label)
+        if not kali:
+            with _lock:
+                state.status = "paused"
+            _app_log(f"[Sweep Driver] {client_label}: Paused due to disconnected SSH")
+            break
+        try:
+            _, _, code = kali.exec("echo 1", timeout=5)
+            if code != 0:
+                raise Exception("SSH ping failed")
+            _app_log(f"[Sweep Driver] {client_label}: SSH check passed for job {job_id}")
+        except Exception as e:
+            with _lock:
+                state.status = "paused"
+            _app_log(f"[Sweep Driver] {client_label}: Paused due to SSH error ({e})")
+            break
+        
+        # Check if sweep was stopped
+        if stop_event.is_set():
+            _app_log(f"[Sweep Driver] {client_label}: Stopped by user")
+            break
+
+        # Remove from pending and trigger
+        with _lock:
+            state.pending_job_ids.pop(0)
+            
+        _app_log(f"[Sweep Driver] {client_label}: Triggering scan for job {job_id}")
+        # Give the job to the worker
+        trigger_scan(job_id, cfg)
+        
+        _app_log(f"[Sweep Driver] {client_label}: Waiting for job {job_id} to finish...")
+        # Wait for this job to finish before queuing the next.
+        while True:
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+            with _lock:
+                status = JOBS.get(job_id, {}).get("status")
+            if status not in ("queued", "scanning"):
+                break
+        _app_log(f"[Sweep Driver] {client_label}: Job {job_id} finished with status {status}")
+
+
+def start_sweep(client_label: str, cfg: Config, job_ids: List[str]):
+    """Start a new resilient sweep for a list of job IDs."""
+    with _lock:
+        if _sweep_stop_events.get(client_label):
+            _sweep_stop_events[client_label].set()
+        evt = threading.Event()
+        _sweep_stop_events[client_label] = evt
+        state = SweepState(status="running", pending_job_ids=job_ids)
+        SWEEPS[client_label] = state
+    threading.Thread(target=_sweep_driver, args=(client_label, cfg, evt), daemon=True).start()
+
+def resume_sweep(client_label: str, cfg: Config):
+    """Resume a paused sweep."""
+    with _lock:
+        state = SWEEPS.get(client_label)
+        if not state or state.status != "paused":
+            return False
+        state.status = "running"
+        if _sweep_stop_events.get(client_label):
+            _sweep_stop_events[client_label].set()
+        evt = threading.Event()
+        _sweep_stop_events[client_label] = evt
+    threading.Thread(target=_sweep_driver, args=(client_label, cfg, evt), daemon=True).start()
+    return True
+
+def pause_sweep(client_label: str):
+    """Manually pause an active sweep."""
+    with _lock:
+        state = SWEEPS.get(client_label)
+        if state and state.status == "running":
+            state.status = "paused"
+            _app_log(f"[Sweep] {client_label}: Sweep paused by user")
+
 
 
 def trigger_triage(job_id: str, cfg: Config):
@@ -496,6 +617,8 @@ def stop_scan(job_id: str) -> bool:
 def cancel_all_active() -> dict:
     """Stop running scans and cancel all queued jobs (worker will skip them)."""
     with _lock:
+        for event in _sweep_stop_events.values():
+            event.set()
         stopped_running = len(_stop_events)
         for event in _stop_events.values():
             event.set()
@@ -549,6 +672,12 @@ def run_poll_cycle(cfg: Config, jira_client, session: str = "axian") -> None:
                 job_id = _queue_ticket(ticket, client.label, manual=is_manual, session=session)
                 new_count += 1
                 rule = JOBS[job_id].get("rule_name")
+                # Also mark as manual if no scan rule was matched
+                # (e.g. vuln type disabled / not yet supported).
+                if not is_manual and rule is None:
+                    with _lock:
+                        JOBS[job_id]["status"] = "manual"
+                    is_manual = True
                 if is_manual:
                     _app_log(
                         f"{tag}Queued (manual): {key} ({client.label}) | "

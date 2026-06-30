@@ -343,7 +343,7 @@ class TestCountJql:
             "isLast": True,
         }
 
-        client._session.get.side_effect = [v2_resp, cursor_resp]
+        client._session.get.side_effect = [v2_resp, cursor_resp, cursor_resp]
 
         count = client.count_jql("project = TEST")
         assert count == 30

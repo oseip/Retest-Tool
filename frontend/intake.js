@@ -60,18 +60,32 @@ function onIntakeClientChange() {
 }
 
 // ── Jira index prefetch ──────────────────────────────────────────────────
-async function _intakePrefetchJira(label) {
+async function _intakePrefetchJira(label, force = false) {
   _intakeJiraStatus = "loading";
   _intakeUpdateJiraBar();
   try {
-    await fetch(`/api/intake/${label}/prefetch-jira`, { method: 'POST' });
+    const url = `/api/intake/${label}/prefetch-jira` + (force ? '?force=1' : '');
+    await fetch(url, { method: 'POST' });
   } catch (_) {}
   _intakeStartJiraPoll(label);
 }
 
+let _intakeJiraPollCount = 0;
+
 function _intakeStartJiraPoll(label) {
   if (_intakeJiraTimer) clearInterval(_intakeJiraTimer);
+  _intakeJiraPollCount = 0;
+  
   _intakeJiraTimer = setInterval(async () => {
+    _intakeJiraPollCount++;
+    if (_intakeJiraPollCount > 40) { // 60 seconds max
+      clearInterval(_intakeJiraTimer);
+      _intakeJiraTimer = null;
+      _intakeJiraStatus = 'error';
+      _intakeUpdateJiraBar(true);
+      return;
+    }
+    
     try {
       const r = await fetch(`/api/intake/${label}/jira-index-status`);
       if (!r.ok) return;
@@ -91,7 +105,7 @@ function _intakeStartJiraPoll(label) {
   }, 1500);
 }
 
-function _intakeUpdateJiraBar() {
+function _intakeUpdateJiraBar(isTimeout = false) {
   const bar  = $('intakeJiraBar');
   const icon = $('intakeJiraIcon');
   const txt  = $('intakeJiraTxt');
@@ -107,8 +121,15 @@ function _intakeUpdateJiraBar() {
     bar.style.color  = 'var(--green)';
   } else if (_intakeJiraStatus === 'error') {
     icon.textContent = '⚠️';
-    txt.textContent  = 'Jira index failed — check connection';
+    txt.textContent  = isTimeout ? 'Jira index timed out — check connection' : 'Jira index failed — check connection';
     bar.style.color  = 'var(--red)';
+    const retry = document.createElement('a');
+    retry.textContent = ' (Retry)';
+    retry.href = 'javascript:void(0)';
+    retry.style.color = 'var(--text)';
+    retry.style.marginLeft = '6px';
+    retry.onclick = () => _intakePrefetchJira($('intakeClient').value, true);
+    txt.appendChild(retry);
   } else {
     icon.textContent = '';
     txt.textContent  = '';
@@ -131,19 +152,26 @@ async function _intakeLoadFolders() {
   const scanList    = $('intakeScanList');
   if (!folderList) return;
   folderList.innerHTML = '<span style="color:var(--text-dim)">Loading…</span>';
-  scanList.innerHTML   = '<span style="color:var(--text-dim)">Check a folder to see its scans</span>';
+  folderList.textContent = 'Loading…';
+  folderList.style.color = 'var(--text-dim)';
+  scanList.textContent   = 'Check a folder to see its scans';
+  scanList.style.color   = 'var(--text-dim)';
   _intakeFolderScans = {};
   try {
     const r = await fetch(`/api/nessus/${label}/folders`);
     if (!r.ok) {
       const e = await r.json();
-      folderList.innerHTML = `<span style="color:var(--red)">${e.detail || 'Error loading folders'}</span>`;
+      folderList.innerHTML = '';
+      const span = document.createElement('span');
+      span.style.color = 'var(--red)';
+      span.textContent = e.detail || 'Error loading folders';
+      folderList.appendChild(span);
       return;
     }
     const d = await r.json();
     const folders = (d.folders || []).filter(f => f.type !== 'trash');
     if (!folders.length) {
-      folderList.innerHTML = '<span style="color:var(--text-dim)">No folders found</span>';
+      folderList.textContent = 'No folders found';
       return;
     }
     folderList.innerHTML = '';
@@ -159,7 +187,11 @@ async function _intakeLoadFolders() {
       folderList.appendChild(row);
     });
   } catch (e) {
-    folderList.innerHTML = `<span style="color:var(--red)">${e.message}</span>`;
+    folderList.innerHTML = '';
+    const span = document.createElement('span');
+    span.style.color = 'var(--red)';
+    span.textContent = e.message;
+    folderList.appendChild(span);
   }
 }
 

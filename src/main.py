@@ -393,10 +393,56 @@ def start_scan(job_id: str):
     job = scanner.JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-    if job["status"] != "queued":
+    if job["status"] not in ("queued", "error"):
         raise HTTPException(400, f"Cannot scan — job status is '{job['status']}'")
+    with scanner._lock:
+        job["status"] = "queued"
+        job["error"] = None
+        job["verdict"] = None
+        job["verdict_reason"] = None
+        job["completed_at"] = None
     scanner.trigger_scan(job_id, cfg)
     return {"ok": True, "job_id": job_id}
+
+
+from pydantic import BaseModel
+
+
+class ScanBatchRequest(BaseModel):
+    job_ids: List[str]
+
+
+@app.post("/api/jobs/scan-batch")
+def scan_batch(body: ScanBatchRequest):
+    """Enqueue multiple jobs for scanning in one request.
+    The backend worker processes them sequentially, one at a time.
+    Allows enqueuing queued or errored jobs; others are skipped."""
+    enqueued = 0
+    skipped = 0
+    for job_id in body.job_ids:
+        job = scanner.JOBS.get(job_id)
+        if not job or job["status"] not in ("queued", "error"):
+            skipped += 1
+            continue
+        with scanner._lock:
+            job["status"] = "queued"
+            job["error"] = None
+            job["verdict"] = None
+            job["verdict_reason"] = None
+            job["completed_at"] = None
+        scanner.trigger_scan(job_id, cfg)
+        enqueued += 1
+    scanner._app_log(f"[Scan Batch] Enqueued {enqueued} jobs ({skipped} skipped)")
+    return {"ok": True, "enqueued": enqueued, "skipped": skipped}
+
+
+@app.post("/api/jobs/resume-worker")
+def resume_worker(client_label: str):
+    """Resume a paused scan worker after SSH reconnection."""
+    with scanner._lock:
+        scanner._worker_paused[client_label] = False
+    scanner._app_log(f"[SYSTEM] Worker for {client_label} resumed.")
+    return {"ok": True}
 
 
 @app.post("/api/jobs/{job_id}/triage")
@@ -1048,11 +1094,34 @@ def generate_report(client: str, month: str):
         log.warning("New vulnerabilities query failed: %s", exc)
         new_vulnerabilities["error"] = str(exc)
 
+    # OS Breakdown
+    os_breakdown = {}
+    try:
+        from collections import defaultdict
+        open_issues = jira_client.search_jql(f"{base} {or_}")
+        os_groups = defaultdict(lambda: {"issues": 0, "ips": set()})
+        for issue in open_issues:
+            os_name = (issue.get("os") or "Unknown").strip()
+            os_groups[os_name]["issues"] += 1
+            for ip in issue.get("ips", []):
+                os_groups[os_name]["ips"].add(ip)
+        
+        os_list = [
+            {"os": k, "issues": v["issues"], "ips": len(v["ips"])}
+            for k, v in os_groups.items()
+        ]
+        os_list.sort(key=lambda x: x["issues"], reverse=True)
+        os_breakdown = {"items": os_list}
+    except Exception as exc:
+        log.warning("OS breakdown query failed: %s", exc)
+        os_breakdown = {"error": str(exc), "items": []}
+
     report = {
         "client": client,
         "month":  month,
         "period": {"start": start, "end": end, "last_day": last_day},
         "new_vulnerabilities": new_vulnerabilities,
+        "os_breakdown": os_breakdown,
         "new_tickets": {
             "total":    results["new_total"],
             "critical": results["new_critical"],
@@ -1170,6 +1239,28 @@ def generate_weekly_report(client: str, day: str):
         log.warning("Weekly report new-vulnerabilities query failed: %s", exc)
         new_vulnerabilities["error"] = str(exc)
 
+    # OS Breakdown
+    os_breakdown = {}
+    try:
+        from collections import defaultdict
+        open_issues = jira_client.search_jql(f"{base} {or_}")
+        os_groups = defaultdict(lambda: {"issues": 0, "ips": set()})
+        for issue in open_issues:
+            os_name = (issue.get("os") or "Unknown").strip()
+            os_groups[os_name]["issues"] += 1
+            for ip in issue.get("ips", []):
+                os_groups[os_name]["ips"].add(ip)
+        
+        os_list = [
+            {"os": k, "issues": v["issues"], "ips": len(v["ips"])}
+            for k, v in os_groups.items()
+        ]
+        os_list.sort(key=lambda x: x["issues"], reverse=True)
+        os_breakdown = {"items": os_list}
+    except Exception as exc:
+        log.warning("OS breakdown query failed: %s", exc)
+        os_breakdown = {"error": str(exc), "items": []}
+
     report = {
         "client":  client,
         "period":  {
@@ -1179,6 +1270,7 @@ def generate_weekly_report(client: str, day: str):
             "week_end":   str(week_end),
         },
         "new_vulnerabilities": new_vulnerabilities,
+        "os_breakdown": os_breakdown,
         "new_tickets": {
             "total":    results["new_total"],
             "critical": results["new_critical"],
@@ -1280,20 +1372,21 @@ def find_duplicates(client: str):
     except Exception as exc:
         raise HTTPException(500, f"Failed to fetch tickets: {exc}")
 
-    # Group by (first IP, normalised summary, first port)
+    # Group by (first IP, normalised summary, first port, affected_system)
     groups: dict = defaultdict(list)
     for t in tickets:
         ip      = (t.get("ips")   or [""])[0].strip()
         port    = (t.get("ports") or [""])[0].strip()
         summary = (t.get("summary") or "").strip().lower()
+        affected_system = (t.get("affected_system") or "").strip()
         if not ip or not summary:
             continue   # can't reliably detect duplicates without at least IP + name
-        groups[(ip, summary, port)].append(t)
+        groups[(ip, summary, port, affected_system)].append(t)
 
     jira_base_url = jira_client.cfg.url.rstrip("/")
 
     duplicate_groups = []
-    for (ip, summary, port), members in groups.items():
+    for (ip, summary, port, affected_system), members in groups.items():
         if len(members) < 2:
             continue
         # Oldest key first = recommended keep
@@ -1404,6 +1497,28 @@ def _parse_assets(data: bytes, filename: str = "") -> list:
 # keep old name as alias so nothing else breaks
 _parse_excel_assets = _parse_assets
 
+
+@app.get("/api/debug/threads")
+def debug_threads():
+    import sys
+    import traceback
+    from .scanner import _scan_workers
+    threads_info = {}
+    for th_id, frame in sys._current_frames().items():
+        threads_info[str(th_id)] = traceback.format_stack(frame)
+    
+    workers = {}
+    for label, w in _scan_workers.items():
+        workers[label] = {
+            "alive": w.is_alive(),
+            "ident": w.ident,
+            "name": w.name
+        }
+        
+    return {
+        "threads": threads_info,
+        "workers": workers
+    }
 
 @app.get("/api/batch-scan/rules")
 def batch_scan_rules():
@@ -1628,6 +1743,11 @@ def ssh_connect(label: str):
         try:
             connections.connect(cfg, label)
             scanner._app_log(f"[SSH] Connected to {label}")
+            # Auto-resume paused scan worker if it was paused due to SSH failure
+            with scanner._lock:
+                if scanner._worker_paused.get(label):
+                    scanner._worker_paused[label] = False
+                    scanner._app_log(f"[SYSTEM] Scan worker for {label} auto-resumed after SSH reconnect")
         except Exception as exc:
             scanner._app_log(f"[SSH] Connection to {label} failed: {exc}")
     threading.Thread(target=_do, daemon=True).start()
@@ -1729,6 +1849,45 @@ def sweep_run(label: str, body: Optional[SweepRunRequest] = None):
     threading.Thread(target=_do, daemon=True).start()
     return {"ok": True}
 
+class SweepStartRequest(BaseModel):
+    job_ids: List[str]
+
+@app.post("/api/sweep/{label}/start_scan")
+def sweep_start_scan(label: str, req: SweepStartRequest):
+    client_cfg, _ = _get_client(label)
+    if not client_cfg:
+        raise HTTPException(400, f"Unknown client: {label}")
+    if not connections.get_connection(label):
+        raise HTTPException(400, f"SSH not connected for {label}. Please connect SSH first.")
+    scanner.start_sweep(label, client_cfg, req.job_ids)
+    return {"ok": True}
+
+@app.post("/api/sweep/{label}/resume")
+def sweep_resume(label: str):
+    client_cfg, _ = _get_client(label)
+    if not client_cfg:
+        raise HTTPException(400, f"Unknown client: {label}")
+    if not connections.get_connection(label):
+        raise HTTPException(400, f"SSH not connected for {label}. Please connect SSH first.")
+    if not scanner.resume_sweep(label, client_cfg):
+        raise HTTPException(400, "Sweep is not in paused state")
+    return {"ok": True}
+
+@app.post("/api/sweep/{label}/pause")
+def sweep_pause(label: str):
+    scanner.pause_sweep(label)
+    return {"ok": True}
+
+@app.get("/api/sweep/{label}/status")
+def sweep_status(label: str):
+    with scanner._lock:
+        state = scanner.SWEEPS.get(label)
+        if not state:
+            return {"status": "stopped", "pending_count": 0}
+        return {
+            "status": state.status,
+            "pending_count": len(state.pending_job_ids)
+        }
 
 @app.delete("/api/sweep/jobs")
 def clear_sweep_jobs():
@@ -1744,6 +1903,22 @@ def clear_sweep_jobs():
             del scanner.JOBS[jid]
             removed += 1
     scanner._app_log(f"Cleared {removed} sweep job(s) from queue")
+    return {"ok": True, "removed": removed}
+
+@app.delete("/api/manual/jobs")
+def clear_manual_jobs():
+    """Remove all non-scanning manual jobs."""
+    with scanner._lock:
+        to_remove = [
+            jid for jid, j in scanner.JOBS.items()
+            if j.get("source") == "manual" and j["status"] != "scanning"
+        ]
+        removed = 0
+        for jid in to_remove:
+            scanner.SEEN_KEYS.discard(scanner.JOBS[jid]["ticket_key"])
+            del scanner.JOBS[jid]
+            removed += 1
+    scanner._app_log(f"Cleared {removed} manual job(s) from queue")
     return {"ok": True, "removed": removed}
 
 
@@ -1884,10 +2059,12 @@ def nessus_pull(label: str, req: NessusPullRequest):
     # Sequential is slower but eliminates that interference entirely.
     for scan_id in req.scan_ids:
         try:
-            hosts = nc.get_scan_hosts(
+            hosts, warning = nc.get_scan_hosts(
                 conn, client_cfg.nessus_access_key, client_cfg.nessus_secret_key, scan_id
             )
             all_hosts.extend(hosts)
+            if warning:
+                errors.append(warning)
         except Exception as exc:
             errors.append(f"Scan {scan_id}: {exc}")
 

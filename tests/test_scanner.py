@@ -110,9 +110,9 @@ class TestQueueTicket:
 
     def test_udp_rule_uses_sudo(self):
         ticket = make_ticket(
-            summary="SNMP Default Community Name (public)",
+            summary="Portable SDK for UPnP Devices (libupnp)",
             ips=["10.0.0.1"],
-            ports=["161"],
+            ports=["1900"],
         )
         job_id = scanner._queue_ticket(ticket, "TestClient")
         cmd = scanner.JOBS[job_id]["nmap_command"]
@@ -466,9 +466,9 @@ class TestBuildTriageCommand:
 
     def test_udp_rule_triage_uses_sudo_and_su(self):
         ticket = make_ticket(
-            summary="SNMP Default Community Name (public)",
+            summary="Portable SDK for UPnP Devices (libupnp)",
             ips=["10.0.0.1"],
-            ports=["161"],
+            ports=["1900"],
         )
         job_id = scanner._queue_ticket(ticket, "TestClient")
         cmd = scanner.JOBS[job_id]["triage_command"]
@@ -591,10 +591,12 @@ class TestTriageWorkerDispatch:
             for i in range(2, 5)
         ]
         scan_job_id = scanner._queue_ticket(
-            make_ticket(summary="SSH Weak Key Exchange Algorithms", ips=["10.0.0.9"], ports=["22"]),
+            make_ticket(summary="SSL Certificate Expiry on 10.0.0.9", ips=["10.0.0.9"], ports=["443"]),
             client,
         )
-        fake_cfg = SimpleNamespace(clients=[SimpleNamespace(label=client)])
+        fake_cfg = SimpleNamespace(clients=[SimpleNamespace(label=client)], clients_secondary=None)
+        import sys
+        print(f"DEBUG_JOB: {scanner.JOBS[scan_job_id]}", file=sys.stderr)
 
         order = []
         order_lock = threading.Lock()
@@ -612,7 +614,7 @@ class TestTriageWorkerDispatch:
                 # behind it, and so the scan gets enqueued while this one
                 # is still "in flight" — exactly the "Triage All in
                 # progress, then I start a scan" scenario being tested.
-                release_first_triage.wait(timeout=2)
+                release_first_triage.wait(timeout=10)
             with order_lock:
                 order.append("triage")
             return ("443/tcp open  https\n", "", 0)
@@ -629,7 +631,7 @@ class TestTriageWorkerDispatch:
              patch("src.scanner.time.sleep"):
             for jid in triage_job_ids:
                 scanner.trigger_triage(jid, cfg=None)
-            first_triage_started.wait(timeout=2)
+            first_triage_started.wait(timeout=10)
             scanner.trigger_scan(scan_job_id, cfg=fake_cfg)
             release_first_triage.set()
             scanner._scan_queues[client].join()

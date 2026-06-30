@@ -31,6 +31,9 @@
           <option value="inconclusive">⚠️ Inconclusive</option>
         </optgroup>
       </select>
+      <label style="display:flex; align-items:center; gap:5px; font-size:12px; margin-left:10px; color:var(--text); cursor:pointer;">
+        <input type="checkbox" id="selectAllJobs" onchange="toggleSelectAll(this.checked)"> Select All
+      </label>
       <select id="triageFilter">
         <option value="">All Triage</option>
         <option value="closed">🟢 Likely Fixed</option>
@@ -88,6 +91,8 @@
       </div>
       <div class="panel-scan-bar">
         <button class="btn btn-sm btn-primary" id="scanAllBtn" style="visibility:hidden" onclick="scanAll()">▶▶ Scan All</button>
+        <button class="btn btn-sm btn-secondary" id="pauseSweepBtn" style="display:none" onclick="pauseSweep()">⏸ Pause Sweep</button>
+        <button class="btn btn-sm btn-primary" id="resumeSweepBtn" style="display:none" onclick="resumeSweep()">▶ Resume Sweep</button>
         <button class="btn btn-sm btn-red" id="stopAllBtn" style="display:none" onclick="stopAllScans()">⏹ Stop All</button>
         <button class="btn btn-sm btn-primary" id="scanSelectedBtn" disabled>▶ Scan Selected</button>
       </div>
@@ -714,7 +719,7 @@
   <div id="toastContainer" class="toast-container"></div>
   <script src="/static/vendor/xterm/xterm.js"></script>
   <script src="/static/vendor/xterm/xterm-addon-fit.js"></script>
-  <script src="/static/intake.js?v=15"></script>
-  <script src="/static/app.js?v=15"></script>
+  <script src="/static/intake.js?v=3"></script>
+  <script src="/static/app.js?v=3"></script>
 </body>
 </html>

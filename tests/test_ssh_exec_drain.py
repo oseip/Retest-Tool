@@ -195,16 +195,18 @@ class TestNessusGetScanHosts:
 
     def test_extracts_ip_from_hostname(self):
         conn = self._conn_for({"hosts": [{"hostname": "10.0.0.1"}, {"hostname": "10.0.0.2"}]})
-        hosts = nc.get_scan_hosts(conn, "ak", "sk", 1)
+        hosts, _ = nc.get_scan_hosts(conn, "ak", "sk", 1)
         assert [h["ip"] for h in hosts] == ["10.0.0.1", "10.0.0.2"]
 
     def test_empty_hosts_key(self):
         conn = self._conn_for({"hosts": []})
-        assert nc.get_scan_hosts(conn, "ak", "sk", 1) == []
+        hosts, _ = nc.get_scan_hosts(conn, "ak", "sk", 1)
+        assert hosts == []
 
     def test_missing_hosts_key(self):
         conn = self._conn_for({"info": {"name": "scan"}, "vulnerabilities": []})
-        assert nc.get_scan_hosts(conn, "ak", "sk", 1) == []
+        hosts, _ = nc.get_scan_hosts(conn, "ak", "sk", 1)
+        assert hosts == []
 
     def test_skips_entries_without_hostname(self):
         conn = self._conn_for({"hosts": [
@@ -212,7 +214,7 @@ class TestNessusGetScanHosts:
             {"no_hostname_here": True},
             {"hostname": "10.0.0.2"},
         ]})
-        hosts = nc.get_scan_hosts(conn, "ak", "sk", 1)
+        hosts, _ = nc.get_scan_hosts(conn, "ak", "sk", 1)
         assert len(hosts) == 2
 
     def test_large_response_split_at_65k_boundary(self):
@@ -236,7 +238,7 @@ class TestNessusGetScanHosts:
         )
 
         conn = self._conn_for(payload, split=65536, delay_s=0.2)
-        hosts = nc.get_scan_hosts(conn, "ak", "sk", 1779)
+        hosts, _ = nc.get_scan_hosts(conn, "ak", "sk", 1779)
 
         assert len(hosts) == 200, (
             f"Only {len(hosts)}/200 hosts returned — response was truncated"

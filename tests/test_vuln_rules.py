@@ -144,12 +144,26 @@ class TestMatchRule:
         rule = match_rule("SMBv1 Server Detected")
         assert rule is not None
 
-    # No match
     def test_unrecognised_summary_returns_none(self):
         assert match_rule("Random unrelated vulnerability XYZ 12345") is None
 
     def test_empty_summary_returns_none(self):
         assert match_rule("") is None
+
+    def test_manual_only_rules(self):
+        manual_summaries = [
+            "VMware ESXi Version Vulnerability",
+            "Terminal Services Encryption Level is Medium or Low",
+            "IPMI v2.0 Password Hash Disclosure",
+            "SNMP Agent Default Community Name (public)",
+            "NTP Mode 6 Scanner",
+            "Apache Struts Remote Code Execution",
+            "Spring4Shell Spring Framework RCE",
+            "Exposed phpinfo.php page"
+        ]
+        for summary in manual_summaries:
+            rule = match_rule(summary)
+            assert rule is None, f"Expected '{summary}' to bypass automated scan, but matched {rule}"
 
     # Rule structure
     def test_matched_rule_has_nmap_script_or_curl_path(self):

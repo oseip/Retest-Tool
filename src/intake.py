@@ -7,6 +7,7 @@ the three lines that wire it into main.py / index.html / app.js.
 import csv
 import io
 import logging
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
@@ -135,9 +136,60 @@ def _col(row: dict, *names: str) -> str:
 
 def _parse_nessus_csv(csv_text: str) -> List[dict]:
     """Parse one Nessus CSV export into normalised finding dicts."""
-    reader = csv.DictReader(io.StringIO(csv_text))
+    rows = list(csv.DictReader(io.StringIO(csv_text)))
+    
+    # --- Pass 1: Extract OS Mapping ---
+    ip_to_os = {}
+    for row in rows:
+        host = _col(row, "Host")
+        if not host:
+            continue
+        
+        # Explicit OS column (if present)
+        os_val = _col(row, "OS", "Operating System")
+        if os_val:
+            ip_to_os[host] = os_val
+            continue
+            
+        # Plugin-based OS identification
+        pid = _col(row, "Plugin ID")
+        if pid in ("11936", "33850", "108791", "108792"):
+            p_out = _col(row, "Plugin Output")
+            m = re.search(r"(?i)Remote operating system\s*:\s*(.+)", p_out)
+            if m:
+                ip_to_os[host] = m.group(1).split("\n")[0].strip()
+            elif p_out and host not in ip_to_os:
+                ip_to_os[host] = p_out.split("\n")[0].strip()[:50]
+
+    # --- Helpers for CIA & Risk ---
+    def parse_cia(cvss_vector: str) -> str:
+        if not cvss_vector:
+            return ""
+        c_map = {"N": "None", "L": "Low", "M": "Medium", "H": "High", "C": "Complete", "P": "Partial"}
+        c = re.search(r"/C:([NLMHCP])", cvss_vector)
+        i = re.search(r"/I:([NLMHCP])", cvss_vector)
+        a = re.search(r"/A:([NLMHCP])", cvss_vector)
+        if not c and not i and not a:
+            return ""
+        c_val = c_map.get(c.group(1), "None") if c else "None"
+        i_val = c_map.get(i.group(1), "None") if i else "None"
+        a_val = c_map.get(a.group(1), "None") if a else "None"
+        return f"Confidentiality: {c_val}, Integrity: {i_val}, Availability: {a_val}"
+
+    def calc_risk(score: str) -> str:
+        try:
+            s = float(score)
+        except ValueError:
+            return ""
+        if s >= 9.0: return "5 - Critical"
+        if s >= 7.0: return "4 - High"
+        if s >= 4.0: return "3 - Medium"
+        if s > 0.0:  return "2 - Low"
+        return "1 - Info"
+
+    # --- Pass 2: Generate Findings ---
     findings: List[dict] = []
-    for row in reader:
+    for row in rows:
         risk = _col(row, "Risk").lower()
         if risk in _SKIP_RISKS:
             continue
@@ -149,6 +201,7 @@ def _parse_nessus_csv(csv_text: str) -> List[dict]:
         cve   = _col(row, "CVE")
         desc  = _col(row, "Description")
         soln  = _col(row, "Solution")
+        cvss_vector = _col(row, "CVSS v3.0 Vector", "CVSS Vector")
 
         # Prefer CVSS v3, fall back to v2
         cvss = (_col(row, "CVSS v3.0 Base Score")
@@ -165,7 +218,7 @@ def _parse_nessus_csv(csv_text: str) -> List[dict]:
             "Recommendation":            soln,
             "Affected_System":           "",
             "System_IP":                 host,
-            "OS":                        "",
+            "OS":                        ip_to_os.get(host, ""),
             "Assignee":                  "",
             "OWASP_Top_10_Category":     "",
             "Vulnerability_Rating":      risk.capitalize(),
@@ -175,8 +228,8 @@ def _parse_nessus_csv(csv_text: str) -> List[dict]:
             "Technology":                _technology(name, port, proto),
             "Vector":                    "",   # filled per engagement
             "Actor":                     "",   # filled per engagement
-            "CIA_Damage":                "",   # left for user to fill
-            "Risk_Value":                "",   # left for user to fill
+            "CIA_Damage":                parse_cia(cvss_vector),
+            "Risk_Value":                calc_risk(cvss),
             # Internal helpers (stripped before export)
             "_port": port,
             "_ip":   host,
@@ -184,20 +237,97 @@ def _parse_nessus_csv(csv_text: str) -> List[dict]:
     return findings
 
 
+_NORMALIZATION_PATTERNS = [
+    (re.compile(r"(?i)^Apache(?:\s+HTTP\s+Server)?\s+\d+(?:\.\d+)+.*"), "Apache HTTP Server Multiple Vulnerabilities"),
+    (re.compile(r"(?i)^PHP\s+\d+(?:\.\d+)+.*"), "PHP Multiple Vulnerabilities"),
+    (re.compile(r"(?i)^OpenSSL\s+\d+(?:\.\d+)*[a-z]?\s+.*"), "OpenSSL Multiple Vulnerabilities"),
+    (re.compile(r"(?i)^nginx\s+\d+(?:\.\d+)+.*"), "nginx Multiple Vulnerabilities"),
+    (re.compile(r"(?i)^Apache\s+Tomcat\s+\d+(?:\.\d+)+.*"), "Apache Tomcat Multiple Vulnerabilities"),
+    (re.compile(r"(?i)^Node\.js\s+\d+(?:\.\d+)+.*"), "Node.js Multiple Vulnerabilities"),
+    (re.compile(r"(?i)^MySQL\s+\d+(?:\.\d+)+.*"), "MySQL Multiple Vulnerabilities"),
+    (re.compile(r"(?i)^PostgreSQL\s+\d+(?:\.\d+)+.*"), "PostgreSQL Multiple Vulnerabilities"),
+    (re.compile(r"(?i)^Oracle\s+Java\s+SE\s+\d+.*"), "Oracle Java SE Multiple Vulnerabilities"),
+]
+
+
+def _normalize_title(title: str) -> str:
+    """Normalize vulnerability titles to group similar version vulnerabilities."""
+    for pattern, replacement in _NORMALIZATION_PATTERNS:
+        if pattern.match(title.strip()):
+            return replacement
+    return title.strip()
+
+
 def _merge_dedup(all_findings: List[dict]) -> List[dict]:
-    """Remove exact (title, IP, port) duplicates across merged scans."""
-    seen: set = set()
+    """Deduplicate by (title, IP) — same vuln on multiple ports merges into one
+    row with all ports combined in the Technology field, e.g. SSL,443,8443."""
+    # Ordered dict preserves first-seen order
+    seen: dict = {}   # (title_lower, ip) → index in `out`
     out: List[dict] = []
+    
+    # Rating mapped to severity levels for merging to highest severity
+    severity_map = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "None": 0, "Info": 0}
+
     for f in all_findings:
-        key = (
-            f["Vulnerability_Title"].lower().strip(),
-            f["_ip"].strip(),
-            f["_port"].strip(),
-        )
-        if key not in seen:
-            seen.add(key)
+        raw_title = f["Vulnerability_Title"]
+        norm_title = _normalize_title(raw_title)
+        
+        # Update title so UI and exported CSV show the grouped family title
+        f["Vulnerability_Title"] = norm_title
+        
+        key = (norm_title.lower().strip(), f["_ip"].strip())
+        port = f["_port"].strip()
+
+        if key in seen:
+            # Merge port into the existing row's Technology field
+            existing = out[seen[key]]
+            _merge_port(existing, port)
+            
+            # Combine CVEs
+            if f.get("CVE"):
+                existing_cves = [c.strip() for c in existing.get("CVE", "").split(",") if c.strip()]
+                new_cves = [c.strip() for c in f["CVE"].split(",") if c.strip()]
+                for cve in new_cves:
+                    if cve not in existing_cves:
+                        existing_cves.append(cve)
+                existing["CVE"] = ",".join(existing_cves)
+                
+            # Take the highest CVSS
+            try:
+                e_cvss = float(existing.get("CVSS") or 0.0)
+            except ValueError:
+                e_cvss = 0.0
+            try:
+                f_cvss = float(f.get("CVSS") or 0.0)
+            except ValueError:
+                f_cvss = 0.0
+            if f_cvss > e_cvss:
+                existing["CVSS"] = f.get("CVSS", "")
+                
+            # Take highest Rating
+            e_rating = existing.get("Vulnerability_Rating", "Info").capitalize()
+            f_rating = f.get("Vulnerability_Rating", "Info").capitalize()
+            if severity_map.get(f_rating, 0) > severity_map.get(e_rating, 0):
+                existing["Vulnerability_Rating"] = f_rating
+        else:
+            seen[key] = len(out)
             out.append(f)
+
     return out
+
+
+def _merge_port(finding: dict, new_port: str) -> None:
+    """Add *new_port* to an existing finding's Technology field if not already present."""
+    if not new_port or new_port == "0":
+        return
+    tech = finding.get("Technology", "")
+    parts = [p.strip() for p in tech.split(",")]
+    if new_port not in parts:
+        parts.append(new_port)
+    finding["Technology"] = ",".join(parts)
+    # Keep _port as the first port for Jira dedup matching
+    if not finding.get("_port"):
+        finding["_port"] = new_port
 
 
 # ── Jira index builder ──────────────────────────────────────────────────────
@@ -215,18 +345,12 @@ def _build_index(label: str) -> None:
         jc = m._jira_for_label(label)
 
         if session == "non_axian":
-            jql = (
-                f'project = {label} '
-                f'AND status NOT IN (Fixed, "Risk Accepted", Closed, Done) '
-                f'ORDER BY created ASC'
-            )
+            jql = f'project = {label} ORDER BY created ASC'
         else:
-            jql = (
-                f'project = {m.cfg.jira.project} AND labels = "{label}" '
-                f'AND status NOT IN (Fixed, "Risk Accepted", Closed, Done) '
-                f'ORDER BY created ASC'
-            )
+            jql = f'project = {m.cfg.jira.project} AND labels = "{label}" ORDER BY created ASC'
 
+        # Optimize: only fetch fields necessary for deduplication (massive speedup)
+        jc._fetch_fields = "summary,labels"
         tickets = jc.search_jql(jql)
 
         # Build index: (normalised_title, ip, port) → ticket key
@@ -267,7 +391,7 @@ def _build_index(label: str) -> None:
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
 @router.post("/api/intake/{label}/prefetch-jira")
-def intake_prefetch_jira(label: str):
+def intake_prefetch_jira(label: str, force: bool = False):
     """Kick off background Jira index build. Call as soon as user picks a client."""
     from . import main as m
     if not m.cfg:
@@ -277,7 +401,7 @@ def intake_prefetch_jira(label: str):
 
     with _INDEX_LOCK:
         st = _JIRA_INDEXES.get(label, {}).get("status", "idle")
-    if st == "loading":
+    if st == "loading" and not force:
         return {"ok": True, "status": "loading"}
 
     threading.Thread(target=_build_index, args=(label,), daemon=True).start()

@@ -423,7 +423,7 @@ def _parse_clickjacking(text: str, xml: str, description: str = "") -> Tuple[Ver
 def _parse_service_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
-    versions = re.findall(r'(?:server|version)[:\s/]+(\d+[\d.]+)', text, re.I)
+    versions = re.findall(r'(?:server|version)[:\s/]+(\d+\.\d+[\d.]*)', text, re.I)
     if not versions:
         versions = re.findall(r'/([\d]+\.[\d]+\.[\d]+)', text)
     if versions:
@@ -1985,17 +1985,18 @@ RULES: List[VulnRule] = [
     ),
 
     # --- RDP ---
-    VulnRule(
-        name="Terminal Services / RDP NLA / Encryption",
-        patterns=[
-            r"terminal services.*nla", r"terminal services.*network level auth",
-            r"terminal services.*encryption", r"remote desktop.*man.in.the.middle",
-            r"ms12-020", r"rdp.*encryption", r"rdp.*nla", r"rdp.*without.*nla",
-        ],
-        nmap_script="rdp-enum-encryption",
-        default_port=3389,
-        parse=_parse_rdp,
-    ),
+    # Disabled: Terminal Services / RDP scans producing inaccurate results — moved to manual review.
+    # VulnRule(
+    #     name="Terminal Services / RDP NLA / Encryption",
+    #     patterns=[
+    #         r"terminal services.*nla", r"terminal services.*network level auth",
+    #         r"terminal services.*encryption", r"remote desktop.*man.in.the.middle",
+    #         r"ms12-020", r"rdp.*encryption", r"rdp.*nla", r"rdp.*without.*nla",
+    #     ],
+    #     nmap_script="rdp-enum-encryption",
+    #     default_port=3389,
+    #     parse=_parse_rdp,
+    # ),
     VulnRule(
         name="BlueKeep CVE-2019-0708",
         patterns=[r"bluekeep", r"cve-2019-0708"],
@@ -2066,15 +2067,13 @@ RULES: List[VulnRule] = [
         default_port=80,
         parse=_parse_http_methods,
     ),
+    # Apache-specific patterns removed — Apache scans producing inaccurate results, moved to manual review.
     VulnRule(
-        name="Apache / Nginx / Web Server Version",
+        name="Nginx / Web Server Version",
         patterns=[
-            r"apache 2\.4", r"apache 2\.2", r"apache http server",
-            r"nginx\s*<", r"apache activemq web console",
+            r"nginx\s*<",
             r"unsupported web server", r"unsupported web server detection",
-            r"apache.*multiple vulnerabilities", r"apache http.*cve", r"apache httpd.*cve",
             r"nginx.*multiple vulnerabilities",
-            r"apache.*seol", r"apache http server seol",
         ],
         nmap_script="http-server-header",
         extra_args="-sV",
@@ -2225,15 +2224,15 @@ RULES: List[VulnRule] = [
     ),
 
     # --- Network Services ---
-    VulnRule(
-        name="SNMP Default Community Name (public)",
-        patterns=[r"snmp.*default community", r"snmp agent default community", r"snmp.*getbulk", r"clear.text snmp"],
-        nmap_script="snmp-brute",
-        extra_args="-sU",
-        default_port=161,
-        parse=_parse_snmp,
-        requires_root=True,
-    ),
+    # VulnRule(
+    #     name="SNMP Default Community Name (public)",
+    #     patterns=[r"snmp.*default community", r"snmp agent default community", r"snmp.*getbulk", r"clear.text snmp"],
+    #     nmap_script="snmp-brute",
+    #     extra_args="-sU",
+    #     default_port=161,
+    #     parse=_parse_snmp,
+    #     requires_root=True,
+    # ),
     VulnRule(
         name="Telnet Service / Telnetd RCE",
         patterns=[
@@ -2285,15 +2284,15 @@ RULES: List[VulnRule] = [
         default_port=3260,
         parse=_parse_iscsi,
     ),
-    VulnRule(
-        name="IPMI v2 Password Hash Disclosure",
-        patterns=[r"ipmi.*password hash", r"ipmi v2"],
-        nmap_script="ipmi-cipher-zero,ipmi-brute",
-        extra_args="-sU",
-        default_port=623,
-        parse=_parse_ipmiv2,
-        requires_root=True,
-    ),
+    # VulnRule(
+    #     name="IPMI v2 Password Hash Disclosure",
+    #     patterns=[r"ipmi.*password hash", r"ipmi v2"],
+    #     nmap_script="ipmi-cipher-zero,ipmi-brute",
+    #     extra_args="-sU",
+    #     default_port=623,
+    #     parse=_parse_ipmiv2,
+    #     requires_root=True,
+    # ),
     VulnRule(
         name="FTP Anonymous Access",
         patterns=[r"ftp.*anonymous", r"ftp.*anon"],
@@ -2358,18 +2357,18 @@ RULES: List[VulnRule] = [
         default_port=443,
         parse=_parse_service_version,
     ),
-    VulnRule(
-        name="VMware ESXi / vCenter / Aria / Workspace ONE Vulnerabilities",
-        patterns=[
-            r"vmware esxi", r"vmware vcenter", r"vmware aria", r"vmware workspace",
-            r"vsphere.*cve", r"esxi\s+[0-9]", r"vcenter.*cve", r"vmsa-",
-            r"esxi.*xss", r"esxi.*vulnerabilit",
-        ],
-        nmap_script="http-server-header",
-        extra_args="-sV",
-        default_port=443,
-        parse=_parse_vmware,
-    ),
+    # VulnRule(
+    #     name="VMware ESXi / vCenter / Aria / Workspace ONE Vulnerabilities",
+    #     patterns=[
+    #         r"vmware esxi", r"vmware vcenter", r"vmware aria", r"vmware workspace",
+    #         r"vsphere.*cve", r"esxi\s+[0-9]", r"vcenter.*cve", r"vmsa-",
+    #         r"esxi.*xss", r"esxi.*vulnerabilit",
+    #     ],
+    #     nmap_script="http-server-header",
+    #     extra_args="-sV",
+    #     default_port=443,
+    #     parse=_parse_vmware,
+    # ),
     VulnRule(
         name="ActiveMQ RCE CVE-2023-46604",
         patterns=[r"activemq.*rce", r"cve-2023-46604", r"activemq.*5\."],
@@ -2576,16 +2575,17 @@ RULES: List[VulnRule] = [
         parse=_parse_dns_cache,
         requires_root=True,
     ),
-    VulnRule(
-        name="NTP Mode 6 Scanner",
-        patterns=[r"ntp.*mode 6", r"network time protocol.*mode 6",
-                  r"ntp mode 6 scanner", r"ntp.*scanner"],
-        nmap_script="ntp-info",
-        extra_args="-sU",
-        default_port=123,
-        parse=_parse_ntp,
-        requires_root=True,
-    ),
+    # Disabled: NTP Mode 6 scans taking too long and producing inaccurate results — moved to manual review.
+    # VulnRule(
+    #     name="NTP Mode 6 Scanner",
+    #     patterns=[r"ntp.*mode 6", r"network time protocol.*mode 6",
+    #               r"ntp mode 6 scanner", r"ntp.*scanner"],
+    #     nmap_script="ntp-info",
+    #     extra_args="-sU",
+    #     default_port=123,
+    #     parse=_parse_ntp,
+    #     requires_root=True,
+    # ),
     VulnRule(
         name="Cisco IOS TFTP File Disclosure",
         patterns=[r"cisco.*tftp", r"cisco ios.*tftp", r"cisco.*tftp.*disclosure"],
@@ -2697,15 +2697,16 @@ RULES: List[VulnRule] = [
     ),
 
     # --- phpinfo() ---
-    VulnRule(
-        name="phpinfo() Page Publicly Accessible",
-        patterns=[r"phpinfo", r"php.*info.*page", r"php.*configuration.*disclosure",
-                  r"php.*info.*exposed", r"php.*info.*accessible"],
-        tool="curl",
-        curl_path="/phpinfo.php",
-        default_port=80,
-        parse=_parse_phpinfo,
-    ),
+    # Disabled: phpinfo / info.php scans not picking up results accurately — moved to manual review.
+    # VulnRule(
+    #     name="phpinfo() Page Publicly Accessible",
+    #     patterns=[r"phpinfo", r"php.*info.*page", r"php.*configuration.*disclosure",
+    #               r"php.*info.*exposed", r"php.*info.*accessible"],
+    #     tool="curl",
+    #     curl_path="/phpinfo.php",
+    #     default_port=80,
+    #     parse=_parse_phpinfo,
+    # ),
 
     # --- phpMyAdmin / Adminer ---
     VulnRule(
@@ -2970,9 +2971,52 @@ RULES: List[VulnRule] = [
 # Lookup
 # ---------------------------------------------------------------------------
 
+# Vulnerabilities that are explicitly excluded from automated scanning
+# because they are notoriously slow, prone to false positives/negatives via automation,
+# or require manual validation. Tickets matching these fall back to the manual queue.
+MANUAL_ONLY_RULES = [
+    # 1. Slow & Unreliable UDP Protocols
+    r"network time protocol",
+    r"ntp.*mode 6",
+    r"snmp agent default community",
+    r"snmp.*getbulk",
+    r"cisco.*tftp",
+    r"cisco ios.*tftp",
+    r"dns.*cache snooping",
+    
+    # 2. Complex Web Applications & Framework RCEs
+    r"spring4shell",
+    r"spring.*framework.*rce",
+    r"struts",
+    r"react server components rce",
+    r"react2shell",
+    r"moodle",
+    r"alfresco",
+    r"exchange.*proxylogon",
+    r"exchange.*proxyshell",
+    
+    # 3. Deep Protocol / Authenticated Checks
+    r"terminal services encryption level",
+    r"esxi",
+    r"ipmi v2\.0 password hash disclosure",
+    r"smb signing disabled",
+    r"ldap null base",
+    r"apache 2\.4\.x.*windows",
+    
+    # 4. Flaky Web Configurations (False Positives)
+    r"info\.php",
+    r"phpinfo\.php",
+]
+
 def match_rule(summary: str) -> Optional[VulnRule]:
     """Return the first matching VulnRule for a given ticket summary."""
     low = summary.lower()
+    
+    # Fast-fail for explicitly manual rules
+    for pattern in MANUAL_ONLY_RULES:
+        if re.search(pattern, low):
+            return None
+
     for rule in RULES:
         for pattern in rule.patterns:
             if re.search(pattern, low):

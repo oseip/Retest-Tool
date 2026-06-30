@@ -74,24 +74,49 @@ def get_scans(conn, access_key: str, secret_key: str, folder_id: Optional[int] =
     ]
 
 
+def _get_fallback_history_id(data: Dict) -> Optional[int]:
+    """Return the history_id of the most recent completed run if current is incomplete."""
+    info = data.get("info", {})
+    if info.get("status") == "completed":
+        return None
+    history = data.get("history", [])
+    completed = [h for h in history if h.get("status") == "completed"]
+    if not completed:
+        return None
+    completed.sort(key=lambda x: x.get("last_modification_date", 0), reverse=True)
+    return completed[0].get("history_id")
+
+
 def get_scan_host_count(conn, access_key: str, secret_key: str, scan_id: int) -> int:
     """Return just the host count for a scan without fetching all host details."""
     data = _req(conn, "GET", f"/scans/{scan_id}", access_key, secret_key)
+    hid = _get_fallback_history_id(data)
+    if hid:
+        log.info("Scan %s incomplete/failed. Falling back to history_id %s for host count.", scan_id, hid)
+        data = _req(conn, "GET", f"/scans/{scan_id}?history_id={hid}", access_key, secret_key)
+        
     hosts = data.get("hosts") or []
     info  = data.get("info") or {}
     # Try info.hosts_total first (faster), fall back to counting hosts array
     return info.get("hosts_total") or len(hosts)
 
 
-def get_scan_hosts(conn, access_key: str, secret_key: str, scan_id: int) -> List[Dict]:
-    """Return all hosts found in a completed Nessus scan."""
+def get_scan_hosts(conn, access_key: str, secret_key: str, scan_id: int) -> Tuple[List[Dict], Optional[str]]:
+    """Return (hosts, fallback_warning) for a Nessus scan."""
     data = _req(conn, "GET", f"/scans/{scan_id}", access_key, secret_key)
+    hid = _get_fallback_history_id(data)
+    warning = None
+    if hid:
+        warning = f"Scan {scan_id} was {data.get('info', {}).get('status')}; automatically fell back to last successful run ({hid})"
+        log.info(warning)
+        data = _req(conn, "GET", f"/scans/{scan_id}?history_id={hid}", access_key, secret_key)
+
     hosts = data.get("hosts") or []
     return [
         {"ip": h.get("hostname", ""), "status": h.get("status", "")}
         for h in hosts
         if h.get("hostname")
-    ]
+    ], warning
 
 
 def get_scan_info(conn, access_key: str, secret_key: str, scan_id: int) -> Dict:
