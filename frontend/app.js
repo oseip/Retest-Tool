@@ -2970,6 +2970,7 @@ async function findDuplicates() {
       $('duplicatesResults').innerHTML = `<div class="report-error">⚠️ ${escHtml(data.detail || 'Unknown error')}</div>`;
       return;
     }
+    _currentDuplicatesData = data;
     renderDuplicates(data);
   } catch (e) {
     $('duplicatesResults').innerHTML = `<div class="report-error">⚠️ Request failed: ${escHtml(e.message)}</div>`;
@@ -2987,6 +2988,8 @@ let _keepUrls = [];
 let _dupByTester = {};
 // Sorted [name, tickets] pairs — index used by per-tester open buttons
 let _dupTesterList = [];
+// Holds the raw data for Excel export
+let _currentDuplicatesData = null;
 
 function renderDuplicates(data) {
   const container = $('duplicatesResults');
@@ -3000,6 +3003,7 @@ function renderDuplicates(data) {
     _keepUrls = [];
     _dupByTester = {};
     _dupTesterList = [];
+    _currentDuplicatesData = null;
     return;
   }
 
@@ -3056,6 +3060,9 @@ function renderDuplicates(data) {
           </div>
         </div>
         <div style="display:flex;gap:8px">
+          <button class="btn btn-secondary" onclick="downloadDuplicatesExcel()" style="white-space:nowrap;background:var(--green);border-color:var(--green);color:white">
+            📥 Export to Excel
+          </button>
           <button class="btn btn-secondary" onclick="openAllKeeps()" style="white-space:nowrap">
             🔗 Open All ${k} Keep${k !== 1 ? '' : ''} (Old) in Jira
           </button>
@@ -3126,6 +3133,31 @@ function openDuplicatesForTester(idx) {
   if (!tickets.length) { showToast('No tickets found for this tester.', 'warn'); return; }
   window.open(_jiraSearchUrl(tickets), '_blank', 'noopener');
   showToast(`Opened ${tickets.length} ticket${tickets.length !== 1 ? 's' : ''} for ${name}.`, 'success');
+}
+
+async function downloadDuplicatesExcel() {
+  if (!_currentDuplicatesData) return;
+  showToast('Generating Excel file...', 'info');
+  try {
+    const res = await fetch('/api/duplicates/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_currentDuplicatesData)
+    });
+    if (!res.ok) throw new Error('Failed to generate Excel file');
+    
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `duplicates_${_currentDuplicatesData.client}.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    a.remove();
+  } catch (e) {
+    showToast(e.message, 'error');
+  }
 }
 
 // ── Batch Scan ────────────────────────────────────────────────────────────

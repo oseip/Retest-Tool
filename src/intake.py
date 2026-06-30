@@ -133,9 +133,13 @@ def _col(row: dict, *names: str) -> str:
             return (v or "").strip()
     return ""
 
+_PLUGIN_CACHE = {}
 
-def _parse_nessus_csv(csv_text: str) -> List[dict]:
+
+def _parse_nessus_csv(csv_text: str, vector: str = "", actor: str = "", conn=None, ak=None, sk=None) -> List[dict]:
     """Parse one Nessus CSV export into normalised finding dicts."""
+    from . import nessus_client as nc
+    from concurrent.futures import ThreadPoolExecutor
     rows = list(csv.DictReader(io.StringIO(csv_text)))
     
     # --- Pass 1: Extract OS Mapping ---
@@ -161,31 +165,91 @@ def _parse_nessus_csv(csv_text: str) -> List[dict]:
             elif p_out and host not in ip_to_os:
                 ip_to_os[host] = p_out.split("\n")[0].strip()[:50]
 
+    # --- Pass 1.5: Prefetch Plugins ---
+    if conn and ak and sk:
+        needed_plugins = set()
+        for row in rows:
+            if _col(row, "Risk").lower() in _SKIP_RISKS: continue
+            pid = _col(row, "Plugin ID")
+            if pid:
+                try:
+                    p = int(pid)
+                    if p not in _PLUGIN_CACHE:
+                        needed_plugins.add(p)
+                except ValueError: pass
+                
+        if needed_plugins:
+            def _fetch_plug(p):
+                try:
+                    _PLUGIN_CACHE[p] = nc.get_plugin_details(conn, ak, sk, p)
+                except Exception:
+                    _PLUGIN_CACHE[p] = {"attributes": []}
+            
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                list(executor.map(_fetch_plug, needed_plugins))
+
     # --- Helpers for CIA & Risk ---
+    def get_plugin_attributes(plugin_id: str):
+        if not plugin_id: return []
+        try:
+            return _PLUGIN_CACHE.get(int(plugin_id), {}).get("attributes", [])
+        except ValueError:
+            return []
+
     def parse_cia(cvss_vector: str) -> str:
         if not cvss_vector:
             return ""
-        c_map = {"N": "None", "L": "Low", "M": "Medium", "H": "High", "C": "Complete", "P": "Partial"}
         c = re.search(r"/C:([NLMHCP])", cvss_vector)
         i = re.search(r"/I:([NLMHCP])", cvss_vector)
         a = re.search(r"/A:([NLMHCP])", cvss_vector)
-        if not c and not i and not a:
-            return ""
-        c_val = c_map.get(c.group(1), "None") if c else "None"
-        i_val = c_map.get(i.group(1), "None") if i else "None"
-        a_val = c_map.get(a.group(1), "None") if a else "None"
-        return f"Confidentiality: {c_val}, Integrity: {i_val}, Availability: {a_val}"
+        
+        parts = []
+        if c and c.group(1) != "N":
+            parts.append("Confidentiality")
+        if i and i.group(1) != "N":
+            parts.append("Integrity")
+        if a and a.group(1) != "N":
+            parts.append("Availability")
+            
+        return ",".join(parts)
 
-    def calc_risk(score: str) -> str:
-        try:
-            s = float(score)
-        except ValueError:
+    def calc_risk(cvss_vector: str, cvss_score: str, exploitable: float) -> str:
+        if not cvss_vector:
             return ""
-        if s >= 9.0: return "5 - Critical"
-        if s >= 7.0: return "4 - High"
-        if s >= 4.0: return "3 - Medium"
-        if s > 0.0:  return "2 - Low"
-        return "1 - Info"
+        try:
+            cvss_val = float(cvss_score)
+        except (ValueError, TypeError):
+            return ""
+            
+        c_match = re.search(r"/C:([NLMHCP])", cvss_vector)
+        i_match = re.search(r"/I:([NLMHCP])", cvss_vector)
+        a_match = re.search(r"/A:([NLMHCP])", cvss_vector)
+        
+        c = 0.0
+        if c_match:
+            v = c_match.group(1)
+            if v in ("P", "L"): c = 0.22
+            elif v in ("H", "C"): c = 0.56
+            
+        i = 0.0
+        if i_match:
+            v = i_match.group(1)
+            if v in ("P", "L"): i = 0.22
+            elif v in ("H", "C"): i = 0.56
+            
+        a = 0.0
+        if a_match:
+            v = a_match.group(1)
+            if v in ("P", "L"): a = 0.22
+            elif v in ("H", "C"): a = 0.56
+            
+        ciaValue = 1 - ((1 - c) * (1 - i) * (1 - a))
+        
+        ac = 0.62 if vector == "Internal network" else 0.85
+        av = 0.85 if actor == "Unauthenticated user" else 0.27
+        
+        riskValue = 1 * exploitable * ciaValue * 6.97 * cvss_val * ac * av
+        return f"{riskValue:g}"
 
     # --- Pass 2: Generate Findings ---
     findings: List[dict] = []
@@ -201,7 +265,19 @@ def _parse_nessus_csv(csv_text: str) -> List[dict]:
         cve   = _col(row, "CVE")
         desc  = _col(row, "Description")
         soln  = _col(row, "Solution")
-        cvss_vector = _col(row, "CVSS v3.0 Vector", "CVSS Vector")
+        cvss_vector = _col(row, "CVSS v3.0 Vector", "CVSS v2.0 Vector", "CVSS Vector")
+        plugin_id   = _col(row, "Plugin ID")
+        
+        exploitable = 0.7
+        if plugin_id:
+            attrs = get_plugin_attributes(plugin_id)
+            for attr in attrs:
+                aname = attr.get("attribute_name", "").lower()
+                if aname in ("exploitability_ease", "exploit_framework_canvas", "exploit_framework_metasploit", "exploit_framework_core"):
+                    exploitable = 1.0
+                
+                if not cvss_vector and aname in ("cvss3_vector", "cvss_vector"):
+                    cvss_vector = attr.get("attribute_value", "")
 
         # Prefer CVSS v3, fall back to v2
         cvss = (_col(row, "CVSS v3.0 Base Score")
@@ -229,7 +305,7 @@ def _parse_nessus_csv(csv_text: str) -> List[dict]:
             "Vector":                    "",   # filled per engagement
             "Actor":                     "",   # filled per engagement
             "CIA_Damage":                parse_cia(cvss_vector),
-            "Risk_Value":                calc_risk(cvss),
+            "Risk_Value":                calc_risk(cvss_vector, cvss, exploitable),
             # Internal helpers (stripped before export)
             "_port": port,
             "_ip":   host,
@@ -465,7 +541,7 @@ def intake_pull(label: str, req: PullRequest):
     def _pull_one(sid: int) -> Tuple[List[dict], Optional[str]]:
         try:
             csv_text, sname = nc.export_scan_csv(conn, ak, sk, sid)
-            rows = _parse_nessus_csv(csv_text)
+            rows = _parse_nessus_csv(csv_text, vector=req.vector, actor=req.actor, conn=conn, ak=ak, sk=sk)
             log.info("Intake pull: scan %d ('%s') → %d vuln rows", sid, sname, len(rows))
             return rows, None
         except Exception as exc:

@@ -57,6 +57,11 @@ def get_folders(conn, access_key: str, secret_key: str) -> List[Dict]:
     return data.get("folders", [])
 
 
+def get_plugin_details(conn, access_key: str, secret_key: str, plugin_id: int) -> Dict:
+    """Fetch plugin details from Nessus to extract exploitability flags."""
+    return _req(conn, "GET", f"/plugins/plugin/{plugin_id}", access_key, secret_key)
+
+
 def get_scans(conn, access_key: str, secret_key: str, folder_id: Optional[int] = None) -> List[Dict]:
     path = f"/scans?folder_id={folder_id}" if folder_id is not None else "/scans"
     data = _req(conn, "GET", path, access_key, secret_key)

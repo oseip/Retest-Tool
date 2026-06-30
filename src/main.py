@@ -1421,6 +1421,75 @@ def find_duplicates(client: str):
     }
 
 
+class ExportDuplicatesRequest(BaseModel):
+    client: str
+    total_groups: int
+    total_duplicates: int
+    groups: List[dict]
+
+@app.post("/api/duplicates/export")
+def export_duplicates_excel(req: ExportDuplicatesRequest):
+    import openpyxl
+    import io
+    from fastapi import Response
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Duplicates"
+
+    headers = [
+        "Summary", "IP Address", 
+        "Issue Key (New)", "Issue Key (old)", 
+        "Status (New)", "Status (Old)", 
+        "Technology (New)", "Technology (Old)", 
+        "Port(New)", "Port (Old)"
+    ]
+    ws.append(headers)
+
+    for g in req.groups:
+        summary = g.get("vuln_name", "")
+        ip = g.get("ip", "")
+        keep_key = g.get("keep")
+        
+        old_t = next((t for t in g["tickets"] if t["key"] == keep_key), {})
+        
+        for t in g["tickets"]:
+            if t["key"] == keep_key:
+                continue 
+            
+            def _get(ticket_obj, field):
+                val = ticket_obj.get(field, "")
+                if isinstance(val, list):
+                    return ", ".join(str(v) for v in val)
+                return str(val) if val is not None else ""
+                
+            row = [
+                summary,
+                ip,
+                t["key"],
+                old_t.get("key", ""),
+                _get(t, "status"),
+                _get(old_t, "status"),
+                _get(t, "technology"),
+                _get(old_t, "technology"),
+                _get(t, "ports"),
+                _get(old_t, "ports")
+            ]
+            ws.append(row)
+            
+    buf = io.BytesIO()
+    wb.save(buf)
+    
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename=duplicates_{req.client}.xlsx"
+        }
+    )
+
+
+
 # ── Batch Scan ────────────────────────────────────────────────────────────
 
 def _parse_assets(data: bytes, filename: str = "") -> list:
