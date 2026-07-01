@@ -268,25 +268,33 @@ def _parse_nessus_csv(csv_text: str, vector: str = "", actor: str = "", conn=Non
         cvss_vector = _col(row, "CVSS v3.0 Vector", "CVSS v2.0 Vector", "CVSS Vector")
         plugin_id   = _col(row, "Plugin ID")
         
-        exploitable = 0.7
-        if plugin_id:
-            attrs = get_plugin_attributes(plugin_id)
-            for attr in attrs:
-                aname = attr.get("attribute_name", "").lower()
-                if aname in ("exploitability_ease", "exploit_framework_canvas", "exploit_framework_metasploit", "exploit_framework_core"):
-                    exploitable = 1.0
-                
-                if not cvss_vector and aname in ("cvss3_vector", "cvss_vector"):
-                    cvss_vector = attr.get("attribute_value", "")
-
-        # Prefer CVSS v3, fall back to v2
         cvss = (_col(row, "CVSS v3.0 Base Score")
                 or _col(row, "CVSS v3.0 Temporal Score")
                 or _col(row, "CVSS v2.0 Base Score")
                 or _col(row, "CVSS"))
 
+        exploitable = 0.7
+        if plugin_id:
+            attrs = get_plugin_attributes(plugin_id)
+            for attr in attrs:
+                aname = attr.get("attribute_name", "").lower()
+                avalue = attr.get("attribute_value", "")
+                if aname in ("exploitability_ease", "exploit_framework_canvas", "exploit_framework_metasploit", "exploit_framework_core"):
+                    exploitable = 1.0
+                
+                if not cvss_vector and aname in ("cvss3_vector", "cvss_vector"):
+                    cvss_vector = avalue
+                    
+                if not cvss and aname in ("cvss3_base_score", "cvss_base_score"):
+                    cvss = avalue
+
         if not name or not host:
             continue
+
+        if desc:
+            desc = re.sub(r"(?i)nessus", "mUnit", desc)
+        if soln:
+            soln = re.sub(r"(?i)nessus", "mUnit", soln)
 
         findings.append({
             "Vulnerability_Title":       name,
@@ -323,6 +331,8 @@ _NORMALIZATION_PATTERNS = [
     (re.compile(r"(?i)^MySQL\s+\d+(?:\.\d+)+.*"), "MySQL Multiple Vulnerabilities"),
     (re.compile(r"(?i)^PostgreSQL\s+\d+(?:\.\d+)+.*"), "PostgreSQL Multiple Vulnerabilities"),
     (re.compile(r"(?i)^Oracle\s+Java\s+SE\s+\d+.*"), "Oracle Java SE Multiple Vulnerabilities"),
+    (re.compile(r"(?i)^VMware\s+ESXi.*"), "VMware ESXi Multiple Vulnerabilities"),
+    (re.compile(r"(?i)^VMware\s+vCenter\s+Server.*"), "VMware vCenter Server Multiple Vulnerabilities"),
 ]
 
 

@@ -99,7 +99,12 @@ class JiraClient:
     @property
     def severity_jql_field(self) -> str:
         """JQL field reference for severity/vulnerability rating filtering."""
-        return '"vulnerability_Rating[Short text]"'
+        fid = self._fid("vulnerability_rating") or self._fid("severity")
+        if fid:
+            if fid.startswith("customfield_"):
+                return f'cf[{fid.split("_", 1)[1]}]'
+            return f'"{fid}"'
+        return '"Severity"'
 
     # TestTypes that support automated scanning (nmap / curl)
     SCANNABLE_TYPES = {"SCN", "IPT"}
@@ -134,21 +139,33 @@ class JiraClient:
         Pass max_results to stop after N issues instead of fetching all pages."""
         url = f"{self.cfg.url}/rest/api/3/search/jql"
         log.info("JQL → %s", jql)
-        fields = getattr(self, "_fetch_fields", "*all")
-        params: dict = {"jql": jql, "maxResults": 100, "fields": fields}
+        fields_str = getattr(self, "_fetch_fields", "*all")
+        fields_list = fields_str.split(",") if fields_str else []
         all_issues: List[Dict] = []
+        next_page_token = None
+        
         while True:
-            resp = self._session.get(url, params=params, timeout=30)
+            payload = {
+                "jql": jql,
+                "maxResults": 100,
+                "fields": fields_list
+            }
+            if next_page_token:
+                payload["nextPageToken"] = next_page_token
+                
+            resp = self._session.post(url, json=payload, timeout=30)
             resp.raise_for_status()
             data = resp.json()
+            
             batch = data.get("issues", [])
             all_issues.extend(batch)
+            
             if max_results and len(all_issues) >= max_results:
                 return all_issues[:max_results]
-            if data.get("isLast", True) or not batch:
+                
+            next_page_token = data.get("nextPageToken")
+            if data.get("isLast", True) or not batch or not next_page_token:
                 break
-            params = {"jql": jql, "maxResults": 100, "fields": fields,
-                      "nextPageToken": data["nextPageToken"]}
         return all_issues
 
     def search_jql(self, jql: str, max_results: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -157,14 +174,20 @@ class JiraClient:
         return [self._serialize(issue) for issue in issues]
 
     def count_jql(self, jql: str) -> int:
-        """Count issues matching a JQL query."""
-        resp = self._session.get(
-            f"{self.cfg.url}/rest/api/2/search",
-            params={"jql": jql, "maxResults": 0, "fields": ""},
+        """Count issues matching a JQL query using API v3 approximate-count."""
+        resp = self._session.post(
+            f"{self.cfg.url}/rest/api/3/search/approximate-count",
+            json={"jql": jql},
             timeout=30,
         )
+        if not resp.ok:
+            log.error("JQL failed: %s | Resp: %s", jql, resp.text)
         resp.raise_for_status()
-        return resp.json()["total"]
+        try:
+            return resp.json().get("count", 0)
+        except Exception as e:
+            log.error("JiraClient JSONDecodeError! Status: %s, Body: %s", resp.status_code, resp.text)
+            raise
 
     def get_remediated_tickets(self, client_label: str) -> List[Dict[str, Any]]:
         jql = self._jql(client_label)
@@ -361,7 +384,7 @@ class JiraClient:
             "cves": cves,
             "cvss": get_custom("cvss"),
             "severity": get_custom("severity"),
-            "rating": get_custom("vulnerability_rating"),
+            "rating": get_custom("vulnerability_rating") or get_custom("severity"),
             "technology": get_custom("technology"),
             "testtype": get_custom("testtype[short text]") or get_custom("testtype"),
             "tester": _extract_tester(f, self._fid("tester")),

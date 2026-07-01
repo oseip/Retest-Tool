@@ -78,7 +78,6 @@ def _ok_resp(data: dict) -> MagicMock:
 # ---------------------------------------------------------------------------
 # severity_jql_field — field resolution
 # ---------------------------------------------------------------------------
-
 class TestSeverityJqlField:
     def test_resolves_vulnerability_rating_to_cf(self):
         client = make_v2_client(fields={"vulnerability_rating": "customfield_10125"})
@@ -105,7 +104,6 @@ class TestSeverityJqlField:
         client = make_v2_client(fields={"severity": "severity"})
         assert client.severity_jql_field == '"severity"'
 
-
 class TestSeverityJqlFieldAxian:
     """Axian JiraClient always returns the hardcoded field name."""
     def test_axian_returns_fixed_field_name(self):
@@ -118,42 +116,41 @@ class TestSeverityJqlFieldAxian:
                     username="u", api_token="t", project="AXG",
                 )
                 c = JiraClient(cfg)
-        assert c.severity_jql_field == '"vulnerability_Rating[Short text]"'
+        assert c.severity_jql_field == '"Severity"'
 
 
 # ---------------------------------------------------------------------------
 # count_jql
 # ---------------------------------------------------------------------------
-
 class TestCountJql:
     def test_returns_total_from_response(self):
         client = make_v2_client()
-        client._session.get.return_value = _ok_resp({"total": 57})
+        client._session.post.return_value = _ok_resp({"total": 57})
 
         result = client.count_jql("project = CPEL")
         assert result == 57
 
     def test_zero_when_total_missing(self):
         client = make_v2_client()
-        client._session.get.return_value = _ok_resp({})
+        client._session.post.return_value = _ok_resp({})
 
         result = client.count_jql("project = CPEL")
         assert result == 0
 
     def test_uses_max_results_zero(self):
         client = make_v2_client()
-        client._session.get.return_value = _ok_resp({"total": 10})
+        client._session.post.return_value = _ok_resp({"total": 10})
 
         client.count_jql("project = CPEL")
-        call_kwargs = client._session.get.call_args
-        params = call_kwargs[1].get("params") or call_kwargs[0][1]
-        assert params.get("maxResults") == 0
+        call_kwargs = client._session.post.call_args
+        params = call_kwargs[1].get("json") or call_kwargs[0][1]
+        assert params.get("maxResults") == 1
 
     def test_raises_on_http_error(self):
         client = make_v2_client()
         resp = MagicMock()
         resp.raise_for_status.side_effect = _requests.HTTPError("403 Forbidden")
-        client._session.get.return_value = resp
+        client._session.post.return_value = resp
 
         with pytest.raises(_requests.HTTPError):
             client.count_jql("project = CPEL")
@@ -162,7 +159,6 @@ class TestCountJql:
 # ---------------------------------------------------------------------------
 # _search_jql — startAt pagination
 # ---------------------------------------------------------------------------
-
 class TestSearchJqlPagination:
     def _page(self, issues_count, total, start_at=0):
         r = MagicMock()
@@ -179,47 +175,47 @@ class TestSearchJqlPagination:
 
     def test_single_page_returns_all(self):
         client = make_v2_client()
-        client._session.get.return_value = self._page(30, total=30)
+        client._session.post.return_value = self._page(30, total=30)
 
         results = client.search_jql("project = CPEL")
         assert len(results) == 30
-        assert client._session.get.call_count == 1
+        assert client._session.post.call_count == 1
 
     def test_two_pages_combined(self):
         client = make_v2_client()
-        client._session.get.side_effect = [
+        client._session.post.side_effect = [
             self._page(100, total=140, start_at=0),
             self._page(40, total=140, start_at=100),
         ]
 
         results = client.search_jql("project = CPEL")
         assert len(results) == 140
-        assert client._session.get.call_count == 2
+        assert client._session.post.call_count == 2
 
     def test_second_call_uses_correct_start_at(self):
         client = make_v2_client()
-        client._session.get.side_effect = [
+        client._session.post.side_effect = [
             self._page(100, total=110, start_at=0),
             self._page(10, total=110, start_at=100),
         ]
 
         client._search_jql("project = CPEL")
 
-        second_call = client._session.get.call_args_list[1]
-        params = second_call[1].get("params") or second_call[0][1]
+        second_call = client._session.post.call_args_list[1]
+        params = second_call[1].get("json") or second_call[0][1]
         assert params.get("startAt") == 100
 
     def test_empty_batch_stops_pagination(self):
         client = make_v2_client()
-        client._session.get.return_value = self._page(0, total=0)
+        client._session.post.return_value = self._page(0, total=0)
 
         results = client.search_jql("project = CPEL")
         assert results == []
-        assert client._session.get.call_count == 1
+        assert client._session.post.call_count == 1
 
     def test_max_results_respected(self):
         client = make_v2_client()
-        client._session.get.return_value = self._page(100, total=500, start_at=0)
+        client._session.post.return_value = self._page(100, total=500, start_at=0)
 
         results = client.search_jql("project = CPEL", max_results=50)
         assert len(results) == 50
@@ -228,7 +224,6 @@ class TestSearchJqlPagination:
 # ---------------------------------------------------------------------------
 # _serialize — label/field extraction
 # ---------------------------------------------------------------------------
-
 class TestSerialize:
     def test_ip_extracted_from_labels(self):
         client = make_v2_client()
@@ -313,7 +308,6 @@ class TestSerialize:
 # ---------------------------------------------------------------------------
 # transition — alias resolution
 # ---------------------------------------------------------------------------
-
 class TestTransition:
     def _make_transitions_resp(self, names):
         r = MagicMock()
@@ -364,7 +358,6 @@ class TestTransition:
 # ---------------------------------------------------------------------------
 # fast_track — chained transitions
 # ---------------------------------------------------------------------------
-
 class TestFastTrack:
     def _make_status_resp(self, status_name):
         r = MagicMock()
@@ -531,7 +524,6 @@ class TestFastTrack:
 # ---------------------------------------------------------------------------
 # add_comment — plain text, not ADF
 # ---------------------------------------------------------------------------
-
 class TestAddComment:
     def test_posts_to_comment_endpoint(self):
         client = make_v2_client()

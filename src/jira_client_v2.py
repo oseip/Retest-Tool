@@ -92,18 +92,10 @@ class JiraClientV2:
 
     @property
     def severity_jql_field(self) -> str:
-        """JQL field reference for severity filtering on this Jira instance.
-
-        Tries (in order):
-          1. "vulnerability_rating" custom field  → cf[id]
-          2. "severity" custom/standard field     → cf[id]
-          3. falls back to standard "priority"
-        """
-        for candidate in ("vulnerability_rating", "vulnerability_Rating[Short text]",
-                          "severity"):
+        """JQL field reference for severity filtering on this Jira instance."""
+        for candidate in ("vulnerability_rating", "severity"):
             fid = self._fid(candidate)
             if fid:
-                # Extract numeric id from e.g. "customfield_10024" → cf[10024]
                 if fid.startswith("customfield_"):
                     return f'cf[{fid.split("_", 1)[1]}]'
                 return f'"{fid}"'
@@ -128,25 +120,37 @@ class JiraClientV2:
     # ── Search (v2 uses startAt pagination, not cursor) ───────────────────
 
     def _search_jql(self, jql: str, max_results: Optional[int] = None) -> List[Dict]:
+        """Fetch issues matching JQL, paging with maxResults/startAt for API v2."""
         url = f"{self.cfg.url}/rest/api/2/search"
-        log.info("Secondary JQL → %s", jql)
-        fields = self._fetch_fields
+        log.info("JQL → %s", jql)
+        fields_str = getattr(self, "_fetch_fields", "*all")
+        fields_list = fields_str.split(",") if fields_str else []
         all_issues: List[Dict] = []
         start_at = 0
+        
         while True:
-            resp = self._session.get(url, params={
-                "jql": jql, "maxResults": 100, "startAt": start_at, "fields": fields,
-            }, timeout=30)
+            payload = {
+                "jql": jql,
+                "maxResults": 100,
+                "startAt": start_at,
+                "fields": fields_list
+            }
+            resp = self._session.post(url, json=payload, timeout=30)
+            if not resp.ok:
+                log.error("JQL failed: %s | Resp: %s", jql, resp.text)
             resp.raise_for_status()
             data = resp.json()
+            
             batch = data.get("issues", [])
             all_issues.extend(batch)
+            
             if max_results and len(all_issues) >= max_results:
                 return all_issues[:max_results]
+                
             total = data.get("total", 0)
-            start_at += len(batch)
-            if not batch or start_at >= total:
+            if len(all_issues) >= total or not batch:
                 break
+            start_at += len(batch)
         return all_issues
 
     def search_jql(self, jql: str, max_results: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -154,13 +158,19 @@ class JiraClientV2:
         return [self._serialize(i) for i in issues]
 
     def count_jql(self, jql: str) -> int:
-        resp = self._session.get(
+        resp = self._session.post(
             f"{self.cfg.url}/rest/api/2/search",
-            params={"jql": jql, "maxResults": 0, "fields": ""},
+            json={"jql": jql, "maxResults": 1, "fields": []},
             timeout=30,
         )
+        if not resp.ok:
+            log.error("JQL failed: %s | Resp: %s", jql, resp.text)
         resp.raise_for_status()
-        return resp.json().get("total", 0)
+        try:
+            return resp.json().get("total", 0)
+        except Exception as e:
+            log.error("JiraClientV2 JSONDecodeError! Status: %s, Body: %s", resp.status_code, resp.text)
+            raise
 
     # ── Public ticket methods ─────────────────────────────────────────────
 
@@ -342,7 +352,7 @@ class JiraClientV2:
             "cves":        cves,
             "cvss":        get_custom("cvss"),
             "severity":    get_custom("severity"),
-            "rating":      get_custom("vulnerability_rating"),
+            "rating":      get_custom("vulnerability_rating") or get_custom("severity"),
             "technology":  get_custom("technology"),
             "testtype":    get_custom("testtype[short text]") or get_custom("testtype"),
             "tester":      _extract_tester(f, self._fid("tester")),

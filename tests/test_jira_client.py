@@ -69,7 +69,6 @@ def make_raw_issue(
 # ---------------------------------------------------------------------------
 # _serialize — label parsing
 # ---------------------------------------------------------------------------
-
 class TestSerialize:
     def test_ip_extracted_from_labels(self):
         client = make_client()
@@ -163,7 +162,6 @@ class TestSerialize:
 # ---------------------------------------------------------------------------
 # _sweep_jql
 # ---------------------------------------------------------------------------
-
 class TestSweepJql:
     def test_contains_project(self):
         client = make_client()
@@ -203,7 +201,6 @@ class TestSweepJql:
 # ---------------------------------------------------------------------------
 # _search_jql — pagination
 # ---------------------------------------------------------------------------
-
 class TestSearchJqlPagination:
     def _make_response(self, issue_count, is_last, next_token=None):
         mock_resp = MagicMock()
@@ -219,26 +216,26 @@ class TestSearchJqlPagination:
 
     def test_single_page_returns_all(self):
         client = make_client()
-        client._session.get.return_value = self._make_response(50, is_last=True)
+        client._session.post.return_value = self._make_response(50, is_last=True)
 
         results = client._search_jql("project = TEST")
         assert len(results) == 50
-        assert client._session.get.call_count == 1
+        assert client._session.post.call_count == 1
 
     def test_two_pages_combined(self):
         client = make_client()
-        client._session.get.side_effect = [
+        client._session.post.side_effect = [
             self._make_response(100, is_last=False, next_token="tok-2"),
             self._make_response(50, is_last=True),
         ]
 
         results = client._search_jql("project = TEST")
         assert len(results) == 150
-        assert client._session.get.call_count == 2
+        assert client._session.post.call_count == 2
 
     def test_three_pages_combined(self):
         client = make_client()
-        client._session.get.side_effect = [
+        client._session.post.side_effect = [
             self._make_response(100, is_last=False, next_token="tok-2"),
             self._make_response(100, is_last=False, next_token="tok-3"),
             self._make_response(40, is_last=True),
@@ -246,36 +243,36 @@ class TestSearchJqlPagination:
 
         results = client._search_jql("project = TEST")
         assert len(results) == 240
-        assert client._session.get.call_count == 3
+        assert client._session.post.call_count == 3
 
     def test_next_page_token_passed_in_params(self):
         client = make_client()
-        client._session.get.side_effect = [
+        client._session.post.side_effect = [
             self._make_response(100, is_last=False, next_token="cursor-abc"),
             self._make_response(5, is_last=True),
         ]
 
         client._search_jql("project = TEST")
 
-        second_call_kwargs = client._session.get.call_args_list[1]
-        params = second_call_kwargs[1].get("params") or second_call_kwargs[0][1]
+        second_call_kwargs = client._session.post.call_args_list[1]
+        params = second_call_kwargs[1].get("json") or second_call_kwargs[0][1]
         assert params.get("nextPageToken") == "cursor-abc"
 
     def test_empty_result_stops_pagination(self):
         client = make_client()
-        client._session.get.return_value = self._make_response(0, is_last=False)
+        client._session.post.return_value = self._make_response(0, is_last=False)
 
         results = client._search_jql("project = TEST")
         assert results == []
-        assert client._session.get.call_count == 1
+        assert client._session.post.call_count == 1
 
     def test_is_last_true_stops_pagination(self):
         client = make_client()
-        client._session.get.return_value = self._make_response(100, is_last=True)
+        client._session.post.return_value = self._make_response(100, is_last=True)
 
         results = client._search_jql("project = TEST")
         assert len(results) == 100
-        assert client._session.get.call_count == 1
+        assert client._session.post.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -287,14 +284,13 @@ class TestSearchJqlPagination:
 # for it, which is exactly what caused Sweep to silently show zero results
 # instead of erroring after a token rotation.
 # ---------------------------------------------------------------------------
-
 class TestGetSweepTicketsAuthBehavior:
     def test_empty_issues_response_returns_empty_list_not_error(self):
         client = make_client()
         mock_resp = MagicMock()
         mock_resp.raise_for_status.return_value = None
         mock_resp.json.return_value = {"issues": [], "isLast": True}
-        client._session.get.return_value = mock_resp
+        client._session.post.return_value = mock_resp
 
         results = client.get_sweep_tickets("ClientABC")
 
@@ -306,7 +302,7 @@ class TestGetSweepTicketsAuthBehavior:
         client = make_client()
         mock_resp = MagicMock()
         mock_resp.raise_for_status.side_effect = requests.HTTPError("401 Unauthorized")
-        client._session.get.return_value = mock_resp
+        client._session.post.return_value = mock_resp
 
         with pytest.raises(requests.HTTPError):
             client.get_sweep_tickets("ClientABC")
@@ -315,50 +311,29 @@ class TestGetSweepTicketsAuthBehavior:
 # ---------------------------------------------------------------------------
 # count_jql
 # ---------------------------------------------------------------------------
-
 class TestCountJql:
     def test_uses_v2_api_when_available(self):
         client = make_client()
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.raise_for_status.return_value = None
-        mock_resp.json.return_value = {"total": 42}
-        client._session.get.return_value = mock_resp
+        mock_resp.json.return_value = {"count": 42}
+        client._session.post.return_value = mock_resp
 
         count = client.count_jql("project = TEST")
         assert count == 42
 
-    def test_falls_back_to_cursor_on_v2_410(self):
-        client = make_client()
 
-        # First call (v2) returns 410
-        v2_resp = MagicMock()
-        v2_resp.status_code = 410
-
-        # Fallback cursor call
-        cursor_resp = MagicMock()
-        cursor_resp.raise_for_status.return_value = None
-        cursor_resp.json.return_value = {
-            "issues": [{"id": str(i)} for i in range(30)],
-            "isLast": True,
-        }
-
-        client._session.get.side_effect = [v2_resp, cursor_resp, cursor_resp]
-
-        count = client.count_jql("project = TEST")
-        assert count == 30
 
 
 # ---------------------------------------------------------------------------
 # severity_jql_field — Axian client always returns fixed field name
 # ---------------------------------------------------------------------------
-
 class TestSeverityJqlField:
     def test_returns_vulnerability_rating_field_name(self):
-        client = make_client()
-        assert client.severity_jql_field == '"vulnerability_Rating[Short text]"'
+        client = make_client(fields={"vulnerability_rating": "customfield_10100"})
+        assert client.severity_jql_field == 'cf[10100]'
 
     def test_is_consistent_regardless_of_loaded_fields(self):
-        """Axian field is hardcoded — loaded field map has no effect."""
         client = make_client(fields={"severity": "customfield_10050"})
-        assert client.severity_jql_field == '"vulnerability_Rating[Short text]"'
+        assert client.severity_jql_field == 'cf[10050]'

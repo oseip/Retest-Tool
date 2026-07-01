@@ -993,7 +993,7 @@ def _to_report_item(issue: dict) -> dict:
         "key": issue["key"],
         "vuln_name": issue.get("summary", ""),
         "ip": (issue.get("ips") or [""])[0],
-        "rating": issue.get("rating") or "",
+        "rating": issue.get("rating") or issue.get("severity") or "",
     }
 
 

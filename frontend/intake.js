@@ -231,7 +231,9 @@ async function _intakeFolderToggled(cb, folderId, folderName, label) {
       cb2.value = s.id;
       cb2.dataset.scanName = s.name;
       cb2.onchange = _intakeUpdatePullBtn;
-      if (s.status !== 'completed') cb2.disabled = true;
+      // We intentionally do NOT disable the checkbox for canceled/incomplete scans,
+      // as the backend automatically falls back to the previous completed run.
+      // if (s.status !== 'completed') cb2.disabled = true;
       row.appendChild(cb2);
       row.appendChild(document.createTextNode(`${s.name}${statusText}`));
       scanList.appendChild(row);
