@@ -325,6 +325,19 @@ def _parse_ms17010(text: str, xml: str, description: str = "") -> Tuple[Verdict,
     return "inconclusive", "Could not confirm MS17-010 status — check output"
 
 
+def _parse_ms09050(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if _port_closed(low, 445):
+        return "inconclusive", "SMB port closed or filtered"
+    if "vulnerable" in low and "ms09-050" in low:
+        return "not_fixed", "MS09-050 vulnerability still present"
+    if "not vulnerable" in low or "host does not appear vulnerable" in low:
+        return "fixed", "Host is not vulnerable to MS09-050"
+    return "inconclusive", "Could not confirm MS09-050 status — check output"
+
+
 def _parse_rdp(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
@@ -1929,7 +1942,7 @@ RULES: List[VulnRule] = [
     VulnRule(
         name="SMB Signing Not Required",
         patterns=[r"smb signing not required", r"smb.*signing.*disabled", r"smb.*signing.*not required"],
-        nmap_script="smb-security-mode",
+        nmap_script="smb2-security-mode",
         default_port=445,
         parse=_parse_smb_signing,
     ),
@@ -1946,9 +1959,9 @@ RULES: List[VulnRule] = [
     VulnRule(
         name="MS09-050 Microsoft Windows SMB2 Vulnerability",
         patterns=[r"ms09-050", r"educatedscholar", r"smb2.*validat"],
-        nmap_script="smb-vuln-ms17-010",
+        nmap_script="smb-vuln-ms09-050",
         default_port=445,
-        parse=_parse_ms17010,
+        parse=_parse_ms09050,
     ),
     VulnRule(
         name="SMB NULL Session / Shares Unprivileged Access",
@@ -1968,13 +1981,13 @@ RULES: List[VulnRule] = [
         default_port=445,
         parse=_parse_smb_v1,
     ),
-    VulnRule(
-        name="MS16-047 Badlock / Samba Badlock",
-        patterns=[r"ms16-047", r"badlock"],
-        nmap_script="smb-vuln-ms17-010",
-        default_port=445,
-        parse=_parse_ms17010,
-    ),
+    # VulnRule(
+    #     name="MS16-047 Badlock / Samba Badlock",
+    #     patterns=[r"ms16-047", r"badlock"],
+    #     nmap_script="smb-vuln-ms17-010",
+    #     default_port=445,
+    #     parse=_parse_ms17010,
+    # ),
     VulnRule(
         name="Microsoft MSMQ RCE QueueJumper (CVE-2023-21554)",
         patterns=[r"microsoft message queuing", r"queuejumper", r"cve-2023-21554", r"msmq"],
@@ -2000,7 +2013,7 @@ RULES: List[VulnRule] = [
     VulnRule(
         name="BlueKeep CVE-2019-0708",
         patterns=[r"bluekeep", r"cve-2019-0708"],
-        nmap_script="rdp-vuln-ms12-020",
+        nmap_script="rdp-vuln-ms19-0708",
         extra_args="--script-args=unsafe=1",
         default_port=3389,
         parse=_parse_bluekeep,
@@ -2169,7 +2182,7 @@ RULES: List[VulnRule] = [
             r"redis.*unprotected", r"redis.*without password",
             r"redis server unprotected", r"redis server unprotected by password",
         ],
-        nmap_script="redis-info",
+        tool="redis-cli",
         default_port=6379,
         parse=_parse_redis,
     ),
@@ -3006,6 +3019,13 @@ MANUAL_ONLY_RULES = [
     # 4. Flaky Web Configurations (False Positives)
     r"info\.php",
     r"phpinfo\.php",
+
+    # 5. Missing / Unreliable Nmap Scripts
+    r"ms14-066",
+    r"schannel.*rce",
+    r"winshock",
+    r"ms16-047",
+    r"badlock",
 ]
 
 def match_rule(summary: str) -> Optional[VulnRule]:

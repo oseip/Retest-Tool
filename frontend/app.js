@@ -9,6 +9,7 @@ const state = {
   triageFilter: '',
   remExpanded: true,      // collapsed/expanded state of the REMEDIATED pane
   remTypeFilter: 'all',   // 'all' | 'auto' | 'manual'  — remediated section
+  remSearch: '',          // search term for remediated section
   manualExpanded: true,
   manualTypeFilter: 'all',
   sweepSearch: '',
@@ -237,9 +238,18 @@ function renderJobList() {
     const manualRemCount = remJobs.filter(j => j.status === 'manual').length;
 
     const rtf = state.remTypeFilter;
-    const filteredRem = rtf === 'auto'   ? remJobs.filter(j => j.status !== 'manual')
+    let filteredRem = rtf === 'auto'   ? remJobs.filter(j => j.status !== 'manual')
                       : rtf === 'manual' ? remJobs.filter(j => j.status === 'manual')
                       : remJobs;
+
+    if (state.remSearch) {
+      const q = state.remSearch.toLowerCase();
+      filteredRem = filteredRem.filter(j => 
+        (j.ip || '').toLowerCase().includes(q) ||
+        (j.ticket_key || '').toLowerCase().includes(q) ||
+        (j.ticket_summary || '').toLowerCase().includes(q)
+      );
+    }
 
     const remCountLabel = rtf !== 'all'
       ? `${filteredRem.length} of ${remJobs.length}`
@@ -264,10 +274,14 @@ function renderJobList() {
     </div>`;
 
     if (state.remExpanded) {
-      html += `<div style="padding:5px 8px;border-bottom:1px solid var(--border);background:var(--bg2);display:flex;gap:5px">
+      html += `<div style="padding:5px 8px;border-bottom:1px solid var(--border);background:var(--bg2);display:flex;gap:5px;align-items:center;">
         <button ${remPill(rtf === 'all')}    onclick="setRemTypeFilter('all')">All (${remJobs.length})</button>
         <button ${remPill(rtf === 'auto')}   onclick="setRemTypeFilter('auto')">⚡ Auto-scan (${autoRemCount})</button>
         <button ${remPill(rtf === 'manual')} onclick="setRemTypeFilter('manual')">🖐 Manual (${manualRemCount})</button>
+        <input type="text" id="remSearchInput" placeholder="Search IP, Key, or Name..." 
+               value="${escHtml(state.remSearch || '')}"
+               oninput="setRemSearch(this.value)"
+               style="margin-left:auto; width: 180px; padding: 2px 6px; font-size: 11px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg1); color: var(--text);">
       </div>`;
       html += filteredRem.map(renderJobCard).join('');
     }
@@ -336,7 +350,7 @@ function renderJobList() {
     const q = state.sweepSearch.toLowerCase();
     const filteredSweep = q
       ? typeFiltered.filter(j =>
-          `${j.ticket_key} ${j.ticket_summary} ${j.rule_name || ''}`.toLowerCase().includes(q))
+          `${j.ip || ''} ${j.ticket_key} ${j.ticket_summary} ${j.rule_name || ''}`.toLowerCase().includes(q))
       : typeFiltered;
 
     const visibleSweep = filteredSweep.slice(0, state.sweepRenderLimit);
@@ -387,6 +401,7 @@ function renderJobList() {
 
   // Capture focus state before replacing DOM
   const wasSweepSearchFocused = document.activeElement?.id === 'sweepSearchInput';
+  const wasRemSearchFocused = document.activeElement?.id === 'remSearchInput';
 
   // Preserve scroll position
   const prevScroll = list.scrollTop;
@@ -409,6 +424,12 @@ function renderJobList() {
     }
   }
 
+  const rsi = document.getElementById('remSearchInput');
+  if (rsi && wasRemSearchFocused) {
+    rsi.focus();
+    rsi.setSelectionRange(rsi.value.length, rsi.value.length);
+  }
+
   // Infinite scroll: when the sentinel at the bottom of the rendered sweep
   // list scrolls into view, render the next batch instead of hard-capping
   // at SWEEP_RENDER_LIMIT (the old behavior just told you to filter further).
@@ -420,6 +441,11 @@ function renderJobList() {
 
 function setRemTypeFilter(type) {
   state.remTypeFilter = type;
+  renderJobList();
+}
+
+function setRemSearch(query) {
+  state.remSearch = query;
   renderJobList();
 }
 
