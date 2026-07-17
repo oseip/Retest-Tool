@@ -382,7 +382,10 @@ def run_scan(job_id: str, cfg: Config):
                 _collecting_xml[0] = False
                 _xml_chunks.clear()
 
-                exit_code = kali.exec_stream(_pn_cmd, emit, timeout=600, stop_event=stop_event)
+                if is_ept:
+                    exit_code = _local_exec_stream(_pn_cmd, emit, timeout=600, stop_event=stop_event)
+                else:
+                    exit_code = kali.exec_stream(_pn_cmd, emit, timeout=600, stop_event=stop_event)
                 emit("")
                 if stop_event.is_set():
                     emit("[CANCELLED] Scan stopped by user")
