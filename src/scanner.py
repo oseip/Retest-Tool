@@ -195,6 +195,61 @@ def _queue_ticket(ticket: Dict[str, Any], client_label: str,
     return job_id
 
 
+def _local_exec_stream(command: str, emit, timeout: int = 600, stop_event=None) -> int:
+    import subprocess
+    import select
+    import time
+
+    proc = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    
+    deadline = time.time() + timeout
+    exit_code = -1
+    cancelled = False
+    
+    try:
+        while True:
+            if stop_event and stop_event.is_set():
+                cancelled = True
+                proc.terminate()
+                break
+            if time.time() > deadline:
+                emit(f"[ERROR] Command timed out after {timeout}s")
+                proc.terminate()
+                break
+                
+            rlist, _, _ = select.select([proc.stdout], [], [], 0.1)
+            if proc.stdout in rlist:
+                line = proc.stdout.readline()
+                if not line:
+                    if proc.poll() is not None:
+                        exit_code = proc.returncode
+                        break
+                    continue
+                emit(line.rstrip('\r\n'))
+            elif proc.poll() is not None:
+                for line in proc.stdout:
+                    emit(line.rstrip('\r\n'))
+                exit_code = proc.returncode
+                break
+                
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+            
+    if exit_code == -1 and proc.returncode is not None:
+        exit_code = proc.returncode
+        
+    return -9 if cancelled else exit_code
+
+
 def run_scan(job_id: str, cfg: Config):
     """Run a single scan job. Called sequentially by the per-client worker."""
     job = JOBS[job_id]
@@ -248,21 +303,29 @@ def run_scan(job_id: str, cfg: Config):
                 "This may be a manual finding — mark Fixed/Not Fixed manually."
             )
 
-        kali = connections.get_connection(client_label)
-        if not kali:
-            raise ValueError(
-                f"SSH not connected for '{client_label}' — "
-                "click Connect in the SSH panel first."
-            )
+        is_ept = job.get("ticket_testtype", "") == "EPT"
 
-        emit("[SSH] Using existing connection ✓")
+        kali = None
+        if not is_ept:
+            kali = connections.get_connection(client_label)
+            if not kali:
+                raise ValueError(
+                    f"SSH not connected for '{client_label}' — "
+                    "click Connect in the SSH panel first."
+                )
+            emit("[SSH] Using existing connection ✓")
+        else:
+            emit("[LOCAL] EPT scan detected — running locally without SSH ✓")
 
         rule = match_rule(job["ticket_summary"])
 
         if tool == "curl":
             emit("[CURL] Starting request...")
             emit("")
-            exit_code = kali.exec_stream(job["nmap_command"], emit, timeout=120, stop_event=stop_event)
+            if is_ept:
+                exit_code = _local_exec_stream(job["nmap_command"], emit, timeout=120, stop_event=stop_event)
+            else:
+                exit_code = kali.exec_stream(job["nmap_command"], emit, timeout=120, stop_event=stop_event)
             emit("")
             if stop_event.is_set():
                 emit("[CANCELLED] Scan stopped by user")
@@ -280,7 +343,10 @@ def run_scan(job_id: str, cfg: Config):
         else:
             emit("[NMAP] Starting scan...")
             emit("")
-            exit_code = kali.exec_stream(job["nmap_command"], emit, timeout=600, stop_event=stop_event)
+            if is_ept:
+                exit_code = _local_exec_stream(job["nmap_command"], emit, timeout=600, stop_event=stop_event)
+            else:
+                exit_code = kali.exec_stream(job["nmap_command"], emit, timeout=600, stop_event=stop_event)
             emit("")
             if stop_event.is_set():
                 emit("[CANCELLED] Scan stopped by user")
@@ -402,16 +468,25 @@ def run_triage(job_id: str, cfg: Config):
     with _lock:
         JOBS[job_id]["triage"] = "running"
 
-    kali = connections.get_connection(client_label)
-    if not kali:
-        with _lock:
-            JOBS[job_id]["triage"] = "error"
-            JOBS[job_id]["triage_note"] = "SSH not connected"
-        return
+    is_ept = job.get("ticket_testtype", "") == "EPT"
+
+    kali = None
+    if not is_ept:
+        kali = connections.get_connection(client_label)
+        if not kali:
+            with _lock:
+                JOBS[job_id]["triage"] = "error"
+                JOBS[job_id]["triage_note"] = "SSH not connected"
+            return
 
     proto = "udp" if "-sU" in cmd else "tcp"
     try:
-        out, _err, _code = kali.exec(cmd, timeout=20)
+        if is_ept:
+            import subprocess
+            proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=20)
+            out = proc.stdout
+        else:
+            out, _err, _code = kali.exec(cmd, timeout=20)
         if "Host seems down" in out or "0 hosts up" in out:
             result, note = "host_down", "Host unreachable — review manually"
         elif f"/{proto} open" in out:
