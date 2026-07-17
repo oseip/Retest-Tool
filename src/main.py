@@ -56,6 +56,7 @@ _file_handler = RotatingFileHandler(
     os.path.join(LOG_DIR, "nemesis.log"),
     maxBytes=5_000_000,
     backupCount=5,
+    encoding="utf-8",
 )
 _file_handler.setLevel(logging.INFO)
 _file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
@@ -618,6 +619,9 @@ def transition_ticket(req: TransitionRequest):
         scanner._app_log(f"Jira updated: {ticket_key} → {req.to_status} (removed from queue)")
         return {"ok": True, "ticket": ticket_key, "status": req.to_status}
     except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        scanner._app_log(f"Transition error: {exc}")
         raise HTTPException(500, str(exc))
 
 

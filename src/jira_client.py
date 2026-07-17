@@ -68,9 +68,11 @@ class JiraClient:
         self._session.auth = self._auth
         self._session.headers.update({"Accept": "application/json"})
         self._fields: Dict[str, str] = {}
+        self._fields_loaded = False
         self._load_fields()
 
     def _load_fields(self):
+        self._fields_loaded = True
         try:
             for f in self._j.fields():
                 self._fields[f["name"].lower()] = f["id"]
@@ -94,6 +96,8 @@ class JiraClient:
         return ",".join(standard + custom_ids)
 
     def _fid(self, name: str) -> Optional[str]:
+        if not self._fields_loaded:
+            self._load_fields()
         return self._fields.get(name.lower())
 
     @property

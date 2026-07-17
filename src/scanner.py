@@ -18,7 +18,7 @@ from .vuln_rules import match_rule
 
 log = logging.getLogger(__name__)
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 # All scan jobs keyed by job_id
 JOBS: Dict[str, Dict[str, Any]] = {}
@@ -134,6 +134,8 @@ def _queue_ticket(ticket: Dict[str, Any], client_label: str,
                 f'-w "\\n[STATUS:%{{http_code}}][URL:%{{url_effective}}]\\n" '
                 f'-D -{curl_extra} {scheme}://{ip}:{port}{rule.curl_path}'
             )
+        elif rule.tool == "redis-cli":
+            nmap_cmd = f"timeout 15 redis-cli -h {ip} -p {port} INFO"
         else:
             parts = ["sudo nmap" if rule.requires_root else "nmap"]
             if rule.extra_args:
@@ -665,19 +667,15 @@ def run_poll_cycle(cfg: Config, jira_client, session: str = "axian") -> None:
                     if key in SEEN_KEYS:
                         continue
                     SEEN_KEYS.add(key)
-                # SCN and IPT test-types support automated scanning;
-                # everything else (APP, WEB, NET, OSINT, …) goes to manual review.
                 testtype = (ticket.get("testtype") or "").upper()
-                is_manual = testtype not in jira_client.SCANNABLE_TYPES
+                summary = ticket.get("summary") or ""
+                rule_obj = match_rule(summary)
+                
+                # If we have a scan rule, it's auto-scan. Otherwise, it's manual.
+                is_manual = rule_obj is None
                 job_id = _queue_ticket(ticket, client.label, manual=is_manual, session=session)
                 new_count += 1
                 rule = JOBS[job_id].get("rule_name")
-                # Also mark as manual if no scan rule was matched
-                # (e.g. vuln type disabled / not yet supported).
-                if not is_manual and rule is None:
-                    with _lock:
-                        JOBS[job_id]["status"] = "manual"
-                    is_manual = True
                 if is_manual:
                     _app_log(
                         f"{tag}Queued (manual): {key} ({client.label}) | "

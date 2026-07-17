@@ -435,8 +435,7 @@ def _build_index(label: str) -> None:
         else:
             jql = f'project = {m.cfg.jira.project} AND labels = "{label}" ORDER BY created ASC'
 
-        # Optimize: only fetch fields necessary for deduplication (massive speedup)
-        jc._fetch_fields = "summary,labels"
+        # Fetch all necessary fields for the index, avoiding global mutations
         tickets = jc.search_jql(jql)
 
         # Build index: (normalised_title, ip, port) → ticket key
