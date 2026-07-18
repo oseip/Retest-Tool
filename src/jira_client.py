@@ -69,13 +69,21 @@ class JiraClient:
         self._session.headers.update({"Accept": "application/json"})
         self._fields: Dict[str, str] = {}
         self._fields_loaded = False
-        self._load_fields()
+        # Safe default so the client is usable immediately. The real field map is
+        # loaded lazily on first use (see _fid) or proactively by the app in a
+        # background thread — constructing the client must never block on the
+        # network, otherwise app startup stalls until Jira answers.
+        self._fetch_fields = "*all"
 
     def _load_fields(self):
-        self._fields_loaded = True
         try:
             for f in self._j.fields():
                 self._fields[f["name"].lower()] = f["id"]
+            # Only mark as loaded after a *successful* fetch so that a transient
+            # startup failure (network blip, auth hiccup) can be retried on the
+            # next _fid() call instead of permanently degrading to "*all" fields
+            # and losing every custom field (cvss/severity/testtype/tester).
+            self._fields_loaded = True
             log.info("Loaded %d Jira fields", len(self._fields))
             self._fetch_fields = self._build_fetch_fields()
         except Exception as e:
@@ -168,7 +176,11 @@ class JiraClient:
                 return all_issues[:max_results]
                 
             next_page_token = data.get("nextPageToken")
-            if data.get("isLast", True) or not batch or not next_page_token:
+            if not batch:
+                break
+            # Default isLast from nextPageToken — missing isLast must not stop early
+            # when Jira still returns a continuation token.
+            if data.get("isLast", not next_page_token) or not next_page_token:
                 break
         return all_issues
 
@@ -309,7 +321,14 @@ class JiraClient:
                     # when the declared target was Remediated).
                     try:
                         live_after = self._j.issue(key).fields.status.name.lower().strip()
-                        if live_after == target.lower() or live_after in _TERMINAL:
+                        # Only swallow the error if the ticket genuinely reached
+                        # the target or moved to a *different* terminal state.
+                        # Without the "!= current_status" guard, a ticket that
+                        # started at a terminal-named status (e.g. "not fixed")
+                        # and never moved would be reported as success (silent
+                        # no-op).
+                        if (live_after == target.lower()
+                                or (live_after in _TERMINAL and live_after != current_status)):
                             break  # already done — swallow the error
                     except Exception:
                         pass
@@ -331,16 +350,30 @@ class JiraClient:
     def transition(self, key: str, to_status: str):
         transitions = self._j.transitions(key)
         target = to_status.lower().strip()
+        by_name = {}
+        for t in transitions:
+            by_name.setdefault(t["name"].lower().strip(), t)
 
-        # Build full candidate set: exact name + all aliases for this label
-        candidates = {target}
+        # Build a PRIORITY-ORDERED candidate list rather than a flat set:
+        #   1. the exact requested status name
+        #   2. the canonical name of its alias group
+        #   3. the remaining aliases (last resort)
+        # Matching in this order guarantees we fire the *literal* target
+        # transition when Jira offers it, instead of an equivalent-but-different
+        # one that merely shares the alias group (e.g. requesting "Fixed" must
+        # never fire "Done"/"Closed"/"Resolve" while a real "Fixed" exists).
+        ranked = [target]
         for canonical, aliases in self._TRANSITION_ALIASES.items():
             if target == canonical or target in aliases:
-                candidates |= aliases
-                candidates.add(canonical)
+                if canonical not in ranked:
+                    ranked.append(canonical)
+                for a in sorted(aliases):
+                    if a not in ranked:
+                        ranked.append(a)
 
-        for t in transitions:
-            if t["name"].lower() in candidates:
+        for name in ranked:
+            t = by_name.get(name)
+            if t:
                 self._j.transition_issue(key, t["id"])
                 return
 

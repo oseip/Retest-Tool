@@ -45,16 +45,36 @@ class KaliConnection:
 
         self._kali = paramiko.SSHClient()
         self._kali.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self._kali.connect(
-            hostname="localhost",
-            username=self._client_cfg.kali_user,
-            password=self._client_cfg.kali_password,
-            sock=channel,
-            timeout=30,
-            look_for_keys=False,
-            allow_agent=False,
-        )
+        try:
+            self._kali.connect(
+                hostname="localhost",
+                username=self._client_cfg.kali_user,
+                password=self._client_cfg.kali_password,
+                sock=channel,
+                timeout=30,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+        except Exception:
+            # The Kali hop failed (bad creds, host down, timeout). Tear down the
+            # jump SSH session we already opened so it doesn't leak a live
+            # session on the shared jump server for every failed attempt.
+            self.close()
+            raise
         log.info("Kali connection ready for client '%s'", self._client_cfg.label)
+
+    def is_alive(self) -> bool:
+        """True only if both hops' transports are open and active."""
+        try:
+            for client in (self._jump, self._kali):
+                if client is None:
+                    return False
+                transport = client.get_transport()
+                if transport is None or not transport.is_active():
+                    return False
+            return True
+        except Exception:
+            return False
 
     def exec_stream(self, command: str, on_line: Callable[[str], None],
                     timeout: int = 600, stop_event=None) -> int:

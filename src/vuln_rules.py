@@ -144,26 +144,50 @@ def _parse_ssl_weak_hash(text: str, xml: str, description: str = "") -> Tuple[Ve
     if _host_down(text):
         return "inconclusive", "Host unreachable"
     low = text.lower()
-    for alg in ("md5", "sha-1", "sha1"):
-        if alg in low and ("signature" in low or "digest" in low):
-            return "not_fixed", f"Certificate still uses weak hash algorithm ({alg.upper()})"
-    for alg in ("sha256", "sha384", "sha512", "sha-256", "sha-384", "sha-512"):
-        if alg in low:
-            return "fixed", "Certificate now uses strong hash algorithm"
+    # Only judge the *certificate signature algorithm*, not any hash token that
+    # might appear in a cipher-suite name. Prefer the explicit
+    # "Signature Algorithm: ..." line that nmap ssl-cert / openssl emit.
+    sig = re.search(r'signature algorithm\s*:?\s*([a-z0-9\-]+)', low)
+    sig_ctx = sig.group(1) if sig else ""
+    has_sig_ctx = bool(sig) or "signature" in low or "digest" in low
+    weak_target = sig_ctx or low
+    # Match hash tokens even inside algorithm names like "sha1withrsaencryption"
+    # or "ecdsa-with-sha1"; the negative lookahead stops "sha1" matching "sha256".
+    if has_sig_ctx and re.search(r'md5|md2|sha-?1(?![0-9])', weak_target):
+        which = "MD5/MD2" if re.search(r'md[25]', weak_target) else "SHA-1"
+        return "not_fixed", f"Certificate still uses weak signature hash algorithm ({which})"
+    # Require the signature-algorithm context before declaring "fixed" so a
+    # strong-hash cipher suite can't be mistaken for the cert's own signature.
+    if has_sig_ctx and re.search(r'sha-?(256|384|512)', weak_target):
+        return "fixed", "Certificate now uses a strong signature hash algorithm (SHA-2 family)"
     if "ssl-cert" not in low:
-        return "inconclusive", "Could not retrieve certificate"
-    return "inconclusive", "Could not determine certificate signature algorithm"
+        return "inconclusive", "Could not retrieve certificate — port may be closed or filtered"
+    return "inconclusive", "Could not determine certificate signature algorithm — verify manually"
 
 
 def _parse_ssl_wrong_hostname(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    # "Wrong hostname" can only be judged against the *intended* hostname, which
+    # nmap ssl-cert does not know (it connects by IP). The presence of a SAN
+    # entry does NOT prove the cert matches the hostname, so we never auto-mark
+    # this "fixed" — that was the source of false "fixed" verdicts. Surface the
+    # CN/SAN we found and leave the final call to the tester.
     if _host_down(text):
         return "inconclusive", "Host unreachable"
-    low = text.lower()
-    if "subject alternative name" in low or "san" in low:
-        return "fixed", "Certificate has Subject Alternative Name (SAN) entries"
     cn = _xml_elem(xml, "commonName")
+    # Collect SAN DNS entries from the ssl-cert XML if present.
+    sans = re.findall(r'DNS:([^\s,<]+)', text)
+    detail_bits = []
     if cn:
-        return "inconclusive", f"Certificate CN is '{cn}' — verify it matches the hostname"
+        detail_bits.append(f"CN='{cn}'")
+    if sans:
+        detail_bits.append("SAN=" + ",".join(sorted(set(sans))[:5]))
+    if detail_bits:
+        return "inconclusive", (
+            "Certificate presents " + "; ".join(detail_bits)
+            + " — manually confirm it matches the intended hostname"
+        )
+    if "ssl-cert" not in text.lower():
+        return "inconclusive", "Could not retrieve SSL certificate — port may be closed or filtered"
     return "inconclusive", "Could not parse certificate hostname — verify manually"
 
 
@@ -189,16 +213,38 @@ def _parse_tls_versions(text: str, xml: str, description: str = "") -> Tuple[Ver
         problems.append("SSL v2 still enabled")
     if re.search(r'\bsslv3\b|\bssl ?v3\b', low):
         problems.append("SSL v3 still enabled")
-    for cipher in ("3des", "des-cbc", "rc4", "export", "_null_", "anon"):
+    # Explicit weak ciphers / known cipher-level attacks. Suffix/prefix hyphens
+    # keep these anchored to cipher-suite tokens so we don't match unrelated text.
+    for cipher in ("3des", "des-cbc", "des40", "rc4", "rc2-", "export", "_null_",
+                   "null-", "-null", "anon", "adh-", "aecdh", "idea-", "seed-",
+                   "-md5", "_md5", "sweet32", "64-bit block"):
         if cipher in low:
-            problems.append(f"Weak cipher: {cipher.upper()}")
+            problems.append(f"Weak cipher/algorithm: {cipher.upper().strip('-_')}")
+
+    # nmap ssl-enum-ciphers grades every cipher A–F and prints a
+    # "least strength: <grade>" summary. Anything graded C or worse is weak, so
+    # this catches medium-strength/weak ciphers that a substring list would miss
+    # (the exact false-positive class where the tool said "fixed" but wasn't).
+    least = re.search(r'least strength\s*:\s*([a-f])\b', low)
+    if least and least.group(1) in ("c", "d", "e", "f"):
+        problems.append(f"nmap graded cipher strength '{least.group(1).upper()}' (C or worse = weak)")
+    # Per-cipher grade lines, e.g. "TLS_... - C". Only trust the trailing grade
+    # token so we don't misread hex or hostnames.
+    if re.search(r'\)\s*-\s*[c-f]\b', low) or re.search(r'\s-\s[c-f]\s*$', low, re.M):
+        problems.append("One or more ciphers graded C or worse by ssl-enum-ciphers")
+    # nmap warnings emitted alongside weak ciphers.
+    if re.search(r'\b(broken|weak)\b.*\bcipher', low) or "vulnerable to" in low:
+        problems.append("ssl-enum-ciphers reported a weak/broken cipher warning")
 
     if problems:
-        return "not_fixed", "; ".join(problems)
+        # De-duplicate while preserving order for a clean reason string.
+        seen = set()
+        uniq = [p for p in problems if not (p in seen or seen.add(p))]
+        return "not_fixed", "; ".join(uniq)
 
-    # Script ran and found no weak protocols or ciphers
+    # Script ran and found no weak protocols, ciphers, or poor grades.
     if re.search(r'\btlsv1\.[23]\b', low):
-        return "fixed", "Only TLS 1.2/1.3 detected — no weak protocols or ciphers found"
+        return "fixed", "Only TLS 1.2/1.3 detected — no weak protocols, ciphers, or poor cipher grades found"
     return "fixed", "No weak TLS protocols or ciphers detected in ssl-enum-ciphers output"
 
 
@@ -260,11 +306,16 @@ def _parse_ssh_proto_v1(text: str, xml: str, description: str = "") -> Tuple[Ver
     if _host_down(text):
         return "inconclusive", "Host unreachable"
     low = text.lower()
-    if "protocol 1" in low or "sshv1" in low or "ssh protocol 1" in low:
+    # Explicit v1 evidence, or the "SSH-1.99-" banner which advertises v1+v2.
+    if ("protocol 1" in low or "sshv1" in low or "ssh protocol 1" in low
+            or "ssh-1.99" in low or "supports sshv1" in low):
         return "not_fixed", "SSH Protocol Version 1 still supported"
-    if "protocol 2" in low or "ssh2" in low or "22/tcp open" in low:
-        return "fixed", "SSH Protocol Version 1 is no longer offered"
-    return "inconclusive", "Could not determine SSH protocol version — check output"
+    # Only conclude "fixed" from a v2-only banner. An open port alone proves
+    # nothing about which protocol versions are offered (previously it wrongly
+    # read "22/tcp open" as fixed → false positive).
+    if "ssh-2.0" in low:
+        return "fixed", "Server advertises SSH-2.0 only — Protocol Version 1 is not offered"
+    return "inconclusive", "Could not determine SSH protocol version — verify the SSH banner manually"
 
 
 def _parse_openssh_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
@@ -1942,7 +1993,7 @@ RULES: List[VulnRule] = [
     VulnRule(
         name="SMB Signing Not Required",
         patterns=[r"smb signing not required", r"smb.*signing.*disabled", r"smb.*signing.*not required"],
-        nmap_script="smb2-security-mode",
+        nmap_script="smb-security-mode,smb2-security-mode",
         default_port=445,
         parse=_parse_smb_signing,
     ),
@@ -1956,13 +2007,16 @@ RULES: List[VulnRule] = [
         default_port=445,
         parse=_parse_ms17010,
     ),
-    VulnRule(
-        name="MS09-050 Microsoft Windows SMB2 Vulnerability",
-        patterns=[r"ms09-050", r"educatedscholar", r"smb2.*validat"],
-        nmap_script="smb-vuln-ms09-050",
-        default_port=445,
-        parse=_parse_ms09050,
-    ),
+    # Disabled: the only nmap detection for MS09-050 / CVE-2009-3103 is
+    # smb-vuln-cve2009-3103, which is an *intrusive DoS exploit* that bluescreens
+    # vulnerable hosts. Unsafe to auto-run during a retest — moved to manual review.
+    # VulnRule(
+    #     name="MS09-050 Microsoft Windows SMB2 Vulnerability",
+    #     patterns=[r"ms09-050", r"educatedscholar", r"smb2.*validat"],
+    #     nmap_script="smb-vuln-cve2009-3103",
+    #     default_port=445,
+    #     parse=_parse_ms09050,
+    # ),
     VulnRule(
         name="SMB NULL Session / Shares Unprivileged Access",
         patterns=[
@@ -2010,14 +2064,16 @@ RULES: List[VulnRule] = [
     #     default_port=3389,
     #     parse=_parse_rdp,
     # ),
-    VulnRule(
-        name="BlueKeep CVE-2019-0708",
-        patterns=[r"bluekeep", r"cve-2019-0708"],
-        nmap_script="rdp-vuln-ms19-0708",
-        extra_args="--script-args=unsafe=1",
-        default_port=3389,
-        parse=_parse_bluekeep,
-    ),
+    # Disabled: there is no bundled nmap NSE script for BlueKeep (CVE-2019-0708).
+    # "rdp-vuln-ms19-0708" does not exist; the community-standard safe checks are
+    # rdpscan or Metasploit's cve_2019_0708_bluekeep aux scanner. Moved to manual review.
+    # VulnRule(
+    #     name="BlueKeep CVE-2019-0708",
+    #     patterns=[r"bluekeep", r"cve-2019-0708"],
+    #     nmap_script="",
+    #     default_port=3389,
+    #     parse=_parse_bluekeep,
+    # ),
 
     # --- HTTP / Web (most specific first to avoid generic rule swallowing them) ---
     VulnRule(
@@ -2043,10 +2099,11 @@ RULES: List[VulnRule] = [
             r"jboss java object", r"jboss enterprise application platform",
             r"ejbinvokerservlet", r"jmxinvokerservlet", r"jboss.*unrestricted",
         ],
-        nmap_script="http-get",
-        extra_args="--script-args=http-get.path=/jmx-console/",
+        nmap_script="",
         default_port=8080,
         parse=_parse_jboss,
+        tool="curl",
+        curl_path="/jmx-console/",
     ),
     VulnRule(
         name="Apache Tomcat Version Vulnerability",
@@ -2096,10 +2153,11 @@ RULES: List[VulnRule] = [
     VulnRule(
         name="Apache Solr Unauthenticated Access / RCE",
         patterns=[r"apache solr", r"solr.*unauthenticated", r"solr.*without auth", r"solr.*rce"],
-        nmap_script="http-get",
-        extra_args="--script-args=http-get.path=/solr/admin/cores",
+        nmap_script="",
         default_port=8983,
         parse=_parse_solr,
+        tool="curl",
+        curl_path="/solr/admin/cores",
     ),
     VulnRule(
         name="Jenkins Version Vulnerability",
@@ -2159,10 +2217,11 @@ RULES: List[VulnRule] = [
     VulnRule(
         name="MinIO Admin Default Credentials",
         patterns=[r"minio.*default credentials", r"minio admin.*client", r"minio.*admin.*web"],
-        nmap_script="http-get",
-        extra_args="--script-args=http-get.path=/",
+        nmap_script="",
         default_port=9001,
         parse=_parse_minio,
+        tool="curl",
+        curl_path="/",
     ),
 
     # --- Database ---
@@ -2192,10 +2251,11 @@ RULES: List[VulnRule] = [
             r"elasticsearch unrestricted", r"elasticsearch.*unauthenticated",
             r"elasticsearch.*information disclosure",
         ],
-        nmap_script="http-get",
-        extra_args="-p 9200",
+        nmap_script="",
         default_port=9200,
         parse=_parse_elasticsearch,
+        tool="curl",
+        curl_path="/",
     ),
     VulnRule(
         name="Oracle Database Version / Unsupported",
@@ -2401,10 +2461,11 @@ RULES: List[VulnRule] = [
     VulnRule(
         name="Hadoop YARN Unauthenticated RCE",
         patterns=[r"hadoop yarn", r"resourcemanager.*unauthenticated"],
-        nmap_script="http-get",
-        extra_args="-p 8088",
+        nmap_script="",
         default_port=8088,
         parse=_parse_hadoop_yarn,
+        tool="curl",
+        curl_path="/ws/v1/cluster/info",
     ),
     VulnRule(
         name="HP Data Protector Remote Command Execution",
@@ -2849,15 +2910,18 @@ RULES: List[VulnRule] = [
     ),
 
     # --- ZooKeeper ---
-    VulnRule(
-        name="Apache ZooKeeper Accessible Without Authentication",
-        patterns=[r"zookeeper.*unauthenticated", r"zookeeper.*no.*auth",
-                  r"zookeeper.*without.*auth", r"zookeeper.*open.*access",
-                  r"zookeeper.*exposed"],
-        nmap_script="zookeeper-info",
-        default_port=2181,
-        parse=_parse_zookeeper,
-    ),
+    # Disabled: there is no bundled nmap NSE script named "zookeeper-info".
+    # ZooKeeper exposure is confirmed via 4-letter-word commands (e.g. `echo stat | nc host 2181`)
+    # over raw TCP, which this tool's nmap/curl runner cannot issue. Moved to manual review.
+    # VulnRule(
+    #     name="Apache ZooKeeper Accessible Without Authentication",
+    #     patterns=[r"zookeeper.*unauthenticated", r"zookeeper.*no.*auth",
+    #               r"zookeeper.*without.*auth", r"zookeeper.*open.*access",
+    #               r"zookeeper.*exposed"],
+    #     nmap_script="zookeeper-info",
+    #     default_port=2181,
+    #     parse=_parse_zookeeper,
+    # ),
 
     # --- etcd ---
     VulnRule(
@@ -3026,6 +3090,15 @@ MANUAL_ONLY_RULES = [
     r"winshock",
     r"ms16-047",
     r"badlock",
+
+    # 6. No safe automated probe available (would DoS the host or require a
+    #    non-nmap/curl protocol) — verify manually.
+    r"ms09-050",           # only NSE is smb-vuln-cve2009-3103, an intrusive DoS/bluescreen
+    r"educatedscholar",
+    r"cve-2009-3103",
+    r"bluekeep",           # no bundled nmap NSE; use rdpscan / metasploit aux scanner
+    r"cve-2019-0708",
+    r"zookeeper",          # requires 4lw (`echo stat | nc host 2181`) over raw TCP
 ]
 
 def match_rule(summary: str) -> Optional[VulnRule]:

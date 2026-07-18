@@ -6,9 +6,12 @@ the three lines that wire it into main.py / index.html / app.js.
 """
 import csv
 import io
+import json
 import logging
+import os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from typing import Dict, List, Optional, Tuple
@@ -25,6 +28,38 @@ router = APIRouter()
 _JIRA_INDEXES: Dict[str, dict] = {}
 _INDEX_LOCK = threading.Lock()
 
+# ── Persistent cache ───────────────────────────────────────────────────────
+# Survives app restarts and browser refreshes so tickets/scans aren't re-pulled
+# from Jira/Nessus every single time. data/ is git-ignored.
+_CACHE_DIR        = os.path.join("data", "intake_cache")
+_JIRA_CACHE_DIR   = os.path.join(_CACHE_DIR, "jira")
+_NESSUS_CACHE_DIR = os.path.join(_CACHE_DIR, "nessus")
+
+# How long a cached Jira index is considered "fresh". Older caches still load
+# instantly (so the UI never blocks) but trigger a silent background refresh.
+_JIRA_CACHE_TTL = 12 * 3600   # 12 hours
+
+
+def _safe_name(label: str) -> str:
+    """Filesystem-safe version of a client label for use in cache filenames."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(label))
+
+
+def _ensure_cache_dirs() -> None:
+    for d in (_JIRA_CACHE_DIR, _NESSUS_CACHE_DIR):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as exc:
+            log.warning("Intake cache: could not create %s — %s", d, exc)
+
+
+def _atomic_write_json(path: str, data: dict) -> None:
+    """Write JSON atomically so a crash mid-write can't corrupt the cache."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
 
 # ── Request models ─────────────────────────────────────────────────────────
 
@@ -35,6 +70,7 @@ class PullRequest(BaseModel):
     vector:      str  = "Internal network"
     test_type:   str  = "IPT"
     duration:    str  = ""
+    force:       bool = False   # bypass the per-scan cache and re-export from Nessus
     project_key: str  = ""
     customer:    str  = ""
     contact_person:    str = ""
@@ -62,6 +98,7 @@ class ExportRequest(BaseModel):
     purchaser:         str = ""
     tester:            str = ""
     date_started:      str = ""
+    munit_id:          str = ""
 
 
 # ── Nessus CSV → vulnerability normaliser ─────────────────────────────────
@@ -125,10 +162,14 @@ def _technology(title: str, port: str, protocol: str) -> str:
 
 
 def _col(row: dict, *names: str) -> str:
-    """Case-insensitive column lookup across all provided aliases."""
-    row_lower = {(k or "").strip().lower(): v for k, v in row.items()}
+    """Case-insensitive column lookup across all provided aliases.
+
+    Rows are pre-normalised to lowercase keys once in _parse_nessus_csv, so this
+    is a plain O(1) dict lookup rather than rebuilding a lowercased copy of the
+    whole row on every one of the ~15 field accesses per row.
+    """
     for n in names:
-        v = row_lower.get(n.lower())
+        v = row.get(n.lower())
         if v is not None:
             return (v or "").strip()
     return ""
@@ -140,8 +181,13 @@ def _parse_nessus_csv(csv_text: str, vector: str = "", actor: str = "", conn=Non
     """Parse one Nessus CSV export into normalised finding dicts."""
     from . import nessus_client as nc
     from concurrent.futures import ThreadPoolExecutor
-    rows = list(csv.DictReader(io.StringIO(csv_text)))
-    
+    # Normalise every header to lowercase once so _col() can do O(1) lookups
+    # instead of re-lowercasing the whole row on each field access.
+    rows = [
+        {(k or "").strip().lower(): v for k, v in r.items()}
+        for r in csv.DictReader(io.StringIO(csv_text))
+    ]
+
     # --- Pass 1: Extract OS Mapping ---
     ip_to_os = {}
     for row in rows:
@@ -291,6 +337,8 @@ def _parse_nessus_csv(csv_text: str, vector: str = "", actor: str = "", conn=Non
         if not name or not host:
             continue
 
+        os_val = ip_to_os.get(host, "")
+
         if desc:
             desc = re.sub(r"(?i)nessus", "mUnit", desc)
         if soln:
@@ -300,9 +348,9 @@ def _parse_nessus_csv(csv_text: str, vector: str = "", actor: str = "", conn=Non
             "Vulnerability_Title":       name,
             "Vulnerability_Description": desc,
             "Recommendation":            soln,
-            "Affected_System":           "",
+            "Affected_System":           os_val,
             "System_IP":                 host,
-            "OS":                        ip_to_os.get(host, ""),
+            "OS":                        os_val,
             "Assignee":                  "",
             "OWASP_Top_10_Category":     "",
             "Vulnerability_Rating":      risk.capitalize(),
@@ -416,15 +464,152 @@ def _merge_port(finding: dict, new_port: str) -> None:
         finding["_port"] = new_port
 
 
+def _parse_cve_list(cve_field: str) -> List[str]:
+    """Extract CVE-YYYY-NNNN tokens from a comma/space-separated field."""
+    if not cve_field:
+        return []
+    out = []
+    for part in re.split(r"[,;\s]+", str(cve_field)):
+        p = part.strip().upper()
+        if p.startswith("CVE-"):
+            out.append(p)
+    return out
+
+
+def _match_finding_to_index(
+    finding: dict,
+    title_index: dict,
+    cve_index: dict,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Return (jira_key, match_kind) where match_kind is 'title' or 'cve'."""
+    title = _normalize_title(finding.get("Vulnerability_Title") or "").strip().lower()
+    ip = (finding.get("System_IP") or finding.get("_ip") or "").strip()
+    port = str(finding.get("_port") or "").strip()
+
+    dup_key = title_index.get((title, ip, port)) or title_index.get((title, ip, ""))
+    if dup_key:
+        return dup_key, "title"
+
+    for cve in _parse_cve_list(finding.get("CVE") or ""):
+        dup_key = cve_index.get((cve, ip))
+        if dup_key:
+            return dup_key, "cve"
+    return None, None
+
+
 # ── Jira index builder ──────────────────────────────────────────────────────
 
+def _index_from_tickets(tickets: List[dict]) -> Tuple[dict, dict]:
+    """Build the fast-lookup title/CVE indexes from a list of serialized tickets.
+
+    Shared by fresh Jira fetches and disk-cache loads so both produce identical
+    lookup structures.
+      • Title index: (normalised_title, ip, port) → ticket key
+      • CVE index:   (CVE-ID, ip)                 → ticket key
+    """
+    title_index: dict = {}
+    cve_index: dict = {}
+    for t in tickets:
+        title = _normalize_title(t.get("summary") or "").strip().lower()
+        ips = [i.strip() for i in (t.get("ips") or []) if i.strip()]
+        ports = [str(p).strip() for p in (t.get("ports") or []) if str(p).strip()]
+        cves = [c.strip().upper() for c in (t.get("cves") or []) if c.strip()]
+
+        for ip in ips:
+            for port in ports:
+                title_index[(title, ip, port)] = t["key"]
+            title_index.setdefault((title, ip, ""), t["key"])
+            for cve in cves:
+                cve_index.setdefault((cve, ip), t["key"])
+        if not ips:
+            title_index[(title, "", "")] = t["key"]
+
+    return title_index, cve_index
+
+
+def _jira_cache_path(label: str) -> str:
+    return os.path.join(_JIRA_CACHE_DIR, f"{_safe_name(label)}.json")
+
+
+def _save_jira_cache(label: str, tickets: List[dict], jira_url: str,
+                     fetched_at: float) -> None:
+    """Persist a slim ticket list (only fields needed for dedup matching)."""
+    _ensure_cache_dirs()
+    slim = [
+        {
+            "key":     t.get("key"),
+            "summary": t.get("summary") or "",
+            "ips":     t.get("ips") or [],
+            "ports":   t.get("ports") or [],
+            "cves":    t.get("cves") or [],
+        }
+        for t in tickets if t.get("key")
+    ]
+    try:
+        _atomic_write_json(_jira_cache_path(label), {
+            "label":      label,
+            "jira_url":   jira_url,
+            "fetched_at": fetched_at,
+            "count":      len(slim),
+            "tickets":    slim,
+        })
+    except OSError as exc:
+        log.warning("Intake: could not write Jira cache for '%s' — %s", label, exc)
+
+
+def _read_jira_cache(label: str) -> Optional[dict]:
+    """Read the raw cache file for *label*, or None if missing/corrupt."""
+    path = _jira_cache_path(label)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Intake: ignoring corrupt Jira cache for '%s' — %s", label, exc)
+        return None
+
+
+def _load_jira_cache_into_memory(label: str) -> bool:
+    """Populate _JIRA_INDEXES[label] from disk. Returns True on success."""
+    data = _read_jira_cache(label)
+    if not data:
+        return False
+    tickets = data.get("tickets") or []
+    title_index, cve_index = _index_from_tickets(tickets)
+    with _INDEX_LOCK:
+        _JIRA_INDEXES[label] = {
+            "status":     "ready",
+            "index":      title_index,
+            "cve_index":  cve_index,
+            "count":      data.get("count", len(tickets)),
+            "error":      None,
+            "jira_url":   data.get("jira_url"),
+            "fetched_at": data.get("fetched_at"),
+            "from_cache": True,
+        }
+    log.info("Intake: Jira index '%s' loaded from cache — %d tickets", label, len(tickets))
+    return True
+
+
 def _build_index(label: str) -> None:
-    """Fetch all open Jira tickets for *label* and build a fast-lookup index.
+    """Fetch all Jira tickets for *label*, build indexes, and persist to disk.
     Runs in a daemon thread; result stored in _JIRA_INDEXES[label]."""
     from . import main as m
 
+    # Preserve any already-ready cached index while refreshing so the UI can
+    # keep serving results instead of dropping to a blank "loading" state.
     with _INDEX_LOCK:
-        _JIRA_INDEXES[label] = {"status": "loading", "index": {}, "count": 0, "error": None}
+        prev = _JIRA_INDEXES.get(label, {})
+        if prev.get("status") == "ready":
+            prev = dict(prev)
+            prev["refreshing"] = True
+            _JIRA_INDEXES[label] = prev
+        else:
+            _JIRA_INDEXES[label] = {
+                "status": "loading", "index": {}, "cve_index": {},
+                "count": 0, "error": None,
+            }
 
     try:
         _, session = m._get_client(label)
@@ -433,74 +618,207 @@ def _build_index(label: str) -> None:
         if session == "non_axian":
             jql = f'project = {label} ORDER BY created ASC'
         else:
-            jql = f'project = {m.cfg.jira.project} AND labels = "{label}" ORDER BY created ASC'
+            jql = (
+                f'project = {m.cfg.jira.project} AND labels = "{label}" '
+                f'ORDER BY created ASC'
+            )
 
-        # Fetch all necessary fields for the index, avoiding global mutations
         tickets = jc.search_jql(jql)
-
-        # Build index: (normalised_title, ip, port) → ticket key
-        index: dict = {}
-        for t in tickets:
-            title = (t.get("summary") or "").strip().lower()
-            ips   = [i.strip() for i in (t.get("ips")   or []) if i.strip()]
-            ports = [str(p).strip() for p in (t.get("ports") or []) if str(p).strip()]
-
-            for ip in ips:
-                for port in ports:
-                    index[(title, ip, port)] = t["key"]
-                # Also index without port so a mismatch there doesn't miss a dup
-                index.setdefault((title, ip, ""), t["key"])
-            if not ips:
-                index[(title, "", "")] = t["key"]
+        title_index, cve_index = _index_from_tickets(tickets)
+        jira_url = jc.cfg.url.rstrip("/")
+        fetched_at = time.time()
 
         with _INDEX_LOCK:
             _JIRA_INDEXES[label] = {
                 "status": "ready",
-                "index":  index,
-                "count":  len(tickets),
-                "error":  None,
+                "index": title_index,
+                "cve_index": cve_index,
+                "count": len(tickets),
+                "error": None,
+                "jira_url": jira_url,
+                "fetched_at": fetched_at,
+                "from_cache": False,
             }
+        _save_jira_cache(label, tickets, jira_url, fetched_at)
         log.info("Intake: Jira index '%s' ready — %d tickets indexed", label, len(tickets))
 
     except Exception as exc:
         log.warning("Intake: Jira index '%s' failed — %s", label, exc)
+        # Fall back to any cached copy so a transient Jira outage doesn't wipe
+        # a perfectly good index the user was relying on.
+        if _load_jira_cache_into_memory(label):
+            with _INDEX_LOCK:
+                info = _JIRA_INDEXES.get(label, {})
+                info["error"] = f"Refresh failed ({exc}); showing cached copy"
+                _JIRA_INDEXES[label] = info
+            return
         with _INDEX_LOCK:
             _JIRA_INDEXES[label] = {
                 "status": "error",
-                "index":  {},
-                "count":  0,
-                "error":  str(exc),
+                "index": {},
+                "cve_index": {},
+                "count": 0,
+                "error": str(exc),
             }
+
+
+def _index_is_stale(info: dict) -> bool:
+    fetched_at = info.get("fetched_at")
+    if not fetched_at:
+        return True
+    return (time.time() - fetched_at) > _JIRA_CACHE_TTL
+
+
+# ── Nessus scan cache ────────────────────────────────────────────────────────
+# Parsed findings for a scan are cached so re-pulling the same scan is instant
+# and doesn't re-run the slow Nessus CSV export over SSH. Risk values depend on
+# vector/actor, so those are part of the cache key.
+
+def _nessus_cache_path(label: str, scan_id: int, vector: str, actor: str) -> str:
+    key = _safe_name(f"{label}_{scan_id}_{vector}_{actor}")
+    return os.path.join(_NESSUS_CACHE_DIR, f"{key}.json")
+
+
+def _load_nessus_cache(label: str, scan_id: int, vector: str, actor: str) -> Optional[dict]:
+    path = _nessus_cache_path(label, scan_id, vector, actor)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Intake: ignoring corrupt Nessus cache for scan %s — %s", scan_id, exc)
+        return None
+
+
+def _save_nessus_cache(label: str, scan_id: int, vector: str, actor: str,
+                       scan_name: str, rows: List[dict]) -> None:
+    _ensure_cache_dirs()
+    try:
+        _atomic_write_json(_nessus_cache_path(label, scan_id, vector, actor), {
+            "label":      label,
+            "scan_id":    scan_id,
+            "scan_name":  scan_name,
+            "vector":     vector,
+            "actor":      actor,
+            "fetched_at": time.time(),
+            "count":      len(rows),
+            "findings":   rows,
+        })
+    except OSError as exc:
+        log.warning("Intake: could not write Nessus cache for scan %s — %s", scan_id, exc)
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
 @router.post("/api/intake/{label}/prefetch-jira")
 def intake_prefetch_jira(label: str, force: bool = False):
-    """Kick off background Jira index build. Call as soon as user picks a client."""
+    """Make the Jira index available as fast as possible.
+
+    Order of preference (fast → slow):
+      1. force=True            → always rebuild from Jira in the background.
+      2. Already ready in RAM  → serve instantly; refresh in background if stale.
+      3. On disk (prev run)    → load instantly; refresh in background if stale.
+      4. Nothing cached        → build from Jira in the background.
+    """
     from . import main as m
     if not m.cfg:
         raise HTTPException(400, "App not configured yet")
     if not m._find_client(label):
         raise HTTPException(400, f"Unknown client: {label}")
 
-    with _INDEX_LOCK:
-        st = _JIRA_INDEXES.get(label, {}).get("status", "idle")
-    if st == "loading" and not force:
+    if force:
+        threading.Thread(target=_build_index, args=(label,), daemon=True).start()
         return {"ok": True, "status": "loading"}
 
+    with _INDEX_LOCK:
+        info = _JIRA_INDEXES.get(label, {})
+        st = info.get("status", "idle")
+
+    # Already in memory
+    if st == "ready":
+        if _index_is_stale(info):
+            threading.Thread(target=_build_index, args=(label,), daemon=True).start()
+        return {"ok": True, "status": "ready", "cached": True}
+    if st == "loading":
+        return {"ok": True, "status": "loading"}
+
+    # Not in memory — try the on-disk cache from a previous run
+    if _load_jira_cache_into_memory(label):
+        with _INDEX_LOCK:
+            info = _JIRA_INDEXES.get(label, {})
+        if _index_is_stale(info):
+            threading.Thread(target=_build_index, args=(label,), daemon=True).start()
+        return {"ok": True, "status": "ready", "cached": True}
+
+    # Nothing cached anywhere — build fresh
     threading.Thread(target=_build_index, args=(label,), daemon=True).start()
     return {"ok": True, "status": "loading"}
+
+
+@router.post("/api/intake/{label}/refresh-jira")
+def intake_refresh_jira(label: str):
+    """Force a fresh rebuild of the Jira index from the live project."""
+    from . import main as m
+    if not m.cfg:
+        raise HTTPException(400, "App not configured yet")
+    if not m._find_client(label):
+        raise HTTPException(400, f"Unknown client: {label}")
+    threading.Thread(target=_build_index, args=(label,), daemon=True).start()
+    return {"ok": True, "status": "loading"}
+
+
+@router.post("/api/intake/{label}/clear-cache")
+def intake_clear_cache(label: str):
+    """Delete all on-disk caches (Jira index + Nessus scans) for this client."""
+    removed = 0
+    safe = _safe_name(label)
+    with _INDEX_LOCK:
+        _JIRA_INDEXES.pop(label, None)
+    for d, prefix in ((_JIRA_CACHE_DIR, f"{safe}.json"), (_NESSUS_CACHE_DIR, f"{safe}_")):
+        if not os.path.isdir(d):
+            continue
+        for fname in os.listdir(d):
+            if fname == prefix or fname.startswith(prefix):
+                try:
+                    os.remove(os.path.join(d, fname))
+                    removed += 1
+                except OSError:
+                    pass
+    return {"ok": True, "removed": removed}
 
 
 @router.get("/api/intake/{label}/jira-index-status")
 def intake_jira_index_status(label: str):
     with _INDEX_LOCK:
         info = _JIRA_INDEXES.get(label, {})
+
+    # Nothing in memory yet — surface a cheap "is there a disk cache?" hint so
+    # the UI can load it via prefetch without a network round-trip.
+    if not info:
+        cached = _read_jira_cache(label)
+        if cached:
+            fetched_at = cached.get("fetched_at")
+            return {
+                "status": "cached",
+                "count":  cached.get("count", 0),
+                "error":  None,
+                "jira_url": cached.get("jira_url"),
+                "fetched_at": fetched_at,
+                "age_seconds": (time.time() - fetched_at) if fetched_at else None,
+            }
+
+    fetched_at = info.get("fetched_at")
     return {
-        "status": info.get("status", "idle"),
-        "count":  info.get("count", 0),
-        "error":  info.get("error"),
+        "status":      info.get("status", "idle"),
+        "count":       info.get("count", 0),
+        "error":       info.get("error"),
+        "jira_url":    info.get("jira_url"),
+        "fetched_at":  fetched_at,
+        "age_seconds": (time.time() - fetched_at) if fetched_at else None,
+        "from_cache":  info.get("from_cache", False),
+        "refreshing":  info.get("refreshing", False),
+        "stale":       _index_is_stale(info) if info.get("status") == "ready" else False,
     }
 
 
@@ -546,26 +864,33 @@ def intake_pull(label: str, req: PullRequest):
     ak, sk = client_cfg.nessus_access_key, client_cfg.nessus_secret_key
     all_findings: List[dict] = []
     errors: List[str] = []
+    cached_scans = 0
+    pulled_scans = 0
 
-    def _pull_one(sid: int) -> Tuple[List[dict], Optional[str]]:
+    # Sequential export — large Nessus CSV responses can corrupt parallel SSH
+    # channels (same issue as Assets pull). Slower but reliable. Each scan's
+    # parsed findings are cached on disk (keyed by scan + vector/actor) so a
+    # re-pull of the same scan is instant and skips the slow Nessus export.
+    for scan_id in req.scan_ids:
+        cached = None if req.force else _load_nessus_cache(label, scan_id, req.vector, req.actor)
+        if cached:
+            rows = cached.get("findings") or []
+            all_findings.extend(rows)
+            cached_scans += 1
+            log.info("Intake pull: scan %d ('%s') → %d vuln rows (from cache)",
+                     scan_id, cached.get("scan_name", ""), len(rows))
+            continue
         try:
-            csv_text, sname = nc.export_scan_csv(conn, ak, sk, sid)
-            rows = _parse_nessus_csv(csv_text, vector=req.vector, actor=req.actor, conn=conn, ak=ak, sk=sk)
-            log.info("Intake pull: scan %d ('%s') → %d vuln rows", sid, sname, len(rows))
-            return rows, None
+            csv_text, sname = nc.export_scan_csv(conn, ak, sk, scan_id)
+            rows = _parse_nessus_csv(
+                csv_text, vector=req.vector, actor=req.actor, conn=conn, ak=ak, sk=sk,
+            )
+            log.info("Intake pull: scan %d ('%s') → %d vuln rows", scan_id, sname, len(rows))
+            _save_nessus_cache(label, scan_id, req.vector, req.actor, sname, rows)
+            all_findings.extend(rows)
+            pulled_scans += 1
         except Exception as exc:
-            return [], f"Scan {sid}: {exc}"
-
-    # Parallel pull — each scan's export/poll/download runs in its own thread
-    workers = min(len(req.scan_ids), 5)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_pull_one, sid): sid for sid in req.scan_ids}
-        for fut in as_completed(futs):
-            rows, err = fut.result()
-            if err:
-                errors.append(err)
-            else:
-                all_findings.extend(rows)
+            errors.append(f"Scan {scan_id}: {exc}")
 
     merged = _merge_dedup(all_findings)
 
@@ -587,6 +912,8 @@ def intake_pull(label: str, req: PullRequest):
         "total_merged": len(merged),
         "errors":       errors,
         "findings":     merged,
+        "cached_scans": cached_scans,
+        "pulled_scans": pulled_scans,
     }
 
 
@@ -600,27 +927,30 @@ def intake_check_duplicates(label: str, req: CheckDupRequest):
     with _INDEX_LOCK:
         info = _JIRA_INDEXES.get(label, {})
 
+    # If nothing in memory, try to hydrate from the on-disk cache before giving up.
+    if not info:
+        if _load_jira_cache_into_memory(label):
+            with _INDEX_LOCK:
+                info = _JIRA_INDEXES.get(label, {})
+
     if info.get("status") != "ready":
         # Auto-trigger build if not started
         if info.get("status") not in ("loading",):
             threading.Thread(target=_build_index, args=(label,), daemon=True).start()
         raise HTTPException(503, "Jira index not ready — retry in a moment")
 
-    index = info["index"]
+    index = info.get("index") or {}
+    cve_index = info.get("cve_index") or {}
     results = []
 
     for f in req.findings:
-        title = (f.get("Vulnerability_Title") or "").strip().lower()
-        ip    = (f.get("System_IP") or "").strip()
-        port  = str(f.get("_port") or "").strip()
-
-        # Try exact (title, ip, port) then (title, ip, no-port)
-        dup_key = index.get((title, ip, port)) or index.get((title, ip, ""))
+        dup_key, match_kind = _match_finding_to_index(f, index, cve_index)
 
         results.append({
             "_id":          f.get("_id"),
             "status":       "duplicate" if dup_key else "new",
             "duplicate_of": dup_key,
+            "match_kind":   match_kind,
         })
 
     new_ct  = sum(1 for r in results if r["status"] == "new")
@@ -678,7 +1008,7 @@ def intake_export(req: ExportRequest):
             row["Customer"]          = req.customer
             row["Contact_Person"]    = req.contact_person
             row["Technical_Contact"] = req.technical_contact
-            row["mUnit_ID"]          = ""
+            row["mUnit_ID"]          = req.munit_id
         else:
             for col in META_COLS:
                 row[col] = ""

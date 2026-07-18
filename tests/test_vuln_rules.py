@@ -10,10 +10,149 @@ Covers:
 import pytest
 from src.vuln_rules import (
     match_rule,
+    RULES,
     _host_down,
     _port_closed,
     _xml_elem,
+    _parse_tls_versions,
+    _parse_ssl_wrong_hostname,
+    _parse_ssl_weak_hash,
+    _parse_ssh_proto_v1,
 )
+
+
+# ---------------------------------------------------------------------------
+# Scan-command accuracy — every nmap script referenced by a rule must be a real
+# bundled NSE script, and rules that can only be checked with a DoS exploit or a
+# non-nmap/curl protocol must route to manual review. Locks in the pentest-rule
+# audit so a regression can't reintroduce a broken/dangerous scan command.
+# ---------------------------------------------------------------------------
+
+class TestScanCommandAccuracy:
+    # Scripts that were previously referenced but do NOT exist in the standard
+    # nmap distribution (or are unsafe to auto-run).
+    INVALID_SCRIPTS = {
+        "http-get",              # third-party gist, not bundled
+        "zookeeper-info",        # no such NSE
+        "smb-vuln-ms09-050",     # real script is smb-vuln-cve2009-3103 (a DoS)
+        "rdp-vuln-ms19-0708",    # no bundled BlueKeep NSE
+    }
+
+    def test_no_rule_uses_invalid_nmap_script(self):
+        for rule in RULES:
+            if not rule.nmap_script:
+                continue
+            for script in rule.nmap_script.split(","):
+                assert script.strip() not in self.INVALID_SCRIPTS, (
+                    f"Rule '{rule.name}' references non-existent/unsafe nmap "
+                    f"script '{script.strip()}'"
+                )
+
+    @pytest.mark.parametrize("summary", [
+        "JBoss JMX Console Unrestricted Access",
+        "Apache Solr Unauthenticated Access",
+        "MinIO Admin Default Credentials",
+        "Elasticsearch Unrestricted Access",
+        "Hadoop YARN ResourceManager Unauthenticated",
+    ])
+    def test_http_get_rules_now_use_curl(self, summary):
+        rule = match_rule(summary)
+        assert rule is not None, f"'{summary}' should still match a rule"
+        assert rule.tool == "curl", f"'{summary}' should be a curl check, got {rule.tool}"
+        assert rule.curl_path, f"'{summary}' curl rule must define a path"
+
+    @pytest.mark.parametrize("summary", [
+        "MS09-050 Microsoft Windows SMB2 Vulnerability",
+        "BlueKeep CVE-2019-0708 Remote Code Execution",
+        "Apache ZooKeeper Accessible Without Authentication",
+    ])
+    def test_unsafe_checks_route_to_manual(self, summary):
+        assert match_rule(summary) is None, (
+            f"'{summary}' must fall back to manual review, not auto-scan"
+        )
+
+    def test_smb_signing_runs_both_dialect_scripts(self):
+        rule = match_rule("SMB Signing Not Required")
+        assert rule is not None
+        scripts = {s.strip() for s in rule.nmap_script.split(",")}
+        assert scripts == {"smb-security-mode", "smb2-security-mode"}
+
+
+# ---------------------------------------------------------------------------
+# False-positive hardening — verdicts must never say "fixed" on weak evidence.
+# These lock in the accuracy fixes so a regression can't reintroduce a false
+# "fixed" (the class of bug where colleagues found issues reported fixed that
+# were still present).
+# ---------------------------------------------------------------------------
+
+class TestTlsFalsePositives:
+    def test_least_strength_grade_c_is_not_fixed(self):
+        text = ("ssl-enum-ciphers:\n  TLSv1.2:\n    ciphers:\n"
+                "      TLS_RSA_WITH_AES_128_CBC_SHA - C\n"
+                "  least strength: C")
+        verdict, _ = _parse_tls_versions(text, "")
+        assert verdict == "not_fixed"
+
+    def test_per_cipher_grade_c_is_not_fixed(self):
+        text = ("ssl-enum-ciphers:\n  TLSv1.2:\n    ciphers:\n"
+                "      TLS_RSA_WITH_AES_128_CBC_SHA (rsa 2048) - C")
+        verdict, _ = _parse_tls_versions(text, "")
+        assert verdict == "not_fixed"
+
+    def test_sweet32_is_not_fixed(self):
+        text = ("ssl-enum-ciphers:\n  TLSv1.2:\n    ciphers:\n"
+                "      TLS_RSA_WITH_3DES_EDE_CBC_SHA - D\n"
+                "    warnings:\n      64-bit block cipher 3DES vulnerable to SWEET32")
+        verdict, _ = _parse_tls_versions(text, "")
+        assert verdict == "not_fixed"
+
+    def test_clean_strong_ciphers_still_fixed(self):
+        text = ("ssl-enum-ciphers:\n  TLSv1.3:\n    ciphers:\n"
+                "      TLS_AES_256_GCM_SHA384 - A\n  least strength: A")
+        verdict, _ = _parse_tls_versions(text, "")
+        assert verdict == "fixed"
+
+
+class TestSslWrongHostname:
+    def test_san_present_is_not_auto_fixed(self):
+        # A SAN entry does NOT prove the cert matches the intended hostname.
+        text = "ssl-cert: Subject Alternative Name: DNS:example.com"
+        verdict, _ = _parse_ssl_wrong_hostname(text, "")
+        assert verdict == "inconclusive"
+
+
+class TestSslWeakHash:
+    def test_strong_hash_without_signature_context_is_inconclusive(self):
+        # "sha256" appearing only in a cipher suite must not read as a fixed
+        # certificate signature.
+        text = "ssl-cert stuff TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+        verdict, _ = _parse_ssl_weak_hash(text, "")
+        assert verdict == "inconclusive"
+
+    def test_sha1_signature_is_not_fixed(self):
+        text = "ssl-cert:\n  Signature Algorithm: sha1WithRSAEncryption"
+        verdict, _ = _parse_ssl_weak_hash(text, "")
+        assert verdict == "not_fixed"
+
+    def test_sha256_signature_is_fixed(self):
+        text = "ssl-cert:\n  Signature Algorithm: sha256WithRSAEncryption"
+        verdict, _ = _parse_ssl_weak_hash(text, "")
+        assert verdict == "fixed"
+
+
+class TestSshProtoV1FalsePositive:
+    def test_open_port_alone_is_not_fixed(self):
+        # An open SSH port proves nothing about which protocol versions run.
+        verdict, _ = _parse_ssh_proto_v1("22/tcp open ssh", "")
+        assert verdict == "inconclusive"
+
+    def test_ssh_199_banner_is_not_fixed(self):
+        verdict, _ = _parse_ssh_proto_v1("SSH-1.99-OpenSSH_5.3", "")
+        assert verdict == "not_fixed"
+
+    def test_ssh_20_banner_is_fixed(self):
+        verdict, _ = _parse_ssh_proto_v1("SSH-2.0-OpenSSH_8.9", "")
+        assert verdict == "fixed"
 
 
 # ---------------------------------------------------------------------------

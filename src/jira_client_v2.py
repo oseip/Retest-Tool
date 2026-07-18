@@ -59,8 +59,10 @@ class JiraClientV2:
             "Content-Type": "application/json",
         })
         self._fields: Dict[str, str] = {}
+        self._fields_loaded = False
+        # Safe default; the real field map is loaded in a background thread by the
+        # app so constructing the client never blocks on a slow/unreachable Jira.
         self._fetch_fields = "*all"
-        self._load_fields()
 
     # ── Field discovery ────────────────────────────────────────────────────
 
@@ -70,6 +72,7 @@ class JiraClientV2:
             resp.raise_for_status()
             for f in resp.json():
                 self._fields[f["name"].lower()] = f["id"]
+            self._fields_loaded = True
             log.info("Secondary Jira: loaded %d fields", len(self._fields))
             self._fetch_fields = self._build_fetch_fields()
         except Exception as e:
@@ -88,6 +91,8 @@ class JiraClientV2:
         return ",".join(standard + custom_ids)
 
     def _fid(self, name: str) -> Optional[str]:
+        if not self._fields_loaded:
+            self._load_fields()
         return self._fields.get(name.lower())
 
     @property
@@ -201,15 +206,24 @@ class JiraClientV2:
         resp.raise_for_status()
         transitions = resp.json().get("transitions", [])
         target = to_status.lower().strip()
+        by_name = {}
+        for t in transitions:
+            by_name.setdefault(t["name"].lower().strip(), t)
 
-        candidates = {target}
+        # Priority-ordered matching (exact → canonical → aliases) so the literal
+        # requested transition wins over an equivalent alias like Done/Closed.
+        ranked = [target]
         for canonical, aliases in self._TRANSITION_ALIASES.items():
             if target == canonical or target in aliases:
-                candidates |= aliases
-                candidates.add(canonical)
+                if canonical not in ranked:
+                    ranked.append(canonical)
+                for a in sorted(aliases):
+                    if a not in ranked:
+                        ranked.append(a)
 
-        for t in transitions:
-            if t["name"].lower() in candidates:
+        for name in ranked:
+            t = by_name.get(name)
+            if t:
                 self._session.post(
                     f"{self.cfg.url}/rest/api/2/issue/{key}/transitions",
                     json={"transition": {"id": t["id"]}},
@@ -280,7 +294,11 @@ class JiraClientV2:
                     # state even though the target transition isn't available.
                     try:
                         live_after = _live_status()
-                        if live_after == target.lower() or live_after in _TERMINAL:
+                        # Guard with "!= current_status" so a ticket that started
+                        # at a terminal-named status and never moved is not
+                        # reported as a successful (silent) no-op.
+                        if (live_after == target.lower()
+                                or (live_after in _TERMINAL and live_after != current_status)):
                             break
                     except Exception:
                         pass

@@ -255,10 +255,6 @@ function renderJobList() {
       ? `${filteredRem.length} of ${remJobs.length}`
       : remJobs.length;
 
-    const remPill = (active) =>
-      `style="padding:2px 8px;font-size:10px;border-radius:10px;border:1px solid var(--border);cursor:pointer;` +
-      `background:${active ? 'var(--cyan)' : 'var(--bg3)'};color:${active ? '#000' : 'var(--text-dim)'};font-weight:${active ? '600' : '400'}"`;
-
     const remQueuedIds = filteredRem.filter(j => j.status === 'queued' && j.triage !== 'closed').map(j => j.id);
     const allRemChecked = remQueuedIds.length > 0 && remQueuedIds.every(id => state.checkedIds.has(id));
 
@@ -274,14 +270,16 @@ function renderJobList() {
     </div>`;
 
     if (state.remExpanded) {
-      html += `<div style="padding:5px 8px;border-bottom:1px solid var(--border);background:var(--bg2);display:flex;gap:5px;align-items:center;">
-        <button ${remPill(rtf === 'all')}    onclick="setRemTypeFilter('all')">All (${remJobs.length})</button>
-        <button ${remPill(rtf === 'auto')}   onclick="setRemTypeFilter('auto')">⚡ Auto-scan (${autoRemCount})</button>
-        <button ${remPill(rtf === 'manual')} onclick="setRemTypeFilter('manual')">🖐 Manual (${manualRemCount})</button>
-        <input type="text" id="remSearchInput" placeholder="Search IP, Key, or Name..." 
-               value="${escHtml(state.remSearch || '')}"
-               oninput="setRemSearch(this.value)"
-               style="margin-left:auto; width: 180px; padding: 2px 6px; font-size: 11px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg1); color: var(--text);">
+      html += `<div class="qfilter-bar">
+        <div class="qfilter-group">
+          ${_qpill({ label: 'All',       count: remJobs.length, active: rtf === 'all',    onclick: "setRemTypeFilter('all')" })}
+          ${_qpill({ label: 'Auto-scan', emoji: '⚡', count: autoRemCount,   active: rtf === 'auto',   onclick: "setRemTypeFilter('auto')" })}
+          ${_qpill({ label: 'Manual',    emoji: '🖐', count: manualRemCount, active: rtf === 'manual', onclick: "setRemTypeFilter('manual')" })}
+        </div>
+        <div class="qfilter-search">
+          <input type="text" id="remSearchInput" placeholder="Search IP, Key, or Name…"
+                 value="${escHtml(state.remSearch || '')}" oninput="setRemSearch(this.value)">
+        </div>
       </div>`;
       html += filteredRem.map(renderJobCard).join('');
     }
@@ -300,10 +298,6 @@ function renderJobList() {
       ? `${filteredManual.length} of ${manualJobs.length}`
       : manualJobs.length;
 
-    const manualPill = (active) =>
-      `style="padding:2px 8px;font-size:10px;border-radius:10px;border:1px solid var(--border);cursor:pointer;` +
-      `background:${active ? 'var(--cyan)' : 'var(--bg3)'};color:${active ? '#000' : 'var(--text-dim)'};font-weight:${active ? '600' : '400'}"`;
-
     const manualQueuedIds = filteredManual.filter(j => j.status === 'queued' && j.triage !== 'closed').map(j => j.id);
     const allManualChecked = manualQueuedIds.length > 0 && manualQueuedIds.every(id => state.checkedIds.has(id));
 
@@ -314,16 +308,18 @@ function renderJobList() {
         <label style="display:flex;align-items:center;gap:4px;font-size:10px;font-weight:normal;cursor:pointer;color:var(--text)">
           <input type="checkbox" onchange="toggleSelectAllManual(this.checked, event)" ${allManualChecked ? 'checked' : ''}> Select All
         </label>
-        <button class="btn btn-sm btn-red" style="font-size:10px;padding:2px 8px;margin-left:4px" onclick="clearManualJobs()">🗑 Clear All</button>
+        <button class="btn btn-sm btn-red" style="font-size:11px;padding:2px 7px;margin-left:2px" title="Clear all manual tickets" onclick="clearManualJobs()">🗑</button>
       </div>
       <span style="margin-left:8px;font-size:10px;color:var(--text-dim)">${manualChevron}</span>
     </div>`;
 
     if (state.manualExpanded) {
-      html += `<div style="padding:5px 8px;border-bottom:1px solid var(--border);background:var(--bg2);display:flex;gap:5px">
-        <button ${manualPill(mtf === 'all')}    onclick="setManualTypeFilter('all')">All (${manualJobs.length})</button>
-        <button ${manualPill(mtf === 'auto')}   onclick="setManualTypeFilter('auto')">⚡ Auto-scan (${autoManualCount})</button>
-        <button ${manualPill(mtf === 'manual')} onclick="setManualTypeFilter('manual')">🖐 Manual (${manualManualCount})</button>
+      html += `<div class="qfilter-bar">
+        <div class="qfilter-group">
+          ${_qpill({ label: 'All',       count: manualJobs.length,  active: mtf === 'all',    onclick: "setManualTypeFilter('all')" })}
+          ${_qpill({ label: 'Auto-scan', emoji: '⚡', count: autoManualCount,   active: mtf === 'auto',   onclick: "setManualTypeFilter('auto')" })}
+          ${_qpill({ label: 'Manual',    emoji: '🖐', count: manualManualCount, active: mtf === 'manual', onclick: "setManualTypeFilter('manual')" })}
+        </div>
       </div>`;
       html += filteredManual.map(renderJobCard).join('');
     }
@@ -359,10 +355,6 @@ function renderJobList() {
       ? `${filteredSweep.length} of ${sweepJobs.length}`
       : sweepJobs.length;
 
-    const pillStyle = (active) =>
-      `style="padding:2px 8px;font-size:10px;border-radius:10px;border:1px solid var(--border);cursor:pointer;` +
-      `background:${active ? 'var(--cyan)' : 'var(--bg3)'};color:${active ? '#000' : 'var(--text-dim)'};font-weight:${active ? '600' : '400'}"`;
-
     const sweepQueuedIds = filteredSweep.filter(j => j.status === 'queued' && j.triage !== 'closed').map(j => j.id);
     const allSweepChecked = sweepQueuedIds.length > 0 && sweepQueuedIds.every(id => state.checkedIds.has(id));
 
@@ -371,20 +363,21 @@ function renderJobList() {
         <label style="display:flex;align-items:center;gap:4px;font-size:10px;font-weight:normal;cursor:pointer;color:var(--text)">
           <input type="checkbox" onchange="toggleSelectAllSweep(this.checked, event)" ${allSweepChecked ? 'checked' : ''}> Select All
         </label>
-        <button class="btn btn-sm btn-red" style="font-size:10px;padding:2px 8px;margin-left:4px" onclick="clearSweepJobs()">🗑 Clear All</button>
+        <button class="btn btn-sm btn-red" style="font-size:11px;padding:2px 7px;margin-left:2px" title="Clear all sweep tickets" onclick="clearSweepJobs()">🗑</button>
       </div>
     </div>`;
-    html += `<div style="padding:5px 8px;border-bottom:1px solid var(--border);background:var(--bg2);display:flex;flex-direction:column;gap:5px">
-      <input id="sweepSearchInput" type="text" placeholder="Filter sweep tickets…" autocomplete="off"
-             value="${escHtml(state.sweepSearch)}"
-             style="width:100%;box-sizing:border-box;padding:4px 8px;font-size:11px;border:1px solid var(--border);border-radius:4px;background:var(--bg3);color:var(--text)">
-      <div style="display:flex;gap:5px;flex-wrap:wrap">
-        <button ${pillStyle(tf === 'all')}          onclick="setSweepTypeFilter('all')">All (${sweepJobs.length})</button>
-        <button ${pillStyle(tf === 'auto')}         onclick="setSweepTypeFilter('auto')">⚡ Auto-scan (${autoCount})</button>
-        <button ${pillStyle(tf === 'manual')}       onclick="setSweepTypeFilter('manual')">🖐 Manual (${manualCount})</button>
-        ${fixedCount        ? `<button ${pillStyle(tf === 'fixed')}        onclick="setSweepTypeFilter('fixed')">✅ Fixed (${fixedCount})</button>` : ''}
-        ${notFixedCount     ? `<button ${pillStyle(tf === 'not_fixed')}    onclick="setSweepTypeFilter('not_fixed')">❌ Not Fixed (${notFixedCount})</button>` : ''}
-        ${inconclusiveCount ? `<button ${pillStyle(tf === 'inconclusive')} onclick="setSweepTypeFilter('inconclusive')">⚪ Inconclusive (${inconclusiveCount})</button>` : ''}
+    html += `<div class="qfilter-bar">
+      <div class="qfilter-search full">
+        <input id="sweepSearchInput" type="text" placeholder="Filter sweep tickets…" autocomplete="off"
+               value="${escHtml(state.sweepSearch)}">
+      </div>
+      <div class="qfilter-group">
+        ${_qpill({ label: 'All',       count: sweepJobs.length, active: tf === 'all',    onclick: "setSweepTypeFilter('all')" })}
+        ${_qpill({ label: 'Auto-scan', emoji: '⚡', count: autoCount,   active: tf === 'auto',   onclick: "setSweepTypeFilter('auto')" })}
+        ${_qpill({ label: 'Manual',    emoji: '🖐', count: manualCount, active: tf === 'manual', onclick: "setSweepTypeFilter('manual')" })}
+        ${fixedCount        ? _qpill({ label: 'Fixed',        emoji: '✅', count: fixedCount,        active: tf === 'fixed',        onclick: "setSweepTypeFilter('fixed')",        flavor: 'fixed' })    : ''}
+        ${notFixedCount     ? _qpill({ label: 'Not Fixed',    emoji: '❌', count: notFixedCount,     active: tf === 'not_fixed',    onclick: "setSweepTypeFilter('not_fixed')",    flavor: 'notfixed' }) : ''}
+        ${inconclusiveCount ? _qpill({ label: 'Inconclusive', emoji: '⚪', count: inconclusiveCount, active: tf === 'inconclusive', onclick: "setSweepTypeFilter('inconclusive')", flavor: 'incl' })     : ''}
       </div>
     </div>`;
     if (visibleSweep.length) {
@@ -1075,24 +1068,24 @@ function renderDetail(jobId) {
         <div class="detail-meta">
           <div class="meta-item">
             <span class="meta-label">IP</span>
-            <span class="meta-value">${job.ip || '—'}</span>
+            <span class="meta-value">${escHtml(job.ip) || '—'}</span>
           </div>
           <div class="meta-item">
             <span class="meta-label">Port</span>
-            <span class="meta-value">${job.port || '—'}</span>
+            <span class="meta-value">${escHtml(job.port) || '—'}</span>
           </div>
           <div class="meta-item">
             <span class="meta-label">CVSS</span>
-            <span class="meta-value ${sevClass}">${job.ticket_cvss || '—'}</span>
+            <span class="meta-value ${sevClass}">${escHtml(job.ticket_cvss) || '—'}</span>
           </div>
           <div class="meta-item">
             <span class="meta-label">Severity</span>
-            <span class="meta-value ${sevClass}">${job.ticket_severity || '—'}</span>
+            <span class="meta-value ${sevClass}">${escHtml(job.ticket_severity) || '—'}</span>
           </div>
           <div class="meta-item">
             <span class="meta-label">TestType</span>
             <span class="meta-value" style="color:${job.ticket_testtype && ['SCN','IPT'].includes(job.ticket_testtype) ? 'var(--cyan)' : 'var(--yellow,#e6a817)'};font-size:10px">
-              ${job.ticket_testtype || '—'}
+              ${escHtml(job.ticket_testtype) || '—'}
               ${job.status === 'manual' ? ' · 🖐 Manual' : ' · ⚡ Auto'}
             </span>
           </div>
@@ -1213,7 +1206,8 @@ function openStream(jobId) {
   state.activeStreams[jobId] = es;
 
   es.onmessage = (e) => {
-    const data = JSON.parse(e.data);
+    let data;
+    try { data = JSON.parse(e.data); } catch { return; }
     if (data.line !== undefined) {
       appendTerminalLine(jobId, data.line);
     }
@@ -1248,19 +1242,28 @@ function openStream(jobId) {
   };
 }
 
+const TERMINAL_MAX_LINES = 5000;
+
 function appendTerminalLine(jobId, line) {
-  // Update in-memory job
+  // Update in-memory job, capping retained lines so a long/verbose scan can't
+  // grow the array (and its serialized copies) without bound for the session.
   if (state.jobs[jobId]) {
-    state.jobs[jobId].output_lines = state.jobs[jobId].output_lines || [];
-    state.jobs[jobId].output_lines.push(line);
+    const lines = state.jobs[jobId].output_lines || (state.jobs[jobId].output_lines = []);
+    lines.push(line);
+    if (lines.length > TERMINAL_MAX_LINES) {
+      lines.splice(0, lines.length - TERMINAL_MAX_LINES);
+    }
   }
-  // Append to live terminal if visible
+  // Append to live terminal if visible, capping rendered nodes to match.
   const term = document.getElementById(`terminal-${jobId}`);
   if (term) {
     const div = document.createElement('div');
     div.className = lineClass(line);
     div.textContent = line;
     term.appendChild(div);
+    while (term.childElementCount > TERMINAL_MAX_LINES) {
+      term.removeChild(term.firstChild);
+    }
     term.scrollTop = term.scrollHeight;
   }
 }
@@ -1834,22 +1837,41 @@ function renderSshPanel(status) {
   body.innerHTML = rows || '<div style="padding:8px 12px;font-size:11px;color:var(--text-dim)">No clients configured</div>';
 }
 
-async function sshConnect(label) {
-  // Optimistically show connecting state
-  const status = await (await fetch('/api/ssh/status')).json();
-  status[label] = 'connecting';
-  renderSshPanel(status);
+const _sshConnectPolls = {};
 
-  await fetch(`/api/ssh/${label}/connect`, { method: 'POST' });
-  // Poll until status changes from connecting
+async function sshConnect(label) {
+  try {
+    // Optimistically show connecting state
+    const status = await (await fetch('/api/ssh/status')).json();
+    status[label] = 'connecting';
+    renderSshPanel(status);
+
+    await fetch(`/api/ssh/${label}/connect`, { method: 'POST' });
+  } catch (e) {
+    console.warn('SSH connect failed to start:', e);
+    showToast('Could not reach the server to start the connection.', 'error');
+    return;
+  }
+
+  // Clear any existing poll for this label so a double-click doesn't leave two
+  // intervals running forever.
+  if (_sshConnectPolls[label]) clearInterval(_sshConnectPolls[label]);
+
   let tries = 0;
-  const poll = setInterval(async () => {
+  _sshConnectPolls[label] = setInterval(async () => {
     tries++;
-    const s = await (await fetch('/api/ssh/status')).json();
-    renderSshPanel(s);
-    if (s[label] !== 'connecting' || tries > 30) {
-      clearInterval(poll);
-      fetchLogs();
+    try {
+      const s = await (await fetch('/api/ssh/status')).json();
+      renderSshPanel(s);
+      if (s[label] !== 'connecting' || tries > 30) {
+        clearInterval(_sshConnectPolls[label]);
+        delete _sshConnectPolls[label];
+        fetchLogs();
+      }
+    } catch (e) {
+      // Network blip while polling — stop the timer instead of spinning on errors.
+      clearInterval(_sshConnectPolls[label]);
+      delete _sshConnectPolls[label];
     }
   }, 1000);
 }
@@ -1904,8 +1926,24 @@ $('transitionModal').addEventListener('click', e => { if (e.target === $('transi
 
 // ── Utils ─────────────────────────────────────────────────────────────────
 function escHtml(s) {
-  if (!s) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  // Only treat null/undefined as empty — a legitimate 0 (port, count) must render.
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+/**
+ * Render one segmented-control filter pill for the queue toolbars.
+ * @param {object} o - { label, emoji, count, active, onclick, flavor }
+ *   flavor: '' | 'fixed' | 'notfixed' | 'incl' (adds a verdict color when active)
+ */
+function _qpill(o) {
+  const flavorClass = o.flavor ? `qf-${o.flavor}` : '';
+  const emoji = o.emoji ? `<span class="qf-emoji">${o.emoji}</span>` : '';
+  return `<button type="button" class="qfilter-pill ${o.active ? 'active' : ''} ${flavorClass}" onclick="${o.onclick}">`
+    + `${emoji}<span>${escHtml(o.label)}</span>`
+    + `<span class="qf-count">${o.count}</span></button>`;
 }
 function truncate(s, n) {
   if (!s) return '';
@@ -2214,8 +2252,10 @@ function switchTab(tab) {
 
   // Intake view
   const iv = $('intakeView');
-  if (iv) iv.style.display = isIntake ? 'block' : 'none';
-  iv.style.flexDirection = 'column';
+  if (iv) {
+    iv.style.display = isIntake ? 'block' : 'none';
+    iv.style.flexDirection = 'column';
+  }
 
   if (isReport) initReportControls();
   if (isWeekly) initWeeklyReportControls();
@@ -2408,31 +2448,56 @@ async function onNessusFolderToggle(folderId, checked) {
 
 let _nessusHostCountDebounce = null;
 function _updateNessusPullBtn() {
-  const checked = document.querySelectorAll('.nessus-scan-check:checked');
+  const checked = [...document.querySelectorAll('.nessus-scan-check:checked')];
   const any = checked.length > 0;
   $('nessusPullBtn').disabled = !any;
-  if (!any) { 
-    $('nessusHostCount').textContent = ''; 
-    if (_nessusHostCountDebounce) clearTimeout(_nessusHostCountDebounce);
-    return; 
+  if (_nessusHostCountDebounce) { clearTimeout(_nessusHostCountDebounce); _nessusHostCountDebounce = null; }
+  if (!any) {
+    $('nessusHostCount').textContent = '';
+    return;
   }
 
-  // Show loading then fetch actual count from Nessus scan details
-  $('nessusHostCount').textContent = '🖥 counting hosts…';
-  const label   = $('assetsClient').value;
-  const scanIds = Array.from(checked).map(cb => parseInt(cb.value, 10));
-  
-  if (_nessusHostCountDebounce) clearTimeout(_nessusHostCountDebounce);
+  // Fast path: the scan list already gives us total_hosts per scan (stored in
+  // the checkbox's data-hosts attribute). Sum those on the client instantly —
+  // no server round-trip, no re-fetching full scan details over SSH.
+  let knownSum = 0;
+  const unknownIds = [];
+  for (const cb of checked) {
+    const h = parseInt(cb.getAttribute('data-hosts') || '0', 10);
+    if (h > 0) knownSum += h;
+    else unknownIds.push(parseInt(cb.value, 10));  // incomplete/unknown → ask server
+  }
+
+  // Every selected scan had a known count → done, zero network calls.
+  if (unknownIds.length === 0) {
+    $('nessusHostCount').textContent = `🖥 ${knownSum.toLocaleString()} hosts in selected scans`;
+    return;
+  }
+
+  // Some scans have no cached count (e.g. incomplete runs needing a history
+  // fallback). Show what we know immediately, then resolve just the unknowns.
+  $('nessusHostCount').textContent = knownSum > 0
+    ? `🖥 ${knownSum.toLocaleString()}+ hosts (counting ${unknownIds.length} scan${unknownIds.length > 1 ? 's' : ''}…)`
+    : '🖥 counting hosts…';
+
+  const label = $('assetsClient').value;
   _nessusHostCountDebounce = setTimeout(() => {
     fetch(`/api/nessus/${encodeURIComponent(label)}/host-count`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scan_ids: scanIds }),
+      body: JSON.stringify({ scan_ids: unknownIds }),
     })
     .then(r => r.json())
-    .then(d => { $('nessusHostCount').textContent = `🖥 ${(d.total_hosts || 0).toLocaleString()} hosts in selected scans`; })
-    .catch(() => { $('nessusHostCount').textContent = ''; });
-  }, 600);
+    .then(d => {
+      const total = knownSum + (d.total_hosts || 0);
+      $('nessusHostCount').textContent = `🖥 ${total.toLocaleString()} hosts in selected scans`;
+    })
+    .catch(() => {
+      $('nessusHostCount').textContent = knownSum > 0
+        ? `🖥 ${knownSum.toLocaleString()}+ hosts in selected scans`
+        : '';
+    });
+  }, 400);
 }
 
 const NESSUS_PORT = 8834;
@@ -2578,17 +2643,41 @@ function renderAssetsResults(data) {
   // Store result on the element for the download handler
   $('assetsResults')._lastResult = data;
 
+  const hasUnresolved = (c.unresolved || 0) > 0;
+  // Scope coverage: how many provided scope entries had at least one host found.
+  const coverage = (c.total_scope || 0) > 0
+    ? `${c.reachable_scope || 0} of ${c.total_scope} scope entries reached`
+    : '';
+
+  const unresolvedSummaryCard = hasUnresolved ? `
+      <div class="report-card" style="padding:14px">
+        <div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Unresolved</div>
+        <div style="font-size:32px;font-weight:700;color:var(--red)">${c.unresolved}</div>
+        <div style="font-size:11px;color:var(--text-dim)">scanned hosts reported by name (not an IP) — match manually</div>
+      </div>` : '';
+
+  const unresolvedDetailCard = hasUnresolved ? `
+      <div class="report-card" style="padding:14px">
+        <div style="font-size:11px;font-weight:600;color:var(--red);margin-bottom:10px">❓ Unresolved — Not an IP (${c.unresolved})</div>
+        <div style="line-height:2">${ipChips(data.unresolved, 'var(--red)')}</div>
+      </div>` : '';
+
+  const summaryCols = hasUnresolved ? 4 : 3;
+
   const html = `
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
-      <span style="font-size:13px;font-weight:600;color:var(--text)">Cross-Reference Results</span>
+      <div>
+        <span style="font-size:13px;font-weight:600;color:var(--text)">Cross-Reference Results</span>
+        ${coverage ? `<span style="font-size:11px;color:var(--text-dim);margin-left:10px">${coverage} · ${c.total_scanned || 0} hosts scanned</span>` : ''}
+      </div>
       <button class="btn btn-secondary btn-sm" onclick="downloadAssetsCSV()">⬇ Download CSV</button>
     </div>
 
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px">
+    <div style="display:grid;grid-template-columns:repeat(${summaryCols},1fr);gap:12px;margin-bottom:16px">
       <div class="report-card" style="padding:14px">
         <div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Reachable (In Scope)</div>
         <div style="font-size:32px;font-weight:700;color:var(--green)">${c.reachable || 0}</div>
-        <div style="font-size:11px;color:var(--text-dim)">scope entries with hosts found by Nessus</div>
+        <div style="font-size:11px;color:var(--text-dim)">in-scope hosts found by Nessus</div>
       </div>
       <div class="report-card" style="padding:14px">
         <div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Not Reachable (In Scope)</div>
@@ -2600,9 +2689,10 @@ function renderAssetsResults(data) {
         <div style="font-size:32px;font-weight:700;color:var(--purple)">${c.out_of_scope || 0}</div>
         <div style="font-size:11px;color:var(--text-dim)">hosts Nessus found outside scope</div>
       </div>
+      ${unresolvedSummaryCard}
     </div>
 
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+    <div style="display:grid;grid-template-columns:repeat(${summaryCols},1fr);gap:12px">
       <div class="report-card" style="padding:14px">
         <div style="font-size:11px;font-weight:600;color:var(--green);margin-bottom:10px">✅ Reachable — In Scope (${c.reachable || 0})</div>
         <div style="line-height:2">${ipChips(data.reachable, 'var(--green)')}</div>
@@ -2615,6 +2705,7 @@ function renderAssetsResults(data) {
         <div style="font-size:11px;font-weight:600;color:var(--purple);margin-bottom:10px">🔍 Out of Scope (${c.out_of_scope || 0})</div>
         <div style="line-height:2">${ipChips(data.out_of_scope, 'var(--purple)')}</div>
       </div>
+      ${unresolvedDetailCard}
     </div>`;
 
   $('assetsResults').innerHTML = html;
@@ -2629,6 +2720,7 @@ function downloadAssetsCSV() {
   (data.reachable     || []).forEach(ip => rows.push([ip, 'Reachable - In Scope']));
   (data.not_reachable || []).forEach(ip => rows.push([ip, 'Not Reachable - In Scope']));
   (data.out_of_scope  || []).forEach(ip => rows.push([ip, 'Out of Scope']));
+  (data.unresolved    || []).forEach(ip => rows.push([ip, 'Unresolved - Not an IP']));
 
   const csv  = rows.map(r => r.join(',')).join('\n');
   const blob = new Blob([csv], { type: 'text/csv' });
@@ -2725,6 +2817,16 @@ function renderReport(d) {
     return ['critical', 'high', 'medium', 'low'].includes(v) ? `rating-${v}` : '';
   }
 
+  function statusClass(it) {
+    const s = (it.status || '').toLowerCase().trim();
+    if (['fixed', 'closed', 'done', 'resolved'].includes(s)) return 'status-fixed';
+    if (s === 'not fixed') return 'status-not-fixed';
+    if (['risk accepted', 'accepted risk'].includes(s)) return 'status-risk-accepted';
+    if (['remediated', 'in progress'].includes(s)) return 'status-progress';
+    if (s === 'reported') return 'status-reported';
+    return 'status-other';
+  }
+
   function vulnTable() {
     const sub = nv.is_sample
       ? `No tickets created in ${monthName} ${year} — random sample of currently open vulnerabilities`
@@ -2736,13 +2838,14 @@ function renderReport(d) {
           <td class="vuln-key">${escHtml(it.key)}</td>
           <td class="vuln-ip">${escHtml(it.ip || '—')}</td>
           <td class="vuln-rating ${ratingClass(it.rating)}">${escHtml(it.rating || '—')}</td>
+          <td class="vuln-status ${statusClass(it)}" title="${escHtml(it.status_label || '')}">${escHtml(it.status || '—')}</td>
         </tr>`).join('')
-      : `<tr><td colspan="4" class="report-vuln-empty">No vulnerabilities to show</td></tr>`;
+      : `<tr><td colspan="5" class="report-vuln-empty">No vulnerabilities to show</td></tr>`;
     return `
       <div class="report-vuln-card">
         <div class="report-card-header">New Discovered Vulnerabilities<div class="report-card-sub">${escHtml(sub)}</div></div>
         <table class="report-vuln-table">
-          <thead><tr><th>Vulnerability</th><th>Issue Key</th><th>IP Address</th><th>Rating</th></tr></thead>
+          <thead><tr><th>Vulnerability</th><th>Issue Key</th><th>IP Address</th><th>Rating</th><th>Status</th></tr></thead>
           <tbody>${bodyHtml}</tbody>
         </table>
       </div>`;
@@ -2895,6 +2998,16 @@ function renderWeeklyReport(d) {
     return ['critical', 'high', 'medium', 'low'].includes(v) ? `rating-${v}` : '';
   }
 
+  function statusClass(it) {
+    const s = (it.status || '').toLowerCase().trim();
+    if (['fixed', 'closed', 'done', 'resolved'].includes(s)) return 'status-fixed';
+    if (s === 'not fixed') return 'status-not-fixed';
+    if (['risk accepted', 'accepted risk'].includes(s)) return 'status-risk-accepted';
+    if (['remediated', 'in progress'].includes(s)) return 'status-progress';
+    if (s === 'reported') return 'status-reported';
+    return 'status-other';
+  }
+
   function vulnTable() {
     const sub = nv.is_sample
       ? `No tickets created this week — random sample of currently open vulnerabilities`
@@ -2906,13 +3019,14 @@ function renderWeeklyReport(d) {
           <td class="vuln-key">${escHtml(it.key)}</td>
           <td class="vuln-ip">${escHtml(it.ip || '—')}</td>
           <td class="vuln-rating ${ratingClass(it.rating)}">${escHtml(it.rating || '—')}</td>
+          <td class="vuln-status ${statusClass(it)}" title="${escHtml(it.status_label || '')}">${escHtml(it.status || '—')}</td>
         </tr>`).join('')
-      : `<tr><td colspan="4" class="report-vuln-empty">No vulnerabilities to show</td></tr>`;
+      : `<tr><td colspan="5" class="report-vuln-empty">No vulnerabilities to show</td></tr>`;
     return `
       <div class="report-vuln-card">
         <div class="report-card-header">New Discovered Vulnerabilities<div class="report-card-sub">${escHtml(sub)}</div></div>
         <table class="report-vuln-table">
-          <thead><tr><th>Vulnerability</th><th>Issue Key</th><th>IP Address</th><th>Rating</th></tr></thead>
+          <thead><tr><th>Vulnerability</th><th>Issue Key</th><th>IP Address</th><th>Rating</th><th>Status</th></tr></thead>
           <tbody>${bodyHtml}</tbody>
         </table>
       </div>`;
@@ -3209,7 +3323,9 @@ async function initBatchScan() {
     });
     _batchRulesLoaded = true;
   } catch (e) {
-    log.warn('Could not load scan rules:', e);
+    console.warn('Could not load scan rules:', e);
+    const sel = $('batchRule');
+    if (sel) sel.innerHTML = '<option value="">Failed to load rules — retry</option>';
   }
 }
 
@@ -3471,6 +3587,58 @@ let _shellTerm = null;
 let _shellFit = null;
 let _shellSocket = null;
 let _shellResizeListenerAdded = false;
+let _shellResizeObserver = null;
+let _shellFitDebounce = null;
+let _shellLastSent = { cols: 0, rows: 0 };   // last dims sent to the PTY
+
+function _shellViewVisible() {
+  const v = $('shellView');
+  return v && v.style.display !== 'none';
+}
+
+// Fit the terminal to its container and, only when the size actually changed,
+// tell the remote PTY. Sending a resize on every call made bash reprint its
+// prompt over and over (the stacked blank prompts). Returns true once a real
+// fit has been applied (renderer ready), false to request a retry.
+function _shellFitAndSync() {
+  if (!_shellTerm || !_shellFit || !_shellViewVisible()) return false;
+  const el = $('shellTerminalContainer');
+  if (!el || el.clientWidth < 20 || el.clientHeight < 20) return false;
+
+  // FitAddon.proposeDimensions() returns undefined/NaN until xterm has painted
+  // (cell size still 0). Don't let fit() silently no-op — signal a retry.
+  let dims;
+  try { dims = _shellFit.proposeDimensions(); } catch (e) { dims = null; }
+  if (!dims || !dims.rows || !dims.cols || isNaN(dims.rows) || isNaN(dims.cols)) {
+    return false;
+  }
+
+  try { _shellFit.fit(); } catch (e) { return false; }
+
+  const cols = _shellTerm.cols, rows = _shellTerm.rows;
+  if (_shellSocket && _shellSocket.readyState === WebSocket.OPEN
+      && (cols !== _shellLastSent.cols || rows !== _shellLastSent.rows)) {
+    _shellSocket.send(JSON.stringify({ type: 'resize', cols, rows }));
+    _shellLastSent = { cols, rows };
+  }
+  try { _shellTerm.scrollToBottom(); } catch (e) { /* older xterm */ }
+  return true;
+}
+
+// Retry until the renderer is ready (cell dims known) so the terminal never
+// gets stuck at the default 80x24 on a small viewport.
+function _shellFitRetry(attempts = 15) {
+  if (_shellFitAndSync()) return;
+  if (attempts <= 0) return;
+  setTimeout(() => requestAnimationFrame(() => _shellFitRetry(attempts - 1)), 50);
+}
+
+// Debounced so a burst of resize/observer events collapses into one fit —
+// prevents the fit→resize→observer feedback loop that stacked prompts.
+function _scheduleShellFit() {
+  if (_shellFitDebounce) clearTimeout(_shellFitDebounce);
+  _shellFitDebounce = setTimeout(() => requestAnimationFrame(() => _shellFitRetry()), 120);
+}
 
 function initShellTab() {
   // Options are kept in sync by _syncClientDropdowns() via fetchClients().
@@ -3479,14 +3647,14 @@ function initShellTab() {
     _shellTerm = new Terminal({
       cursorBlink: true,
       fontSize: 13,
-      fontFamily: 'Menlo, Consolas, monospace',
+      fontFamily: 'Menlo, Consolas, "DejaVu Sans Mono", monospace',
       theme: { background: '#0d1117', foreground: '#e6edf3' },
-      scrollback: 5000,
+      scrollback: 10000,
+      scrollOnUserInput: true,
     });
     _shellFit = new FitAddon.FitAddon();
     _shellTerm.loadAddon(_shellFit);
     _shellTerm.open($('shellTerminalContainer'));
-    _shellFit.fit();
 
     _shellTerm.onData((data) => {
       if (_shellSocket && _shellSocket.readyState === WebSocket.OPEN) {
@@ -3495,15 +3663,24 @@ function initShellTab() {
     });
 
     if (!_shellResizeListenerAdded) {
-      window.addEventListener('resize', () => {
-        if (_shellTerm && $('shellView').style.display !== 'none') _shellFit.fit();
-      });
+      window.addEventListener('resize', _scheduleShellFit);
       _shellResizeListenerAdded = true;
     }
-  } else {
-    _shellFit.fit();
+    // Observe the OUTER card, not the terminal container: FitAddon resizes the
+    // .xterm element inside the container, so observing the container itself
+    // would re-trigger on our own fit and loop. The card has a fixed height, so
+    // it only changes when the window/layout genuinely changes.
+    if (window.ResizeObserver && !_shellResizeObserver) {
+      const card = document.querySelector('.shell-terminal-card');
+      if (card) {
+        _shellResizeObserver = new ResizeObserver(_scheduleShellFit);
+        _shellResizeObserver.observe(card);
+      }
+    }
   }
 
+  // The container just became visible on tab switch; fit once layout settles.
+  _scheduleShellFit();
   startTunnelPolling();
 }
 
@@ -3524,6 +3701,7 @@ function connectShell() {
   }
 
   _shellTerm.reset();
+  _shellLastSent = { cols: 0, rows: 0 };  // force a resize send on this session
   status.textContent = `Connecting to ${label}…`;
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -3531,16 +3709,23 @@ function connectShell() {
   _shellSocket = ws;
 
   ws.onopen = () => {
-    _shellFit.fit();
-    ws.send(JSON.stringify({ type: 'resize', cols: _shellTerm.cols, rows: _shellTerm.rows }));
+    // Fit first (retrying until the renderer is ready) so the PTY starts at the
+    // correct dims and the prompt isn't rendered below the visible area.
+    _shellFitRetry();
     status.textContent = `Connected to ${label}`;
     _setShellConnectedUi(true);
+    _shellTerm.focus();
   };
 
   ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
     if (msg.type === 'output') {
-      _shellTerm.write(msg.data);
+      // write() is async in newer xterm — scroll after the buffer settles so
+      // large dumps (e.g. `history`) leave the prompt visible, not clipped.
+      _shellTerm.write(msg.data, () => {
+        try { _shellTerm.scrollToBottom(); } catch (err) { /* ignore */ }
+      });
     } else if (msg.type === 'error') {
       _shellTerm.write(`\r\n\x1b[31m[ERROR] ${msg.data}\x1b[0m\r\n`);
       status.textContent = 'Error';
@@ -3596,15 +3781,17 @@ async function startTunnel() {
   const target = $('tunnelTarget').value.trim();
   const localPortRaw = $('tunnelLocalPort').value.trim();
 
-  if (!label) { alert('Select a client first.'); return; }
+  if (!label) { showToast('Select a client first', 'warn'); return; }
   const m = target.match(/^([^:\s]+):(\d+)$/);
-  if (!m) { alert('Target must be host:port, e.g. 127.0.0.1:8080'); return; }
+  if (!m) { showToast('Target must be host:port, e.g. 127.0.0.1:8080', 'warn'); return; }
 
   // Left blank → default to the same port locally, so pasting just
   // "host:port" into the target field is enough to start a tunnel.
   const localPort = localPortRaw ? parseInt(localPortRaw, 10) : parseInt(m[2], 10);
-  if (!localPort || localPort < 1 || localPort > 65535) { alert('Enter a valid local port (1-65535).'); return; }
+  if (!localPort || localPort < 1 || localPort > 65535) { showToast('Enter a valid local port (1–65535)', 'warn'); return; }
 
+  const btn = document.querySelector('.pf-start-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
   try {
     const resp = await fetch('/api/tunnels', {
       method: 'POST',
@@ -3617,12 +3804,15 @@ async function startTunnel() {
       }),
     });
     const data = await resp.json();
-    if (!resp.ok) { alert(data.detail || 'Failed to start tunnel'); return; }
+    if (!resp.ok) { showToast(data.detail || 'Failed to start tunnel', 'error'); return; }
     $('tunnelTarget').value = '';
     $('tunnelLocalPort').value = '';
+    showToast(`Tunnel started on localhost:${localPort}`, 'success');
     refreshTunnels();
   } catch (exc) {
-    alert(`Error: ${exc}`);
+    showToast(`Error: ${exc.message || exc}`, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Start Tunnel'; }
   }
 }
 
@@ -3633,6 +3823,7 @@ async function stopTunnel(tunnelId) {
   refreshTunnels();
 }
 
+let _lastTunnelSig = null;
 async function refreshTunnels() {
   let tunnels;
   try {
@@ -3645,35 +3836,54 @@ async function refreshTunnels() {
 
   const list = $('tunnelList');
   if (!list) return;
-  list.innerHTML = '';
 
-  if (tunnels.length === 0) {
-    list.innerHTML = '<div style="font-size:11px;color:var(--text-dim)">No active tunnels.</div>';
+  // Only touch the DOM when something actually changed — avoids the 2s poll
+  // wiping the list mid-click and causing flicker.
+  const sig = JSON.stringify(tunnels.map(t =>
+    [t.id, t.status, t.local_port, t.target_host, t.target_port, t.error || '']));
+  if (sig === _lastTunnelSig) return;
+  _lastTunnelSig = sig;
+
+  if (!tunnels.length) {
+    list.innerHTML = '<div class="pf-empty">No active tunnels.</div>';
     return;
   }
 
-  tunnels.forEach((t) => {
-    const row = document.createElement('div');
-    row.style.cssText = 'display:flex;align-items:center;gap:10px;font-size:12px;padding:8px 12px;background:var(--bg3);border-radius:6px;flex-wrap:wrap';
-    const statusColor = t.status === 'listening' ? 'var(--green)'
-      : t.status === 'error' ? 'var(--red)'
-      : 'var(--text-dim)';
-
-    const openLink = t.status === 'listening'
-      ? `<a href="http://localhost:${t.local_port}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">Open</a>`
+  // Map every backend status to a visual class + label. The backend uses
+  // "connecting" while the double-hop SSH is being established.
+  const statusMap = {
+    listening:  { cls: 'listening', text: 'Listening' },
+    error:      { cls: 'error',     text: 'Error' },
+    connecting: { cls: 'starting',  text: 'Connecting' },
+    starting:   { cls: 'starting',  text: 'Starting' },
+    stopped:    { cls: 'stopped',   text: 'Stopped' },
+  };
+  list.innerHTML = tunnels.map((t) => {
+    const raw = t.status || 'connecting';
+    const info = statusMap[raw] || { cls: 'starting', text: raw };
+    const openBtn = raw === 'listening'
+      ? `<a href="http://localhost:${encodeURIComponent(t.local_port)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">↗ Open</a>`
       : '';
-    const errorSpan = t.error ? `<span style="color:var(--red);font-size:11px">${t.error}</span>` : '';
-
-    row.innerHTML = `
-      <span style="color:${statusColor};font-weight:600;min-width:70px">${t.status}</span>
-      <span style="font-weight:600">${t.label}</span>
-      <span style="color:var(--text-dim)">localhost:${t.local_port} &rarr; ${t.target_host}:${t.target_port}</span>
-      ${openLink}
-      ${errorSpan}
-      <button class="btn btn-red btn-sm" style="margin-left:auto" onclick="stopTunnel('${t.id}')">⏹ Stop</button>
-    `;
-    list.appendChild(row);
-  });
+    const errorSpan = t.error
+      ? `<span class="tunnel-error" title="${escHtml(t.error)}">${escHtml(t.error)}</span>`
+      : '';
+    return `
+      <div class="tunnel-row tunnel-${info.cls}">
+        <span class="tunnel-dot"></span>
+        <span class="tunnel-status">${escHtml(info.text)}</span>
+        <span class="tunnel-label">${escHtml(t.label)}</span>
+        <span class="tunnel-route">
+          <code>localhost:${escHtml(t.local_port)}</code>
+          <span class="tunnel-arrow">→</span>
+          <code>${escHtml(t.target_host)}:${escHtml(t.target_port)}</code>
+        </span>
+        ${errorSpan}
+        <span class="tunnel-actions">
+          ${openBtn}
+          <button class="btn btn-red btn-sm" onclick="stopTunnel('${escHtml(t.id)}')">⏹ Stop</button>
+        </span>
+      </div>`;
+  }).join('');
 }
 
 // ── Settings Tab ──────────────────────────────────────────────────────────
@@ -3877,9 +4087,17 @@ function addSettingsClientRow() {
 }
 
 function addSecondaryClientRow() {
-  $('settingsClientRowsSecondary').innerHTML =
-    $('settingsClientRowsSecondary').innerHTML.replace(/<div style="font-size:11px.*?<\/div>/, '');
-  $('settingsClientRowsSecondary').insertAdjacentHTML('beforeend', settingsClientRowHtml({}, 'non_axian'));
+  const container = $('settingsClientRowsSecondary');
+  // Remove only the "no clients yet" placeholder — anything that isn't a real
+  // client row. Re-serializing innerHTML (the old approach) discarded every
+  // value the user had already typed into existing rows, since input values
+  // don't round-trip through .innerHTML.
+  Array.from(container.children).forEach((child) => {
+    if (!child.classList || !child.classList.contains('settings-client-row')) {
+      child.remove();
+    }
+  });
+  container.insertAdjacentHTML('beforeend', settingsClientRowHtml({}, 'non_axian'));
 }
 
 function removeSettingsClientRow(rowId) {
@@ -4051,8 +4269,15 @@ async function saveSettings() {
   await fetchLogs();
   await fetchSshStatus();
 
-  // Poll jobs every 5s, SSH status every 3s, logs every 15s
-  setInterval(fetchJobs,      5_000);
-  setInterval(fetchSshStatus, 3_000);
-  setInterval(fetchLogs,     15_000);
+  // Poll jobs every 5s, SSH status every 3s, logs every 15s.
+  // Skip work while the tab is backgrounded (document.hidden) so we don't burn
+  // CPU/network re-rendering panels the user can't see; refresh immediately when
+  // the tab becomes visible again so data is never stale on return.
+  const pollGuarded = (fn) => () => { if (!document.hidden) fn(); };
+  setInterval(pollGuarded(fetchJobs),      5_000);
+  setInterval(pollGuarded(fetchSshStatus), 3_000);
+  setInterval(pollGuarded(fetchLogs),     15_000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { fetchJobs(); fetchSshStatus(); fetchLogs(); }
+  });
 })();

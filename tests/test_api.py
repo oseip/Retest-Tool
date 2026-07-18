@@ -240,6 +240,60 @@ class TestClearSweepJobs:
 
 
 # ---------------------------------------------------------------------------
+# DELETE /api/poll/jobs
+# ---------------------------------------------------------------------------
+
+class TestClearPollJobs:
+    def test_removes_poll_jobs(self, client):
+        for i in range(3):
+            ticket = make_ticket(key=f"POLL-{i}")
+            scanner._queue_ticket(ticket, "TestClient", source="poll")
+
+        resp = client.delete("/api/poll/jobs")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["removed"] == 3
+
+        remaining_poll = [
+            j for j in scanner.JOBS.values() if j.get("source", "poll") == "poll"
+        ]
+        assert remaining_poll == []
+
+    def test_does_not_remove_sweep_or_manual_jobs(self, client):
+        ticket_poll   = make_ticket(key="POLL-1")
+        ticket_manual = make_ticket(key="MAN-1")
+        ticket_sweep  = make_ticket(key="SWEEP-1")
+
+        scanner._queue_ticket(ticket_poll,   "TestClient", source="poll")
+        scanner._queue_ticket(ticket_manual, "TestClient", source="manual")
+        scanner._queue_ticket(ticket_sweep,  "TestClient", source="sweep")
+
+        resp = client.delete("/api/poll/jobs")
+        assert resp.status_code == 200
+        assert resp.json()["removed"] == 1
+
+        keys_remaining = {j["ticket_key"] for j in scanner.JOBS.values()}
+        assert "POLL-1" not in keys_remaining
+        assert "MAN-1" in keys_remaining
+        assert "SWEEP-1" in keys_remaining
+
+    def test_does_not_remove_scanning_poll_job(self, client):
+        ticket = make_ticket(key="POLL-ACTIVE")
+        job_id = scanner._queue_ticket(ticket, "TestClient", source="poll")
+        scanner.JOBS[job_id]["status"] = "scanning"
+
+        resp = client.delete("/api/poll/jobs")
+        assert resp.status_code == 200
+        assert job_id in scanner.JOBS
+
+    def test_empty_queue_returns_zero_removed(self, client):
+        resp = client.delete("/api/poll/jobs")
+        assert resp.status_code == 200
+        assert resp.json()["removed"] == 0
+
+
+# ---------------------------------------------------------------------------
 # GET /api/logs
 # ---------------------------------------------------------------------------
 
@@ -291,6 +345,41 @@ class TestReportValidation:
     def test_future_month_returns_400(self, client):
         resp = client.get("/api/report?client=TestClient&month=2099-01")
         assert resp.status_code == 400
+
+
+class TestReportItemStatusField:
+    """The report per-ticket item exposes a Fixed / Not Fixed status column."""
+
+    def test_fixed_status_maps_to_fixed_label(self):
+        from src.main import _to_report_item
+        item = _to_report_item({"key": "T-1", "summary": "x", "status": "Fixed"})
+        assert item["status"] == "Fixed"
+        assert item["status_label"] == "Fixed"
+        assert item["is_fixed"] is True
+
+    def test_open_status_maps_to_not_fixed(self):
+        from src.main import _to_report_item
+        item = _to_report_item({"key": "T-2", "summary": "x", "status": "Open"})
+        assert item["status_label"] == "Not Fixed"
+        assert item["is_fixed"] is False
+
+    def test_remediated_is_not_fixed(self):
+        from src.main import _to_report_item
+        item = _to_report_item({"key": "T-3", "summary": "x", "status": "Remediated"})
+        assert item["status_label"] == "Not Fixed"
+
+    def test_risk_accepted_is_its_own_label(self):
+        from src.main import _to_report_item
+        item = _to_report_item({"key": "T-5", "summary": "x", "status": "Risk Accepted"})
+        assert item["status_label"] == "Risk Accepted"
+        assert item["is_fixed"] is False
+        assert item["is_risk_accepted"] is True
+
+    def test_missing_status_is_not_fixed(self):
+        from src.main import _to_report_item
+        item = _to_report_item({"key": "T-4", "summary": "x"})
+        assert item["status_label"] == "Not Fixed"
+        assert item["status"] == "—"
 
 
 # ---------------------------------------------------------------------------

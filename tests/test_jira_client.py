@@ -274,6 +274,27 @@ class TestSearchJqlPagination:
         assert len(results) == 100
         assert client._session.post.call_count == 1
 
+    def test_missing_is_last_continues_when_next_token_present(self):
+        """Jira sometimes omits isLast; pagination must follow nextPageToken."""
+        client = make_client()
+        page1 = MagicMock()
+        page1.raise_for_status.return_value = None
+        page1.json.return_value = {
+            "issues": [{"id": str(i), "key": f"T-{i}"} for i in range(100)],
+            "nextPageToken": "tok-2",
+        }
+        page2 = MagicMock()
+        page2.raise_for_status.return_value = None
+        page2.json.return_value = {
+            "issues": [{"id": "100", "key": "T-100"}],
+            "isLast": True,
+        }
+        client._session.post.side_effect = [page1, page2]
+
+        results = client._search_jql("project = TEST")
+        assert len(results) == 101
+        assert client._session.post.call_count == 2
+
 
 # ---------------------------------------------------------------------------
 # get_sweep_tickets — stale/invalid token behavior
@@ -324,6 +345,61 @@ class TestCountJql:
         assert count == 42
 
 
+
+
+# ---------------------------------------------------------------------------
+# transition() — priority-ordered matching (no wrong-status transitions)
+#
+# Requesting "Fixed" must fire the *literal* Fixed transition when Jira offers
+# it, and must never silently fire an alias like "Done"/"Closed"/"Resolve"
+# just because it appears first in Jira's transition list.
+# ---------------------------------------------------------------------------
+class TestTransitionPriority:
+    def _client_with_transitions(self, transitions):
+        client = make_client()
+        client._j.transitions.return_value = transitions
+        return client
+
+    def test_exact_fixed_wins_over_done_listed_first(self):
+        client = self._client_with_transitions([
+            {"id": "10", "name": "Done"},
+            {"id": "20", "name": "Fixed"},
+        ])
+        client.transition("TEST-1", "Fixed")
+        client._j.transition_issue.assert_called_once_with("TEST-1", "20")
+
+    def test_exact_fixed_wins_over_closed_and_resolve(self):
+        client = self._client_with_transitions([
+            {"id": "1", "name": "Resolve"},
+            {"id": "2", "name": "Closed"},
+            {"id": "3", "name": "Fixed"},
+        ])
+        client.transition("TEST-1", "Fixed")
+        client._j.transition_issue.assert_called_once_with("TEST-1", "3")
+
+    def test_falls_back_to_alias_when_no_exact_match(self):
+        # No literal "Fixed" transition — an alias ("Done") is acceptable.
+        client = self._client_with_transitions([
+            {"id": "99", "name": "Done"},
+        ])
+        client.transition("TEST-1", "Fixed")
+        client._j.transition_issue.assert_called_once_with("TEST-1", "99")
+
+    def test_fix_issue_step_does_not_jump_to_done(self):
+        # Fast-track's intermediate "Fix Issue" step must not fire Done/Fixed.
+        client = self._client_with_transitions([
+            {"id": "5", "name": "Done"},
+            {"id": "6", "name": "Fix Issue"},
+        ])
+        client.transition("TEST-1", "Fix Issue")
+        client._j.transition_issue.assert_called_once_with("TEST-1", "6")
+
+    def test_unavailable_transition_raises(self):
+        client = self._client_with_transitions([
+            {"id": "1", "name": "Start Progress"},
+        ])
+        with pytest.raises(ValueError):
+            client.transition("TEST-1", "Fixed")
 
 
 # ---------------------------------------------------------------------------

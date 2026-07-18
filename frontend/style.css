@@ -780,10 +780,11 @@ textarea:focus { border-color: var(--blue); }
   table-layout: fixed;
   font-size: 13px;
 }
-.report-vuln-table th:nth-child(1), .report-vuln-table td:nth-child(1) { width: 55%; }
-.report-vuln-table th:nth-child(2), .report-vuln-table td:nth-child(2) { width: 17%; }
-.report-vuln-table th:nth-child(3), .report-vuln-table td:nth-child(3) { width: 17%; }
-.report-vuln-table th:nth-child(4), .report-vuln-table td:nth-child(4) { width: 11%; }
+.report-vuln-table th:nth-child(1), .report-vuln-table td:nth-child(1) { width: 46%; }
+.report-vuln-table th:nth-child(2), .report-vuln-table td:nth-child(2) { width: 15%; }
+.report-vuln-table th:nth-child(3), .report-vuln-table td:nth-child(3) { width: 15%; }
+.report-vuln-table th:nth-child(4), .report-vuln-table td:nth-child(4) { width: 10%; }
+.report-vuln-table th:nth-child(5), .report-vuln-table td:nth-child(5) { width: 14%; }
 .report-vuln-table td:nth-child(1) { overflow-wrap: break-word; }
 .report-vuln-table th {
   text-align: left;
@@ -807,6 +808,13 @@ textarea:focus { border-color: var(--blue); }
 .report-vuln-table td.rating-high { color: var(--orange); }
 .report-vuln-table td.rating-medium { color: var(--blue); }
 .report-vuln-table td.rating-low { color: var(--green); }
+.report-vuln-table td.vuln-status { font-weight: 700; white-space: nowrap; }
+.report-vuln-table td.vuln-status.status-fixed { color: var(--green); }
+.report-vuln-table td.vuln-status.status-not-fixed { color: var(--red); }
+.report-vuln-table td.vuln-status.status-risk-accepted { color: var(--green); }
+.report-vuln-table td.vuln-status.status-progress { color: var(--blue); }
+.report-vuln-table td.vuln-status.status-reported { color: var(--text-dim); }
+.report-vuln-table td.vuln-status.status-other { color: var(--text-dim); }
 .report-vuln-empty {
   padding: 16px;
   color: var(--text-dim);
@@ -1156,4 +1164,458 @@ textarea:focus { border-color: var(--blue); }
   padding: 2px 8px;
   border-radius: 4px;
   white-space: nowrap;
+}
+
+/* ── Accessibility ──────────────────────────────────────────────────────── */
+
+/* Restore a clearly-visible keyboard focus indicator. Several controls set
+   `outline: none`, which left keyboard users with no idea where focus was.
+   `:focus-visible` only shows for keyboard navigation, so mouse clicks stay clean. */
+button:focus-visible,
+a:focus-visible,
+select:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+[role="button"]:focus-visible,
+.job-item:focus-visible {
+  outline: 2px solid var(--cyan, #37b6ff);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Respect users who ask the OS to reduce motion: disable the infinite
+   pulse/spin animations and long transitions rather than looping forever. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   UI polish layer — appended last so it refines the existing look without
+   altering markup or earlier rules. Uses the existing design tokens only.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Buttons: a subtle depth + press feedback instead of a flat opacity fade.
+   Reads as more tactile while keeping the same palette. */
+.btn {
+  transition: transform 0.1s ease, box-shadow 0.15s ease, filter 0.15s ease, opacity 0.15s ease;
+}
+.btn:hover:not(:disabled) {
+  opacity: 1;
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+}
+.btn:active:not(:disabled) {
+  transform: translateY(0);
+  filter: brightness(0.96);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3) inset;
+}
+.btn-secondary:hover:not(:disabled) { border-color: var(--blue); }
+
+/* Verdict badges: leading status dot + gentle tinted glow so the outcome
+   reads at a glance without changing any text content. */
+.verdict-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-transform: uppercase;
+}
+.verdict-badge::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+  flex-shrink: 0;
+}
+.verdict-fixed        { box-shadow: 0 0 0 1px var(--green)  inset, 0 0 10px -4px var(--green); }
+.verdict-not_fixed    { box-shadow: 0 0 0 1px var(--red)    inset, 0 0 10px -4px var(--red); }
+.verdict-inconclusive { box-shadow: 0 0 0 1px var(--orange) inset, 0 0 10px -4px var(--orange); }
+
+/* Job rows: smoother hover/selection transitions with a persistent left rail. */
+.job-item {
+  transition: background 0.15s ease, border-color 0.15s ease;
+  border-left: 3px solid transparent;
+}
+.job-item.selected,
+.job-item.active { border-left-color: var(--blue); }
+
+/* Stat badges + source badges: hairline lift so they don't sit flat. */
+.stat-badge { transition: border-color 0.15s ease, color 0.15s ease; }
+.stat-badge:hover { border-color: var(--blue); }
+
+/* Refined, unobtrusive scrollbars that match the theme. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--text-dim); background-clip: content-box; }
+
+/* Modals/cards get a touch more depth for clear layering over the page. */
+.modal, .modal-content, .settings-panel {
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+/* Inputs/selects: clearer active affordance without a jarring outline. */
+select:focus, input:focus, textarea:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.18);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Queue filter toolbar — a clean segmented control + search, replacing the
+   old inline-styled pills. Reused by the Remediated / Manual / Sweep sections.
+   ══════════════════════════════════════════════════════════════════════════ */
+.qfilter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Segmented group: connected pills inside a subtle track. */
+.qfilter-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 3px;
+}
+
+.qfilter-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.qfilter-pill:hover { color: var(--text); background: rgba(127, 127, 127, 0.12); }
+.qfilter-pill .qf-emoji { font-size: 12px; line-height: 1; }
+
+/* Count chip inside each pill. */
+.qfilter-pill .qf-count {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 9px;
+  background: rgba(127, 127, 127, 0.18);
+  color: inherit;
+  min-width: 18px;
+  text-align: center;
+}
+
+/* Active states — default accent is blue; verdict pills carry their own hue. */
+.qfilter-pill.active           { background: var(--blue);  color: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.25); }
+.qfilter-pill.active .qf-count { background: rgba(255, 255, 255, 0.28); }
+.qfilter-pill.active.qf-fixed     { background: var(--green);  color: #05230f; }
+.qfilter-pill.active.qf-notfixed  { background: var(--red);    color: #fff; }
+.qfilter-pill.active.qf-incl      { background: var(--orange); color: #241a00; }
+.qfilter-pill.active.qf-fixed .qf-count,
+.qfilter-pill.active.qf-notfixed .qf-count,
+.qfilter-pill.active.qf-incl .qf-count { background: rgba(0, 0, 0, 0.22); }
+
+/* Search field with a leading magnifier. */
+.qfilter-search {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 1 1 160px;
+  min-width: 140px;
+}
+.qfilter-search.full { flex-basis: 100%; }
+.qfilter-search::before {
+  content: "";
+  position: absolute;
+  left: 10px;
+  width: 12px;
+  height: 12px;
+  border: 1.6px solid var(--text-dim);
+  border-radius: 50%;
+  opacity: 0.7;
+  pointer-events: none;
+}
+.qfilter-search::after {
+  content: "";
+  position: absolute;
+  left: 19px;
+  top: calc(50% + 3px);
+  width: 5px;
+  height: 1.6px;
+  background: var(--text-dim);
+  transform: rotate(45deg);
+  opacity: 0.7;
+  pointer-events: none;
+}
+.qfilter-search input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 10px 6px 28px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+}
+.qfilter-search input::placeholder { color: var(--text-dim); }
+
+/* ── Shell terminal ───────────────────────────────────────────────────────── */
+/* Layout rules that keep FitAddon honest and stop the prompt being clipped:
+   - The container (#shellTerminalContainer / .shell-terminal) has a fixed
+     height and ZERO padding. FitAddon reads the parent's height and subtracts
+     only the .xterm element's own padding, so padding here would make it
+     miscount rows and clip the bottom line.
+   - The .xterm element fills the container height exactly. */
+.shell-terminal-card {
+  padding: 6px;
+  margin-top: 20px;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.shell-terminal {
+  height: 60vh;
+  min-height: 340px;
+  background: #0d1117;
+  border-radius: 4px;
+  padding: 0;
+  overflow: hidden;
+  position: relative;
+}
+.shell-terminal .xterm,
+.shell-terminal .terminal {
+  height: 100%;
+  padding: 4px;
+  box-sizing: border-box;
+}
+.shell-terminal .xterm-viewport {
+  overflow-y: auto !important;
+}
+/* Give xterm's own scrollbar a slim, on-theme look so scrolling feels native. */
+.shell-terminal .xterm-viewport::-webkit-scrollbar { width: 10px; }
+.shell-terminal .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+.shell-terminal .xterm-viewport::-webkit-scrollbar-thumb {
+  background: #30363d;
+  border-radius: 6px;
+  border: 2px solid #0d1117;
+}
+.shell-terminal .xterm-viewport::-webkit-scrollbar-thumb:hover { background: #484f58; }
+
+/* ── Port Forward ─────────────────────────────────────────────────────────── */
+.pf-card { padding: 18px 20px; margin-top: 20px; }
+.pf-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.pf-icon {
+  font-size: 20px;
+  line-height: 1;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.pf-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.3px;
+}
+.pf-sub {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-top: 3px;
+  line-height: 1.5;
+  max-width: 640px;
+}
+.pf-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 14px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 16px;
+}
+.pf-field { display: flex; flex-direction: column; gap: 5px; }
+.pf-field .report-label { font-size: 11px; color: var(--text-dim); font-weight: 600; }
+.pf-optional {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  background: var(--bg3);
+  padding: 1px 5px;
+  border-radius: 4px;
+  margin-left: 4px;
+}
+.pf-input { width: 200px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+.pf-input-sm { width: 150px; }
+.pf-start-btn { white-space: nowrap; }
+
+.pf-tunnels { display: flex; flex-direction: column; gap: 8px; }
+.pf-empty {
+  font-size: 12px;
+  color: var(--text-dim);
+  text-align: center;
+  padding: 18px;
+  background: var(--bg);
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+}
+
+.tunnel-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  padding: 10px 14px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--text-dim);
+  border-radius: 10px;
+  flex-wrap: wrap;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.tunnel-row:hover { background: var(--bg3); }
+.tunnel-row.tunnel-listening { border-left-color: var(--green); }
+.tunnel-row.tunnel-error { border-left-color: var(--red); }
+.tunnel-row.tunnel-starting { border-left-color: var(--orange); }
+.tunnel-row.tunnel-stopped { border-left-color: var(--text-dim); opacity: 0.7; }
+
+.tunnel-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-dim);
+}
+.tunnel-listening .tunnel-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 3px var(--green-tint);
+}
+.tunnel-error .tunnel-dot { background: var(--red); box-shadow: 0 0 0 3px var(--red-tint); }
+.tunnel-starting .tunnel-dot {
+  background: var(--orange);
+  box-shadow: 0 0 0 3px var(--orange-tint);
+  animation: tunnel-pulse 1.2s ease-in-out infinite;
+}
+@keyframes tunnel-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+.tunnel-status { font-weight: 700; min-width: 62px; }
+.tunnel-listening .tunnel-status { color: var(--green); }
+.tunnel-error .tunnel-status { color: var(--red); }
+.tunnel-starting .tunnel-status { color: var(--orange); }
+
+.tunnel-label {
+  font-weight: 600;
+  color: var(--text);
+  padding: 2px 8px;
+  background: var(--bg3);
+  border-radius: 6px;
+}
+.tunnel-route { display: flex; align-items: center; gap: 8px; color: var(--text-dim); }
+.tunnel-route code {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--text);
+  background: var(--bg3);
+  padding: 2px 7px;
+  border-radius: 5px;
+}
+.tunnel-arrow { color: var(--blue); font-weight: 700; }
+.tunnel-error-msg, .tunnel-error {
+  color: var(--red);
+  font-size: 11px;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tunnel-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+
+.intake-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.intake-filter-group {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.intake-filter-pill {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.intake-filter-pill.active {
+  background: var(--bg3);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0,0,0,.15);
+}
+.intake-pill-count {
+  margin-left: 4px;
+  font-size: 10px;
+  opacity: 0.75;
+}
+.intake-filter-search {
+  flex: 1;
+  min-width: 180px;
+  max-width: 320px;
+}
+.intake-filter-search input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 10px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
 }

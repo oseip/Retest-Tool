@@ -21,6 +21,14 @@ router = APIRouter(prefix="/api/setup")
 CONFIG_PATH = "config/config.yaml"
 
 
+def _reject_duplicate_labels(labels: List[str], group: str) -> None:
+    seen = set()
+    for label in labels:
+        if label in seen:
+            raise HTTPException(400, f"Duplicate {group} client label: '{label}' — each label must be unique.")
+        seen.add(label)
+
+
 class ClientInput(BaseModel):
     label: str
     name: str
@@ -111,6 +119,10 @@ def submit_setup(req: SetupRequest):
         raise HTTPException(400, "config.yaml already exists — setup has already been completed.")
     if not req.clients:
         raise HTTPException(400, "Add at least one client.")
+
+    _reject_duplicate_labels([c.label.strip() for c in req.clients if c.label.strip()], "Axian")
+    if req.clients_secondary:
+        _reject_duplicate_labels([c.label.strip() for c in req.clients_secondary if c.label.strip()], "Non-Axian")
 
     clients = []
     for c in req.clients:
