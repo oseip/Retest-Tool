@@ -4281,3 +4281,69 @@ async function saveSettings() {
     if (!document.hidden) { fetchJobs(); fetchSshStatus(); fetchLogs(); }
   });
 })();
+
+// ── Nemesis terminal prompt (top-left) ───────────────────────────────────
+(function initNemesisTerminal() {
+  const cmdEl = document.getElementById('nemesisCmd');
+  if (!cmdEl) return;
+
+  const commands = [
+    { text: 'cd NEMESIS', pause: 2000, type: 55, del: 25 },
+    { text: 'jira → scan → verdict → done', pause: 2600, type: 50, del: 22 },
+    { text: 'no ssh. no copy-paste. no stress.', pause: 2800, type: 48, del: 22 },
+    { text: 'manual retests → deleted', pause: 2400, type: 52, del: 24 },
+    { text: 'sit back. nemesis handles it ✓', pause: 2600, type: 50, del: 22 },
+    { text: '100+ rules · zero hand-holding', pause: 2600, type: 50, del: 22 },
+    { text: 'automation beats burnout', pause: 2200, type: 55, del: 26, flex: true },
+    { text: 'your job: click. mine: everything else.', pause: 2800, type: 45, del: 20, flex: true },
+    { text: 'sudo rm -rf manual-labour', pause: 2400, type: 52, del: 24, flex: true },
+  ];
+
+  let cmdIdx = 0;
+  let charIdx = 0;
+  let deleting = false;
+
+  function escapeHtml(str) {
+    return str
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function renderCmd(text, isFlex) {
+    let html = escapeHtml(text)
+      .replace(/NEMESIS/g, '<span class="nemesis-brand">NEMESIS</span>')
+      .replace(/→/g, '<span class="nemesis-arrow">→</span>')
+      .replace(/✓/g, '<span class="nemesis-ok">✓</span>');
+    if (isFlex) html = `<span class="nemesis-flex">${html}</span>`;
+    cmdEl.innerHTML = html;
+  }
+
+  function tick() {
+    const entry = commands[cmdIdx];
+    const current = entry.text;
+
+    if (!deleting) {
+      renderCmd(current.substring(0, charIdx + 1), entry.flex);
+      charIdx++;
+      if (charIdx >= current.length) {
+        setTimeout(() => { deleting = true; tick(); }, entry.pause);
+        return;
+      }
+      setTimeout(tick, entry.type);
+    } else {
+      renderCmd(current.substring(0, charIdx - 1), entry.flex);
+      charIdx--;
+      if (charIdx <= 0) {
+        deleting = false;
+        cmdIdx = (cmdIdx + 1) % commands.length;
+        setTimeout(tick, 500);
+        return;
+      }
+      setTimeout(tick, entry.del);
+    }
+  }
+
+  tick();
+})();

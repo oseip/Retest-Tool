@@ -58,9 +58,9 @@ body {
 
 /* ── Header ───────────────────────────────────────────────────────────── */
 header {
-  display: flex;
+  display: grid;
+  grid-template-columns: 280px 1fr auto;
   align-items: center;
-  justify-content: space-between;
   background: var(--bg2);
   border-bottom: 1px solid var(--border);
   padding: 0 16px;
@@ -72,8 +72,73 @@ header {
 .header-left {
   display: flex;
   align-items: center;
+  width: 280px;
+  min-width: 280px;
+  max-width: 280px;
+  overflow: hidden;
   flex-shrink: 0;
-  gap: 0;
+}
+
+.nemesis-terminal {
+  display: flex;
+  align-items: baseline;
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', 'Courier New', monospace;
+  font-size: 13px;
+  line-height: 1;
+  white-space: nowrap;
+  user-select: none;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.nemesis-prompt {
+  color: var(--text-dim);
+  margin-right: 0.4em;
+  flex-shrink: 0;
+}
+
+.nemesis-cmd {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.nemesis-brand {
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text);
+}
+
+.nemesis-arrow {
+  color: var(--blue);
+}
+
+.nemesis-ok {
+  color: var(--green);
+  font-weight: 700;
+}
+
+.nemesis-flex {
+  color: var(--purple);
+  font-weight: 600;
+}
+
+.nemesis-cursor {
+  display: inline-block;
+  width: 0.58em;
+  height: 1.05em;
+  background: #e0457a;
+  vertical-align: text-bottom;
+  margin-left: 1px;
+  flex-shrink: 0;
+  animation: nemesis-blink 1s step-end infinite;
+}
+
+@keyframes nemesis-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
 }
 
 .logo {
@@ -87,8 +152,8 @@ header {
 .header-center {
   display: flex;
   gap: 8px;
-  flex: 1;
   justify-content: center;
+  min-width: 0;
 }
 
 .header-right {

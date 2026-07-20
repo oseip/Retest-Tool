@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Nemesis</title>
-  <link rel="stylesheet" href="/static/style.css?v=14">
+  <link rel="stylesheet" href="/static/style.css?v=17">
   <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
 </head>
 <body>
@@ -12,7 +12,11 @@
   <!-- HEADER -->
   <header>
     <div class="header-left">
-      <span class="logo">NEMESIS</span>
+      <div class="nemesis-terminal" aria-label="Nemesis">
+        <span class="nemesis-prompt">&gt; $</span>
+        <span class="nemesis-cmd" id="nemesisCmd"></span>
+        <span class="nemesis-cursor"></span>
+      </div>
     </div>
     <div class="header-center" id="dashboardControls">
       <select id="clientFilter">
@@ -742,6 +746,6 @@
   <script src="/static/vendor/xterm/xterm.js"></script>
   <script src="/static/vendor/xterm/xterm-addon-fit.js"></script>
   <script src="/static/intake.js?v=7"></script>
-  <script src="/static/app.js?v=16"></script>
+  <script src="/static/app.js?v=23"></script>
 </body>
 </html>
