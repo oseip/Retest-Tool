@@ -1412,6 +1412,59 @@ async function forcePoll() {
 
 // ── Transition modal ──────────────────────────────────────────────────────
 let _pendingTransition = null;
+let _transitionScreenshot = null;
+
+function _clearTransitionScreenshot() {
+  if (_transitionScreenshot?.previewUrl) URL.revokeObjectURL(_transitionScreenshot.previewUrl);
+  _transitionScreenshot = null;
+  const preview = $('modalScreenshotPreview');
+  if (preview) {
+    preview.innerHTML = '';
+    preview.style.display = 'none';
+  }
+}
+
+function _setTransitionScreenshot(file) {
+  if (!file || !file.type.startsWith('image/')) return;
+  _clearTransitionScreenshot();
+  const previewUrl = URL.createObjectURL(file);
+  const name = file.name || `screenshot-${Date.now()}.png`;
+  _transitionScreenshot = { blob: file, previewUrl, name };
+  const preview = $('modalScreenshotPreview');
+  if (!preview) return;
+  preview.innerHTML = `
+    <div class="screenshot-preview-bar">
+      <span>📎 ${escHtml(name)}</span>
+      <button type="button" class="btn btn-sm btn-secondary" onclick="removeTransitionScreenshot()">Remove</button>
+    </div>
+    <img src="${previewUrl}" alt="Pasted screenshot preview">`;
+  preview.style.display = 'block';
+}
+
+function removeTransitionScreenshot() {
+  _clearTransitionScreenshot();
+}
+
+function _buildTransitionFormData(fields) {
+  const fd = new FormData();
+  for (const [key, value] of Object.entries(fields)) {
+    if (value != null && value !== '') fd.append(key, value);
+  }
+  return fd;
+}
+
+function _handleTransitionPaste(e) {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      e.preventDefault();
+      const file = item.getAsFile();
+      if (file) _setTransitionScreenshot(file);
+      return;
+    }
+  }
+}
 
 // ── Fast-track helpers ─────────────────────────────────────────────────────
 
@@ -1463,6 +1516,7 @@ function renderTransitionBtns(job) {
 }
 
 function openFastTrack(jobId, target) {
+  _clearTransitionScreenshot();
   const job  = state.jobs[jobId];
   const s    = (job.ticket_status || '').toLowerCase().trim();
   const at_remediated = s === 'remediated';
@@ -1483,6 +1537,7 @@ function openFastTrack(jobId, target) {
 }
 
 function openTransition(jobId, toStatus) {
+  _clearTransitionScreenshot();
   _pendingTransition = { jobId, toStatus };
   const job = state.jobs[jobId];
   $('modalTitle').textContent = `Confirm: Mark as ${toStatus}`;
@@ -1502,15 +1557,18 @@ async function confirmTransition() {
   const { jobId, toStatus, isFastTrack } = _pendingTransition;
   const comment    = $('modalComment').value.trim();
   const ticketKey  = state.jobs[jobId]?.ticket_key;
+  const screenshot = _transitionScreenshot;
   $('transitionModal').style.display = 'none';
   _pendingTransition = null;
+  _clearTransitionScreenshot();
 
   if (isFastTrack) {
     try {
+      const fd = _buildTransitionFormData({ target: toStatus, comment });
+      if (screenshot) fd.append('screenshot', screenshot.blob, screenshot.name);
       const res = await fetch(`/api/jobs/${jobId}/fast-track`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: toStatus, comment }),
+        body: fd,
       });
       if (!res.ok) {
         const err = await res.json();
@@ -1546,10 +1604,11 @@ async function confirmTransition() {
 
   // ── Standard single-step transition ──────────────────────────────────────
   try {
+    const fd = _buildTransitionFormData({ job_id: jobId, to_status: toStatus, comment });
+    if (screenshot) fd.append('screenshot', screenshot.blob, screenshot.name);
     const res = await fetch('/api/transition', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ job_id: jobId, to_status: toStatus, comment }),
+      body: fd,
     });
     if (!res.ok) {
       const err = await res.json();
@@ -1607,7 +1666,9 @@ async function _loadTransitionPreview() {
       return;
     }
 
-    // Merge all eligible tickets and group by current Jira status
+    const retestStatus = (await fetch('/api/config').then(r => r.json())).retest_status || 'Remediated';
+
+    // Merge all eligible tickets; at Remediated, group by verdict target too
     const allTickets = [
       ...data.to_fixed.map(t    => ({...t, verdictTarget: 'Fixed'})),
       ...data.to_not_fixed.map(t => ({...t, verdictTarget: 'Not Fixed'})),
@@ -1615,35 +1676,46 @@ async function _loadTransitionPreview() {
     const groupMap = {};
     allTickets.forEach(t => {
       const s = t.ticket_status || 'Unknown';
-      if (!groupMap[s]) groupMap[s] = { status: s, jobs: [] };
-      groupMap[s].jobs.push(t);
+      const isRemediated = s.toLowerCase() === retestStatus.toLowerCase();
+      const groupKey = isRemediated ? `${s}::${t.verdictTarget}` : s;
+      if (!groupMap[groupKey]) {
+        groupMap[groupKey] = {
+          status: s,
+          verdictTarget: isRemediated ? t.verdictTarget : 'Remediated',
+          jobs: [],
+        };
+      }
+      groupMap[groupKey].jobs.push(t);
     });
 
     // Sort: Remediated last (phase 2); pre-Remediated states first (phase 1)
     const _STATUS_ORDER = ['Reported', 'In Progress', 'Not Fixed', 'Refix', 'Remediated'];
+    const _TARGET_ORDER = { 'Remediated': 0, 'Fixed': 1, 'Not Fixed': 2 };
     _transitionGroups = Object.values(groupMap).sort((a, b) => {
       const ai = _STATUS_ORDER.findIndex(s => s.toLowerCase() === a.status.toLowerCase());
       const bi = _STATUS_ORDER.findIndex(s => s.toLowerCase() === b.status.toLowerCase());
-      return (ai === -1 ? 50 : ai) - (bi === -1 ? 50 : bi);
+      const statusCmp = (ai === -1 ? 50 : ai) - (bi === -1 ? 50 : bi);
+      if (statusCmp !== 0) return statusCmp;
+      return (_TARGET_ORDER[a.verdictTarget] ?? 9) - (_TARGET_ORDER[b.verdictTarget] ?? 9);
     });
-
-    // Detect which groups are already at Remediated so we know what the button does
-    const retestStatus = (await fetch('/api/config').then(r => r.json())).retest_status || 'Remediated';
 
     const groupsHtml = _transitionGroups.map((g, idx) => {
       const isRemediated = g.status.toLowerCase() === retestStatus.toLowerCase();
       const n = g.jobs.length;
       const keys = g.jobs.map(j => j.ticket_key).join(', ');
+      const target = g.verdictTarget;
       const btnLabel = isRemediated
-        ? `✅ Transition ${n} → Fixed`
+        ? `${target === 'Fixed' ? '✅' : '❌'} Transition ${n} → ${target}`
         : `⚡ Advance ${n} → Remediated`;
-      const btnClass = isRemediated ? 'btn-green' : 'btn-sweep';
+      const btnClass = isRemediated
+        ? (target === 'Fixed' ? 'btn-green' : 'btn-red')
+        : 'btn-sweep';
       return `
         <div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;background:var(--bg3);display:flex;flex-direction:column;gap:5px">
           <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px">
             <div style="flex:1;min-width:0">
               <div style="font-size:11px;font-weight:600;color:var(--text);margin-bottom:3px">
-                ${escHtml(g.status)}
+                ${escHtml(g.status)}${isRemediated ? ` → ${escHtml(target)}` : ''}
                 <span style="font-weight:400;color:var(--text-dim)">(${n})</span>
               </div>
               <div style="font-size:11px;color:var(--cyan);user-select:all;cursor:text;word-break:break-all">${escHtml(keys)}</div>
@@ -1679,10 +1751,9 @@ async function _loadTransitionPreview() {
 
     // Bottom button: only for Remediated tickets — the per-group ⚡ buttons handle
     // phase-1 (advancing to Remediated first).
-    const remediatedGroup = _transitionGroups.find(g =>
-      g.status.toLowerCase() === retestStatus.toLowerCase()
-    );
-    const remCount = remediatedGroup ? remediatedGroup.jobs.length : 0;
+    const remCount = _transitionGroups
+      .filter(g => g.status.toLowerCase() === retestStatus.toLowerCase())
+      .reduce((sum, g) => sum + g.jobs.length, 0);
     const hasPreRemediated = _transitionGroups.some(g =>
       g.status.toLowerCase() !== retestStatus.toLowerCase()
     );
@@ -1705,6 +1776,8 @@ async function _advanceTransitionGroup(groupIdx) {
   const group = _transitionGroups[groupIdx];
   if (!group) return;
 
+  const target = group.verdictTarget || 'Fixed';
+
   // Disable all group buttons while the request is in flight
   _transitionGroups.forEach((_, i) => {
     const btn = $(`transGroupBtn${i}`);
@@ -1717,7 +1790,7 @@ async function _advanceTransitionGroup(groupIdx) {
     const res = await fetch('/api/jobs/bulk-fast-track', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ job_ids: jobIds, target: 'Fixed' }),
+      body: JSON.stringify({ job_ids: jobIds, target }),
     });
     const data = await res.json();
     const ok   = data.succeeded.length;
@@ -1734,13 +1807,13 @@ async function _advanceTransitionGroup(groupIdx) {
       }
     });
 
-    const retestStatus = group.status; // the label we showed on the button
-    const isPhase2 = _transitionGroups[groupIdx]?.status &&
+    const isPhase2 = target !== 'Remediated' &&
       data.succeeded.some(s => !s.partial);
 
     if (ok > 0) {
+      const icon = target === 'Not Fixed' ? '❌' : (target === 'Fixed' ? '✅' : '⚡');
       const label = isPhase2
-        ? `✅ ${ok} ticket${ok !== 1 ? 's' : ''} → Fixed`
+        ? `${icon} ${ok} ticket${ok !== 1 ? 's' : ''} → ${target}`
         : `⚡ ${ok} ticket${ok !== 1 ? 's' : ''} → Remediated`;
       showToast(label, 'success', 5000);
     }
@@ -1920,9 +1993,16 @@ $('triageFilter').addEventListener('change', e => {
 $('scanSelectedBtn').addEventListener('click', scanSelected);
 
 // ── Modal buttons ─────────────────────────────────────────────────────────
-$('modalCancel').addEventListener('click',  () => { $('transitionModal').style.display = 'none'; _pendingTransition = null; });
+function _closeTransitionModal() {
+  $('transitionModal').style.display = 'none';
+  _pendingTransition = null;
+  _clearTransitionScreenshot();
+}
+$('modalCancel').addEventListener('click', _closeTransitionModal);
 $('modalConfirm').addEventListener('click', confirmTransition);
-$('transitionModal').addEventListener('click', e => { if (e.target === $('transitionModal')) { $('transitionModal').style.display = 'none'; _pendingTransition = null; } });
+$('transitionModal').addEventListener('click', e => { if (e.target === $('transitionModal')) _closeTransitionModal(); });
+$('transitionModal').addEventListener('paste', _handleTransitionPaste);
+$('modalComment').addEventListener('paste', _handleTransitionPaste);
 
 // ── Utils ─────────────────────────────────────────────────────────────────
 function escHtml(s) {
@@ -3576,7 +3656,7 @@ document.addEventListener('keydown', e => {
   if ($('sweepModal')?.style.display !== 'none')          { closeSweep(); return; }
   if ($('bulkTransitionModal')?.style.display !== 'none') { closeTransitionModal(); return; }
   if ($('triageTransitionModal')?.style.display !== 'none') { closeTriageTransitionModal(); return; }
-  if ($('transitionModal')?.style.display !== 'none')     { $('transitionModal').style.display = 'none'; _pendingTransition = null; }
+  if ($('transitionModal')?.style.display !== 'none')     { _closeTransitionModal(); }
 });
 
 // ── Shell Tab ─────────────────────────────────────────────────────────────
@@ -3776,7 +3856,12 @@ function stopTunnelPolling() {
   }
 }
 
-async function startTunnel() {
+async function startTunnel(ev) {
+  if (ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+
   const label = $('shellClient').value;
   const target = $('tunnelTarget').value.trim();
   const localPortRaw = $('tunnelLocalPort').value.trim();
@@ -3812,7 +3897,11 @@ async function startTunnel() {
   } catch (exc) {
     showToast(`Error: ${exc.message || exc}`, 'error');
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '▶ Start Tunnel'; }
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '▶ Start Tunnel';
+      btn.blur();
+    }
   }
 }
 
@@ -3837,6 +3926,8 @@ async function refreshTunnels() {
   const list = $('tunnelList');
   if (!list) return;
 
+  const prevScroll = list.scrollTop;
+
   // Only touch the DOM when something actually changed — avoids the 2s poll
   // wiping the list mid-click and causing flicker.
   const sig = JSON.stringify(tunnels.map(t =>
@@ -3846,6 +3937,7 @@ async function refreshTunnels() {
 
   if (!tunnels.length) {
     list.innerHTML = '<div class="pf-empty">No active tunnels.</div>';
+    list.scrollTop = prevScroll;
     return;
   }
 
@@ -3884,6 +3976,7 @@ async function refreshTunnels() {
         </span>
       </div>`;
   }).join('');
+  list.scrollTop = prevScroll;
 }
 
 // ── Settings Tab ──────────────────────────────────────────────────────────

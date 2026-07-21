@@ -10,7 +10,7 @@ Verdicts: "fixed" | "not_fixed" | "inconclusive"
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Callable, List, Optional, Tuple
 
 Verdict = str
@@ -363,6 +363,83 @@ def _parse_smb_v1(text: str, xml: str, description: str = "") -> Tuple[Verdict, 
     return "inconclusive", "Could not determine SMBv1 status — check smb-protocols output"
 
 
+# Windows build → (display name, extended-support EOL). Checked before name patterns.
+_WINDOWS_BUILD_EOL: dict = {
+    20348: ("Windows Server 2022", date(2031, 10, 14)),
+    17763: ("Windows Server 2019", date(2029, 1, 9)),
+    14393: ("Windows Server 2016", date(2027, 1, 12)),
+    9600: ("Windows Server 2012 R2", date(2023, 10, 10)),
+    9200: ("Windows Server 2012", date(2023, 10, 10)),
+    7601: ("Windows Server 2008 R2", date(2020, 1, 14)),
+    26100: ("Windows 11 24H2", date(2026, 10, 14)),
+    22631: ("Windows 11 23H2", date(2025, 10, 14)),
+    22621: ("Windows 11 22H2", date(2024, 10, 8)),
+    22000: ("Windows 11 21H2", date(2024, 10, 10)),
+    19045: ("Windows 10 22H2", date(2025, 10, 14)),
+    19044: ("Windows 10 21H2", date(2024, 6, 11)),
+    19043: ("Windows 10 21H1", date(2022, 12, 13)),
+    19042: ("Windows 10 20H2", date(2023, 5, 9)),
+    18363: ("Windows 10 1909", date(2022, 5, 10)),
+}
+
+# Name-pattern fallback when smb-os-discovery omits the NT build number.
+_WINDOWS_NAME_EOL: List[Tuple[str, date, str]] = [
+    (r"windows server 2025", date(2034, 10, 10), "Windows Server 2025"),
+    (r"windows server 2022", date(2031, 10, 14), "Windows Server 2022"),
+    (r"windows server 2019", date(2029, 1, 9), "Windows Server 2019"),
+    (r"windows server 2016", date(2027, 1, 12), "Windows Server 2016"),
+    (r"windows server 2012 r2", date(2023, 10, 10), "Windows Server 2012 R2"),
+    (r"windows server 2012", date(2023, 10, 10), "Windows Server 2012"),
+    (r"windows server 2008 r2", date(2020, 1, 14), "Windows Server 2008 R2"),
+    (r"windows 11", date(2026, 10, 14), "Windows 11"),
+    (r"windows 10", date(2025, 10, 14), "Windows 10"),
+    (r"windows 8\.1", date(2023, 1, 10), "Windows 8.1"),
+    (r"windows 8\b", date(2016, 1, 12), "Windows 8"),
+    (r"windows 7", date(2020, 1, 14), "Windows 7"),
+]
+
+
+def _windows_os_eol(os_text: str) -> Optional[Tuple[str, date]]:
+    """Return (label, eol_date) for detected Windows OS text, or None."""
+    for build in re.findall(r"\b(\d{5})\b", os_text):
+        info = _WINDOWS_BUILD_EOL.get(int(build))
+        if info:
+            return info
+    low = os_text.lower()
+    for pattern, eol, label in _WINDOWS_NAME_EOL:
+        if re.search(pattern, low):
+            return label, eol
+    return None
+
+
+def _parse_windows_os(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    if _port_closed(low, 445):
+        return "inconclusive", "SMB port 445 closed or filtered"
+
+    os_line = _xml_elem(xml, "os") or ""
+    if not os_line:
+        m = re.search(r"OS:\s*(.+)", text, re.I)
+        if m:
+            os_line = m.group(1).split("|")[0].strip()
+
+    if not os_line and "smb-os-discovery" not in low:
+        return "inconclusive", "smb-os-discovery did not return OS information"
+
+    info = _windows_os_eol(os_line or text)
+    if not info:
+        return "inconclusive", f"Detected OS but could not map support lifecycle: {os_line or 'unknown'}"
+
+    label, eol = info
+    today = date.today()
+    eol_str = eol.strftime("%B %Y")
+    if today <= eol:
+        return "fixed", f"{label} is still supported (EOL: {eol_str})"
+    return "not_fixed", f"{label} is past end of support (EOL: {eol_str})"
+
+
 def _parse_ms17010(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
@@ -395,15 +472,48 @@ def _parse_rdp(text: str, xml: str, description: str = "") -> Tuple[Verdict, str
     low = text.lower()
     if _port_closed(low, 3389):
         return "inconclusive", "RDP port closed or filtered"
-    if "nla_supported: true" in low or "nla supported" in low or "credssp" in low:
+    if "rdp-enum-encryption" not in low and "3389/tcp" not in low:
+        return "inconclusive", "RDP encryption script did not return results"
+
+    has_native_rdp = bool(re.search(r"native rdp:\s*success", low))
+    has_credssp = bool(re.search(r"credssp:\s*success", low))
+    has_ssl_layer = bool(re.search(r"(?:^|\n)\s*ssl:\s*success", low))
+    has_hybrid = bool(re.search(r"hybrid:\s*success", low))
+    has_nla = (
+        has_credssp or has_ssl_layer or has_hybrid
+        or "nla_supported: true" in low
+        or "nla supported" in low
+    )
+
+    client_compatible = bool(re.search(r"encryption level:\s*client compatible", low))
+    weak_40 = bool(re.search(r"40-bit rc4:\s*success", low))
+    weak_56 = bool(re.search(r"56-bit rc4:\s*success", low))
+    low_enc = bool(re.search(r"encryption level:\s*(low|medium)", low))
+    high_enc = bool(re.search(r"encryption level:\s*(high|fips)", low))
+
+    issues: List[str] = []
+    if has_native_rdp and not has_nla:
+        issues.append("Native RDP without NLA (pre-auth encryption)")
+    if client_compatible:
+        issues.append("Client Compatible encryption allows downgrade")
+    if weak_40:
+        issues.append("40-bit RC4 enabled")
+    if weak_56:
+        issues.append("56-bit RC4 enabled")
+    if low_enc:
+        issues.append("Low/medium RDP encryption level")
+
+    if issues:
+        return "not_fixed", "; ".join(issues)
+
+    if has_nla and high_enc:
+        return "fixed", "NLA enabled with High/FIPS encryption — no weak ciphers"
+    if has_nla:
         return "fixed", "Network Level Authentication (NLA) is enabled"
-    if "nla_supported: false" in low or "security layer: rdp" in low:
-        return "not_fixed", "NLA not enforced — RDP accepts connections without pre-authentication"
-    if "encryption level: low" in low or "encryption level: medium" in low:
-        return "not_fixed", "RDP encryption level is insufficient"
-    if "encryption level: high" in low or "encryption level: fips" in low:
-        return "fixed", "RDP encryption level is high/FIPS"
-    return "inconclusive", "Could not determine RDP security configuration"
+    if high_enc and not weak_40 and not weak_56 and not client_compatible:
+        return "fixed", "RDP encryption level is High/FIPS with no weak ciphers"
+
+    return "inconclusive", "Could not determine RDP security configuration — review rdp-enum-encryption output"
 
 
 def _parse_bluekeep(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
@@ -411,12 +521,33 @@ def _parse_bluekeep(text: str, xml: str, description: str = "") -> Tuple[Verdict
         return "inconclusive", "Host unreachable"
     low = text.lower()
     if _port_closed(low, 3389):
-        return "inconclusive", "RDP port closed or filtered"
+        return "inconclusive", "RDP port 3389 closed or filtered"
+    if "rdp-enum-encryption" not in low and "3389/tcp" not in low:
+        return "inconclusive", "rdp-enum-encryption did not return results"
+
+    has_credssp = bool(re.search(r"credssp(?:\s*\(nla\))?:\s*success", low))
+    has_early_auth = bool(re.search(r"credssp with early user auth:\s*success", low))
+    has_native_rdp = bool(re.search(r"native rdp:\s*success", low))
+
     if "vulnerable" in low and ("cve-2019-0708" in low or "bluekeep" in low):
-        return "not_fixed", "BlueKeep (CVE-2019-0708) vulnerability still present"
-    if "not vulnerable" in low or "host does not appear" in low:
-        return "fixed", "Host is not vulnerable to BlueKeep"
-    return "inconclusive", "No standard nmap script for BlueKeep — verify manually via authenticated scan"
+        return "not_fixed", "BlueKeep (CVE-2019-0708) vulnerability indicated"
+
+    if has_credssp or has_early_auth:
+        parts = []
+        if has_credssp:
+            parts.append("CredSSP (NLA) enabled")
+        if has_early_auth:
+            parts.append("Early User Auth enabled")
+        return "fixed", (
+            f"{' + '.join(parts)} — not vulnerable to BlueKeep (CVE-2019-0708)"
+        )
+
+    if has_native_rdp:
+        return "not_fixed", (
+            "Native RDP without NLA — susceptible to BlueKeep (CVE-2019-0708) pre-auth RCE"
+        )
+
+    return "inconclusive", "Could not determine BlueKeep exposure — review rdp-enum-encryption output"
 
 
 def _parse_http_methods(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
@@ -501,6 +632,62 @@ def _parse_service_version(text: str, xml: str, description: str = "") -> Tuple[
     return "inconclusive", "Could not detect service version — port may be closed"
 
 
+def _parse_nginx_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    """Parse nginx version from curl -I / Server header and compare fix thresholds."""
+    if _host_down(text):
+        return "inconclusive", "Host unreachable — could not connect to nginx"
+
+    detected = None
+    m = re.search(r"server:\s*nginx/([\d.]+)", text, re.I)
+    if m:
+        detected = m.group(1).rstrip(".")
+    if not detected:
+        m2 = re.search(r"nginx/([\d]+\.[\d]+\.[\d]+)", text, re.I)
+        detected = m2.group(1).rstrip(".") if m2 else None
+
+    if not detected:
+        low = text.lower()
+        if re.search(r"http/[12]|\[status:\d", low):
+            return "inconclusive", "HTTP response received but Server: nginx/x.y.z header not found"
+        return "inconclusive", "Could not detect nginx version — port may be closed or filtered"
+
+    desc = description or ""
+    desc_low = desc.lower()
+    dual_branch = (
+        "1.29.5" in desc
+        or "ssl upstream" in desc_low
+        or "upstream injection" in desc_low
+    )
+    d = _ver_tuple(detected)
+    if dual_branch:
+        if not d or d[0] != 1:
+            return "inconclusive", f"Detected nginx {detected} — could not evaluate fix threshold"
+        if d[0] > 1:
+            return "fixed", f"nginx {detected} is above affected 1.x branches"
+        if d < (1, 28, 2):
+            return "not_fixed", f"nginx {detected} still below fixed version 1.28.2"
+        if d < (1, 29, 0):
+            return "fixed", f"nginx {detected} >= 1.28.2"
+        if d < (1, 29, 5):
+            return "not_fixed", f"nginx {detected} still below fixed version 1.29.5 (1.29.x branch)"
+        return "fixed", f"nginx {detected} >= 1.29.5"
+
+    fm = re.search(r"fixed version\s*:\s*v?([\d]+\.[\d.p\-]+)", desc, re.I)
+    if fm:
+        fixed = fm.group(1).strip(".")
+        fd, ft = _ver_tuple(detected), _ver_tuple(fixed)
+        if fd and ft:
+            if fd >= ft:
+                return "fixed", f"nginx {detected} >= fixed version {fixed}"
+            return "not_fixed", f"nginx {detected} still below fixed version {fixed}"
+
+    vuln_ver = _extract_version_from_description(desc)
+    if vuln_ver:
+        return _compare_versions(detected, vuln_ver)
+
+    return "inconclusive", f"Detected nginx {detected} — fix threshold not found in ticket description"
+
+
 def _parse_jenkins_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable — could not connect to Jenkins"
@@ -524,22 +711,78 @@ def _parse_jenkins_version(text: str, xml: str, description: str = "") -> Tuple[
 def _parse_kibana_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable — could not connect to Kibana"
-    m = re.search(r'"number"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)"', text)
-    detected = m.group(1) if m else None
+
+    detected = None
+    for pattern in (
+        r'version&quot;:&quot;([0-9]+\.[0-9]+\.[0-9]+)',
+        r'"version"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)"',
+        r'"number"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)"',
+        r'kbn-version[:\s]+([0-9]+\.[0-9]+\.[0-9]+)',
+    ):
+        m = re.search(pattern, text, re.I)
+        if m:
+            detected = m.group(1)
+            break
+
     if not detected:
-        m2 = re.search(r'kbn-version[:\s]+([0-9]+\.[0-9]+\.[0-9]+)', text, re.I)
-        detected = m2.group(1) if m2 else None
-    if detected:
-        vuln_ver = _extract_version_from_description(description)
-        if vuln_ver:
-            return _compare_versions(detected, vuln_ver)
-        return "inconclusive", f"Detected Kibana {detected} — vulnerable version not found in ticket description"
-    low = text.lower()
-    if re.search(r'x-elastic-product', text, re.I):
-        return "inconclusive", "Elastic product detected but version not returned — check /api/status"
-    if re.search(r'http/[12]|\[status:\d|\d+/tcp open', low):
-        return "inconclusive", "Service responding but Kibana version not detected — check /api/status manually"
-    return "inconclusive", "Could not connect to Kibana — port may be closed or filtered"
+        low = text.lower()
+        if re.search(r'x-elastic-product|kibana', text, re.I):
+            return "inconclusive", "Kibana detected but version not found on /login — check response manually"
+        if re.search(r'http/[12]|\[status:\d', low):
+            return "inconclusive", "HTTP response received but Kibana version not detected on /login"
+        return "inconclusive", "Could not connect to Kibana — port may be closed or filtered"
+
+    return _kibana_version_verdict(detected, description)
+
+
+def _extract_kibana_fix_thresholds(text: str) -> List[Tuple[tuple, str]]:
+    """Parse Nessus-style branch fix lines, e.g. '8.x < 8.19.10 / 9.1.x < 9.1.10'."""
+    thresholds: List[Tuple[tuple, str]] = []
+    for m in re.finditer(r'(\d+(?:\.\d+)?)\.x\s*<\s*([\d.]+)', text, re.I):
+        branch = tuple(int(x) for x in m.group(1).split('.'))
+        thresholds.append((branch, m.group(2).strip('.')))
+    return thresholds
+
+
+def _kibana_on_branch(detected: tuple, branch: tuple) -> bool:
+    if len(detected) < len(branch):
+        return False
+    return detected[:len(branch)] == branch
+
+
+def _kibana_version_verdict(detected: str, context: str) -> Tuple[Verdict, str]:
+    d = _ver_tuple(detected)
+    if not d:
+        return "inconclusive", f"Detected Kibana {detected} — could not compare versions"
+
+    thresholds = _extract_kibana_fix_thresholds(context or "")
+    if thresholds:
+        for branch, min_fix in thresholds:
+            if _kibana_on_branch(d, branch):
+                ft = _ver_tuple(min_fix)
+                if not ft:
+                    break
+                if d >= ft:
+                    branch_label = ".".join(str(x) for x in branch) + ".x"
+                    return "fixed", f"Kibana {detected} >= {min_fix} (fixed on {branch_label} branch)"
+                branch_label = ".".join(str(x) for x in branch) + ".x"
+                return "not_fixed", f"Kibana {detected} still below fixed version {min_fix} on {branch_label} branch"
+        return "inconclusive", f"Kibana {detected} — no matching fix branch in ticket text"
+
+    fm = re.search(r'fixed version\s*:\s*v?([\d]+\.[\d.p\-]+)', context or "", re.I)
+    if fm:
+        fixed = fm.group(1).strip('.')
+        ft = _ver_tuple(fixed)
+        if ft:
+            if d >= ft:
+                return "fixed", f"Kibana {detected} >= fixed version {fixed}"
+            return "not_fixed", f"Kibana {detected} still below fixed version {fixed}"
+
+    vuln_ver = _extract_version_from_description(context or "")
+    if vuln_ver:
+        return _compare_versions(detected, vuln_ver)
+
+    return "inconclusive", f"Detected Kibana {detected} — fix threshold not found in ticket"
 
 
 def _parse_grafana_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
@@ -619,10 +862,16 @@ def _parse_redis(text: str, xml: str, description: str = "") -> Tuple[Verdict, s
     low = text.lower()
     if _port_closed(low, 6379):
         return "inconclusive", "Redis port closed or filtered"
-    if "redis_version" in low or "connected_clients" in low or "used_memory" in low:
-        return "not_fixed", "Redis still accessible without authentication"
-    if "noauth" in text or "authentication required" in low or "requirepass" in low:
+    if any(x in low for x in (
+        "noauth", "authentication required", "auth required", "wrongpass",
+    )):
         return "fixed", "Redis now requires authentication"
+    # Successful `info` (or legacy PING) without auth — still vulnerable
+    if any(x in low for x in (
+        "redis_version", "connected_clients", "used_memory",
+        "# server", "# clients", "# memory", "# stats",
+    )) or "pong" in low:
+        return "not_fixed", "Redis still accessible without authentication"
     return "inconclusive", "Could not determine Redis authentication status"
 
 
@@ -630,11 +879,28 @@ def _parse_elasticsearch(text: str, xml: str, description: str = "") -> Tuple[Ve
     if _host_down(text):
         return "inconclusive", "Host unreachable"
     low = text.lower()
+
+    # Secured — 401 with Elasticsearch security plugin rejecting unauthenticated access
+    if "401" in text and (
+        "security_exception" in low
+        or "missing authentication credentials" in low
+        or "authentication required" in low
+        or "www-authenticate" in low
+    ):
+        return "fixed", "Elasticsearch requires authentication (401 security_exception)"
+
+    # Vulnerable — root endpoint returns cluster metadata without auth
     if ('"cluster_name"' in text or '"tagline"' in text
-            or ('"version"' in text and "elasticsearch" in low and "200" in text)):
+            or ('"cluster_uuid"' in text and '"name"' in text)):
+        if "200" in text or "[status:200" in low:
+            return "not_fixed", "Elasticsearch accessible without authentication (cluster info disclosed)"
+    if ('"version"' in text and "elasticsearch" in low
+            and ("200" in text or "[status:200" in low)):
         return "not_fixed", "Elasticsearch still accessible without authentication"
-    if "401" in text or "authentication required" in low or "security_exception" in low:
-        return "fixed", "Elasticsearch now requires authentication"
+
+    if "403" in text and "security_exception" in low:
+        return "fixed", "Elasticsearch access denied (authentication enforced)"
+
     return "inconclusive", "Could not determine Elasticsearch access status"
 
 
@@ -783,6 +1049,49 @@ def _parse_tomcat_version(text: str, xml: str, description: str = "") -> Tuple[V
     return "inconclusive", "Could not detect Apache Tomcat — port may be closed or filtered"
 
 
+_TOMCAT_DEFAULT_PATHS = ("/examples/", "/manager/", "/host-manager/", "/docs/")
+
+
+def _parse_tomcat_default_files(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    """Default Tomcat apps removed when all checked paths return HTTP 404."""
+    if _host_down(text):
+        return "inconclusive", "Host unreachable — could not connect to Tomcat"
+
+    hits = re.findall(r"\[STATUS:(\d+)\]\[URL:([^\]]+)\]", text)
+    if not hits:
+        hits = re.findall(r"^(\d{3})\s+(https?://\S+)", text, re.M)
+
+    if not hits:
+        low = text.lower()
+        if re.search(r"curl: \(7\)|connection refused|could not connect", low):
+            return "inconclusive", "Could not connect to Tomcat — port may be closed"
+        return "inconclusive", "Could not parse HTTP status lines from curl output"
+
+    exposed: List[str] = []
+    not_found: List[str] = []
+    for code_str, url in hits:
+        code = int(code_str)
+        path_m = re.search(r"/(?:examples|manager|host-manager|docs)/?", url, re.I)
+        path = path_m.group(0) if path_m else url
+        if not path.endswith("/"):
+            path = path.rstrip("/") + "/"
+
+        if code == 404:
+            not_found.append(path)
+        elif code in (200, 301, 302, 401, 403):
+            exposed.append(f"{path} ({code})")
+        else:
+            exposed.append(f"{path} ({code})")
+
+    if exposed:
+        return "not_fixed", f"Default Tomcat paths still accessible: {', '.join(exposed)}"
+    if len(not_found) >= len(_TOMCAT_DEFAULT_PATHS):
+        return "fixed", "All default Tomcat paths return 404 — examples, manager, host-manager, docs removed"
+    if not_found and not exposed:
+        return "fixed", f"Checked Tomcat default paths return 404 ({len(not_found)} path(s))"
+    return "inconclusive", "Could not check all default Tomcat paths — review curl output"
+
+
 def _parse_ghostcat(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
@@ -917,6 +1226,99 @@ def _parse_vmware(text: str, xml: str, description: str = "") -> Tuple[Verdict, 
     if re.search(r'\d+/tcp open', low):
         return "inconclusive", "Port open but VMware service not identified — verify version via management interface"
     return "inconclusive", "Could not detect VMware service — management port may be closed or filtered"
+
+
+_ESXI_SOAP_RETRIEVE = (
+    '<?xml version="1.0"?>'
+    '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+    '<soap:Body><RetrieveServiceContent xmlns="urn:vim25">'
+    '<_this type="ServiceInstance">ServiceInstance</_this>'
+    '</RetrieveServiceContent></soap:Body></soap:Envelope>'
+)
+
+# VMSA-2025-0013 minimum fixed builds (Broadcom advisory)
+_ESXI_VMSA_2025_0013_7_FIXED = 24784741   # 7.0 Update 3w
+_ESXI_VMSA_2025_0013_8U3_FIXED = 24784735  # 8.0 Update 3f
+_ESXI_VMSA_2025_0013_8_FIXED = 24789317    # 8.0 Update 2e (8.0 U2 and earlier)
+
+
+def _esxi_version_tuple(version_text: str) -> tuple:
+    """Parse '7.0.2', '8.0.3', or '7.0 Update 3' into (major, minor, patch)."""
+    if not version_text:
+        return ()
+    s = version_text.lower().replace("update", " ").strip()
+    nums = [int(x) for x in re.findall(r"\d+", s)]
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums[:3])
+
+
+def _parse_esxi_vmsa_2025_0013(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable — could not query ESXi /sdk"
+
+    full_name = None
+    m = re.search(r"<fullName>([^<]+)</fullName>", text, re.I)
+    if m:
+        full_name = m.group(1).strip()
+
+    build = None
+    for pat in (r"build[-\s#]*(\d+)", r"<build>(\d+)</build>"):
+        bm = re.search(pat, text, re.I)
+        if bm:
+            build = int(bm.group(1))
+            break
+
+    version = None
+    if full_name:
+        vm = re.search(r"ESXi\s+([\d.]+\s*(?:Update\s+\d+)?)", full_name, re.I)
+        if vm:
+            version = vm.group(1).strip()
+    if not version:
+        vm = re.search(r"<version>([^<]+)</version>", text, re.I)
+        if vm:
+            version = vm.group(1).strip()
+
+    if not build and not version:
+        low = text.lower()
+        if any(k in low for k in ("vim25", "servicemanager", "soap", "retrieveservicecontent")):
+            return "inconclusive", "vSphere SDK responded but ESXi version/build not parsed"
+        return "inconclusive", "Could not retrieve ESXi version from SOAP /sdk response"
+
+    if build is None:
+        return "inconclusive", (
+            f"Detected {full_name or version} but build number missing — "
+            "cannot assess VMSA-2025-0013 patch level"
+        )
+
+    vt = _esxi_version_tuple(version or full_name or "")
+    if not vt:
+        return "inconclusive", f"Build {build} detected but ESXi version not parsed"
+
+    major = vt[0]
+    display = full_name or f"ESXi {version} build {build}"
+
+    if major == 7:
+        fixed_build = _ESXI_VMSA_2025_0013_7_FIXED
+        fixed_label = "7.0 Update 3w"
+    elif major == 8:
+        is_u3 = vt[2] >= 3
+        if is_u3:
+            fixed_build = _ESXI_VMSA_2025_0013_8U3_FIXED
+            fixed_label = "8.0 Update 3f"
+        else:
+            fixed_build = _ESXI_VMSA_2025_0013_8_FIXED
+            fixed_label = "8.0 Update 2e"
+    else:
+        return "inconclusive", (
+            f"{display} — VMSA-2025-0013 applies to ESXi 7.x/8.x only"
+        )
+
+    if build >= fixed_build:
+        return "fixed", f"{display} meets fixed build for {fixed_label} (build {fixed_build}+)"
+    return "not_fixed", (
+        f"{display} is below fixed build {fixed_build} ({fixed_label} required for VMSA-2025-0013)"
+    )
 
 
 def _parse_log4shell(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
@@ -1859,6 +2261,10 @@ class VulnRule:
     parse: Optional[Callable] = None
     tool: str = "nmap"      # "nmap" | "curl"
     curl_path: str = "/"    # URL path appended when tool="curl"
+    curl_paths: Optional[List[str]] = None  # multiple paths → one curl with -o /dev/null
+    curl_scheme: Optional[str] = None  # force "http" or "https"; default from port
+    curl_method: str = "GET"           # "GET" | "POST"
+    curl_post_data: Optional[str] = None
     requires_root: bool = False  # True for UDP scans (-sU) and other raw-socket ops
 
 
@@ -2035,6 +2441,21 @@ RULES: List[VulnRule] = [
         default_port=445,
         parse=_parse_smb_v1,
     ),
+    VulnRule(
+        name="Unsupported Windows OS (remote)",
+        patterns=[
+            r"unsupported windows os \(remote\)",
+            r"unsupported windows os",
+            r"windows os.*unsupported",
+            r"unsupported.*windows.*remote",
+            r"microsoft windows.*unsupported",
+            r"windows.*end.of.life",
+            r"windows.*\beol\b",
+        ],
+        nmap_script="smb-os-discovery",
+        default_port=445,
+        parse=_parse_windows_os,
+    ),
     # VulnRule(
     #     name="MS16-047 Badlock / Samba Badlock",
     #     patterns=[r"ms16-047", r"badlock"],
@@ -2052,28 +2473,36 @@ RULES: List[VulnRule] = [
     ),
 
     # --- RDP ---
-    # Disabled: Terminal Services / RDP scans producing inaccurate results — moved to manual review.
-    # VulnRule(
-    #     name="Terminal Services / RDP NLA / Encryption",
-    #     patterns=[
-    #         r"terminal services.*nla", r"terminal services.*network level auth",
-    #         r"terminal services.*encryption", r"remote desktop.*man.in.the.middle",
-    #         r"ms12-020", r"rdp.*encryption", r"rdp.*nla", r"rdp.*without.*nla",
-    #     ],
-    #     nmap_script="rdp-enum-encryption",
-    #     default_port=3389,
-    #     parse=_parse_rdp,
-    # ),
-    # Disabled: there is no bundled nmap NSE script for BlueKeep (CVE-2019-0708).
-    # "rdp-vuln-ms19-0708" does not exist; the community-standard safe checks are
-    # rdpscan or Metasploit's cve_2019_0708_bluekeep aux scanner. Moved to manual review.
-    # VulnRule(
-    #     name="BlueKeep CVE-2019-0708",
-    #     patterns=[r"bluekeep", r"cve-2019-0708"],
-    #     nmap_script="",
-    #     default_port=3389,
-    #     parse=_parse_bluekeep,
-    # ),
+    VulnRule(
+        name="Remote Desktop Protocol MITM / NLA / Encryption",
+        patterns=[
+            r"remote desktop protocol.*man.in.the.middle",
+            r"remote desktop.*man.in.the.middle",
+            r"rdp.*man.in.the.middle",
+            r"terminal services.*encryption",
+            r"terminal services.*network level auth",
+            r"terminal services.*nla",
+            r"rdp.*encryption", r"rdp.*nla", r"rdp.*without.*nla",
+            r"ms12-020",
+        ],
+        nmap_script="rdp-enum-encryption",
+        default_port=3389,
+        parse=_parse_rdp,
+    ),
+    VulnRule(
+        name="BlueKeep CVE-2019-0708",
+        patterns=[
+            r"bluekeep",
+            r"cve-2019-0708",
+            r"microsoft rdp rce.*0708",
+            r"microsoft rdp rce.*bluekeep",
+            r"rdp rce.*0708",
+            r"rdp rce.*bluekeep",
+        ],
+        nmap_script="rdp-enum-encryption",
+        default_port=3389,
+        parse=_parse_bluekeep,
+    ),
 
     # --- HTTP / Web (most specific first to avoid generic rule swallowing them) ---
     VulnRule(
@@ -2106,12 +2535,25 @@ RULES: List[VulnRule] = [
         curl_path="/jmx-console/",
     ),
     VulnRule(
+        name="Apache Tomcat Default Files",
+        patterns=[
+            r"apache tomcat default files",
+            r"tomcat default files",
+            r"tomcat.*default.*(?:files|directories|applications|apps)",
+            r"apache tomcat.*(?:/examples/|/manager/|/host-manager/|/docs/)",
+        ],
+        default_port=8080,
+        parse=_parse_tomcat_default_files,
+        tool="curl",
+        curl_paths=list(_TOMCAT_DEFAULT_PATHS),
+    ),
+    VulnRule(
         name="Apache Tomcat Version Vulnerability",
         patterns=[
             r"apache tomcat\s+[0-9]", r"apache tomcat.*multiple vulnerabilities",
             r"outdated apache tomcat", r"apache tomcat.*security constraint",
             r"apache tomcat.*poodle", r"apache tomcat.*ghostcat",
-            r"apache tomcat default", r"apache tomcat.*ajp",
+            r"apache tomcat.*ajp",
         ],
         nmap_script="http-server-header",
         extra_args="-sV",
@@ -2138,6 +2580,21 @@ RULES: List[VulnRule] = [
         parse=_parse_http_methods,
     ),
     # Apache-specific patterns removed — Apache scans producing inaccurate results, moved to manual review.
+    VulnRule(
+        name="Nginx SSL Upstream Injection",
+        patterns=[
+            r"nginx.*ssl upstream injection",
+            r"nginx 1\.3\.0.*1\.28\.2",
+            r"nginx.*1\.29\.x.*1\.29\.5",
+            r"nginx.*upstream injection",
+        ],
+        nmap_script="",
+        default_port=80,
+        extra_args="-I",
+        parse=_parse_nginx_version,
+        tool="curl",
+        curl_path="/",
+    ),
     VulnRule(
         name="Nginx / Web Server Version",
         patterns=[
@@ -2193,10 +2650,10 @@ RULES: List[VulnRule] = [
             r"kibana.*cve", r"kibana.*vulnerability",
         ],
         nmap_script="",
-        default_port=5601,
+        default_port=443,
         parse=_parse_kibana_version,
         tool="curl",
-        curl_path="/api/status",
+        curl_path="/login",
     ),
     VulnRule(
         name="GitLab Version Vulnerability",
@@ -2248,6 +2705,7 @@ RULES: List[VulnRule] = [
     VulnRule(
         name="Elasticsearch Unrestricted Access",
         patterns=[
+            r"elasticsearch unrestricted access information disclosure",
             r"elasticsearch unrestricted", r"elasticsearch.*unauthenticated",
             r"elasticsearch.*information disclosure",
         ],
@@ -2256,6 +2714,7 @@ RULES: List[VulnRule] = [
         parse=_parse_elasticsearch,
         tool="curl",
         curl_path="/",
+        curl_scheme="https",
     ),
     VulnRule(
         name="Oracle Database Version / Unsupported",
@@ -2442,6 +2901,27 @@ RULES: List[VulnRule] = [
     #     default_port=443,
     #     parse=_parse_vmware,
     # ),
+    VulnRule(
+        name="VMware ESXi VMSA-2025-0013",
+        patterns=[
+            r"vmsa-2025-0013",
+            r"vmware esxi 7\.x.*7\.0 update 3w",
+            r"vmware esxi 8\.x.*8\.0 update 2e",
+            r"vmware esxi.*8\.0 update 3.*8\.0 update 3f",
+            r"vmware esxi.*multiple vulnerabilities.*vmsa",
+            r"esxi.*vmsa-2025-0013",
+            r"cve-2025-4123[6-9].*esxi",
+            r"esxi.*cve-2025-4123[6-9]",
+        ],
+        nmap_script="",
+        default_port=443,
+        parse=_parse_esxi_vmsa_2025_0013,
+        tool="curl",
+        curl_path="/sdk",
+        curl_scheme="https",
+        curl_method="POST",
+        curl_post_data=_ESXI_SOAP_RETRIEVE,
+    ),
     VulnRule(
         name="ActiveMQ RCE CVE-2023-46604",
         patterns=[r"activemq.*rce", r"cve-2023-46604", r"activemq.*5\."],
@@ -3074,7 +3554,6 @@ MANUAL_ONLY_RULES = [
     
     # 3. Deep Protocol / Authenticated Checks
     r"terminal services encryption level",
-    r"esxi",
     r"ipmi v2\.0 password hash disclosure",
     r"smb signing disabled",
     r"ldap null base",
@@ -3096,8 +3575,6 @@ MANUAL_ONLY_RULES = [
     r"ms09-050",           # only NSE is smb-vuln-cve2009-3103, an intrusive DoS/bluescreen
     r"educatedscholar",
     r"cve-2009-3103",
-    r"bluekeep",           # no bundled nmap NSE; use rdpscan / metasploit aux scanner
-    r"cve-2019-0708",
     r"zookeeper",          # requires 4lw (`echo stat | nc host 2181`) over raw TCP
 ]
 

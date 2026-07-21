@@ -63,7 +63,6 @@ class TestScanCommandAccuracy:
 
     @pytest.mark.parametrize("summary", [
         "MS09-050 Microsoft Windows SMB2 Vulnerability",
-        "BlueKeep CVE-2019-0708 Remote Code Execution",
         "Apache ZooKeeper Accessible Without Authentication",
     ])
     def test_unsafe_checks_route_to_manual(self, summary):
@@ -554,3 +553,329 @@ class TestParseSmbV1:
     def test_port_closed_is_inconclusive(self):
         verdict, reason = self.parse("445/tcp filtered", "")
         assert verdict == "inconclusive"
+
+
+# ---------------------------------------------------------------------------
+# Nginx SSL Upstream Injection
+# ---------------------------------------------------------------------------
+
+class TestNginxSslUpstream:
+    SUMMARY = "nginx 1.3.0 < 1.28.2 / 1.29.x < 1.29.5 SSL Upstream Injection"
+    DESCRIPTION = (
+        "URL               : http://10.222.243.181:8081/\n"
+        "  Installed version : 1.24.0\n"
+        "  Fixed version     : 1.28.2\n"
+        " Recommendation \n"
+        "Upgrade to nginx 1.28.2 / 1.29.5 or later."
+    )
+    CURL_OUT = (
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.24.0\r\n"
+        "Date: Tue, 21 Jul 2026 06:20:39 GMT\r\n"
+    )
+
+    def setup_method(self):
+        rule = match_rule(self.SUMMARY)
+        assert rule is not None, "Nginx SSL upstream rule must match Nessus title"
+        assert rule.tool == "curl"
+        assert rule.extra_args == "-I"
+        self.parse = rule.parse
+
+    def test_still_vulnerable_version(self):
+        verdict, _ = self.parse(self.CURL_OUT, "", self.DESCRIPTION)
+        assert verdict == "not_fixed"
+
+    def test_fixed_on_main_branch(self):
+        out = self.CURL_OUT.replace("1.24.0", "1.28.2")
+        verdict, _ = self.parse(out, "", self.DESCRIPTION)
+        assert verdict == "fixed"
+
+    def test_vulnerable_on_129_branch(self):
+        out = self.CURL_OUT.replace("1.24.0", "1.29.3")
+        verdict, _ = self.parse(out, "", self.DESCRIPTION)
+        assert verdict == "not_fixed"
+
+    def test_fixed_on_129_branch(self):
+        out = self.CURL_OUT.replace("1.24.0", "1.29.5")
+        verdict, _ = self.parse(out, "", self.DESCRIPTION)
+        assert verdict == "fixed"
+
+
+# ---------------------------------------------------------------------------
+# Apache Tomcat Default Files
+# ---------------------------------------------------------------------------
+
+class TestTomcatDefaultFiles:
+    SUMMARY = "Apache Tomcat Default Files"
+    FIXED = """
+[STATUS:404][URL:http://10.0.0.1:8080/examples/]
+[STATUS:404][URL:http://10.0.0.1:8080/manager/]
+[STATUS:404][URL:http://10.0.0.1:8080/host-manager/]
+[STATUS:404][URL:http://10.0.0.1:8080/docs/]
+"""
+    OPEN = """
+[STATUS:404][URL:http://10.0.0.1:8080/examples/]
+[STATUS:200][URL:http://10.0.0.1:8080/manager/]
+[STATUS:404][URL:http://10.0.0.1:8080/host-manager/]
+[STATUS:404][URL:http://10.0.0.1:8080/docs/]
+"""
+
+    def setup_method(self):
+        rule = match_rule(self.SUMMARY)
+        assert rule is not None
+        assert rule.tool == "curl"
+        assert len(rule.curl_paths) == 4
+        self.parse = rule.parse
+
+    def test_all_404_is_fixed(self):
+        verdict, _ = self.parse(self.FIXED, "")
+        assert verdict == "fixed"
+
+    def test_accessible_path_is_not_fixed(self):
+        verdict, reason = self.parse(self.OPEN, "")
+        assert verdict == "not_fixed"
+        assert "manager" in reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# Kibana version (/login)
+# ---------------------------------------------------------------------------
+
+class TestKibanaVersion:
+    SUMMARY = "Kibana 8.x < 8.19.10 / 9.1.x < 9.1.10 / 9.2.x < 9.2.4 (ESA_2026_05)"
+    LOGIN_HTML = '<script>{"version&quot;:&quot;8.19.18&quot;}</script>'
+
+    def setup_method(self):
+        rule = match_rule(self.SUMMARY)
+        assert rule is not None
+        assert rule.curl_path == "/login"
+        self.parse = rule.parse
+
+    def test_fixed_on_8x_branch(self):
+        verdict, _ = self.parse(self.LOGIN_HTML, "", self.SUMMARY)
+        assert verdict == "fixed"
+
+    def test_not_fixed_on_8x_branch(self):
+        html = self.LOGIN_HTML.replace("8.19.18", "8.19.5")
+        verdict, _ = self.parse(html, "", self.SUMMARY)
+        assert verdict == "not_fixed"
+
+    def test_not_fixed_on_91_branch(self):
+        html = self.LOGIN_HTML.replace("8.19.18", "9.1.5")
+        verdict, _ = self.parse(html, "", self.SUMMARY)
+        assert verdict == "not_fixed"
+
+
+# ---------------------------------------------------------------------------
+# RDP MITM / NLA / encryption
+# ---------------------------------------------------------------------------
+
+class TestRdpMitm:
+    SUMMARY = "Remote Desktop Protocol Server Man-in-the-Middle Weakness"
+    VULN_OUT = """
+3389/tcp open  ms-wbt-server
+| rdp-enum-encryption:
+|   Security layer
+|     Native RDP: SUCCESS
+|   RDP Encryption level: Client Compatible
+|     40-bit RC4: SUCCESS
+|     56-bit RC4: SUCCESS
+|     128-bit RC4: SUCCESS
+|     FIPS 140-1: SUCCESS
+|_  RDP Protocol Version: Unknown
+"""
+    FIXED_OUT = """
+3389/tcp open  ms-wbt-server
+| rdp-enum-encryption:
+|   Security layer
+|     CredSSP: SUCCESS
+|   RDP Encryption level: High
+|     128-bit RC4: SUCCESS
+|_  RDP Protocol Version: 10.0
+"""
+
+    def setup_method(self):
+        rule = match_rule(self.SUMMARY)
+        assert rule is not None
+        assert rule.nmap_script == "rdp-enum-encryption"
+        self.parse = rule.parse
+
+    def test_vulnerable_rdp_config(self):
+        verdict, reason = self.parse(self.VULN_OUT, "")
+        assert verdict == "not_fixed"
+        assert "native rdp" in reason.lower() or "40-bit" in reason.lower()
+
+    def test_nla_high_encryption_fixed(self):
+        verdict, _ = self.parse(self.FIXED_OUT, "")
+        assert verdict == "fixed"
+
+
+class TestBlueKeep:
+    SUMMARY = "Microsoft RDP RCE (CVE-2019-0708) (BlueKeep) (uncredentialed check)"
+
+    FIXED_OUT = """
+3389/tcp open  ms-wbt-server
+| rdp-enum-encryption:
+|   Security layer
+|     CredSSP (NLA): SUCCESS
+|     CredSSP with Early User Auth: SUCCESS
+|   RDP Encryption level: High
+|_  RDP Protocol Version: 10.0
+"""
+
+    VULN_OUT = """
+3389/tcp open  ms-wbt-server
+| rdp-enum-encryption:
+|   Security layer
+|     Native RDP: SUCCESS
+|   RDP Encryption level: Client Compatible
+|_  RDP Protocol Version: Unknown
+"""
+
+    def setup_method(self):
+        rule = match_rule(self.SUMMARY)
+        assert rule is not None
+        assert rule.nmap_script == "rdp-enum-encryption"
+        self.parse = rule.parse
+
+    def test_nla_enabled_not_vulnerable(self):
+        verdict, reason = self.parse(self.FIXED_OUT, "")
+        assert verdict == "fixed"
+        assert "nla" in reason.lower() or "credssp" in reason.lower()
+        assert "bluekeep" in reason.lower()
+
+    def test_native_rdp_without_nla_vulnerable(self):
+        verdict, reason = self.parse(self.VULN_OUT, "")
+        assert verdict == "not_fixed"
+        assert "native rdp" in reason.lower()
+
+
+class TestElasticsearchUnrestrictedAccess:
+    SUMMARY = "Elasticsearch Unrestricted Access Information Disclosure"
+
+    SECURED_OUT = """
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Basic realm="security" charset="UTF-8"
+Content-Type: application/json
+
+{"error":{"root_cause":[{"type":"security_exception","reason":"missing authentication credentials for REST request [/]"}],"type":"security_exception","reason":"missing authentication credentials for REST request [/]","status":401}}
+[STATUS:401][URL:https://10.222.130.53:9200/]
+"""
+
+    VULN_OUT = """
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"name":"node-1","cluster_name":"elasticsearch","cluster_uuid":"abc","version":{"number":"7.17.0"}}
+[STATUS:200][URL:https://10.222.130.53:9200/]
+"""
+
+    def setup_method(self):
+        rule = match_rule(self.SUMMARY)
+        assert rule is not None
+        assert rule.tool == "curl"
+        assert rule.curl_scheme == "https"
+        assert rule.default_port == 9200
+        self.parse = rule.parse
+
+    def test_secured_401_security_exception(self):
+        verdict, reason = self.parse(self.SECURED_OUT, "")
+        assert verdict == "fixed"
+        assert "401" in reason
+
+    def test_unauthenticated_cluster_info(self):
+        verdict, reason = self.parse(self.VULN_OUT, "")
+        assert verdict == "not_fixed"
+        assert "without authentication" in reason.lower()
+
+
+class TestUnsupportedWindowsOS:
+    SUMMARY = "Unsupported Windows OS (remote)"
+
+    SUPPORTED_OUT = """
+445/tcp open  microsoft-ds
+| smb-os-discovery:
+|   OS: Windows Server 2022 Standard 20348 (Windows Server 2022 Standard 6.3)
+|   Computer name: SHAREPOINTT
+|   FQDN: SHAREPOINTT.tigo.co.tz
+"""
+
+    EOL_OUT = """
+445/tcp open  microsoft-ds
+| smb-os-discovery:
+|   OS: Windows Server 2012 R2 Standard 9600 (Windows Server 2012 R2 Standard 6.3)
+|   Computer name: OLDSERVER
+"""
+
+    def setup_method(self):
+        rule = match_rule(self.SUMMARY)
+        assert rule is not None
+        assert rule.nmap_script == "smb-os-discovery"
+        assert rule.default_port == 445
+        self.parse = rule.parse
+
+    def test_supported_server_2022(self):
+        verdict, reason = self.parse(self.SUPPORTED_OUT, "")
+        assert verdict == "fixed"
+        assert "2022" in reason
+        assert "supported" in reason.lower()
+
+    def test_eol_server_2012_r2(self):
+        verdict, reason = self.parse(self.EOL_OUT, "")
+        assert verdict == "not_fixed"
+        assert "2012" in reason
+        assert "past end of support" in reason.lower()
+
+
+class TestEsxiVmsa20250013:
+    SUMMARY = (
+        "VMware ESXi 7.x < 7.0 Update 3w / 8.x < 8.0 Update 2e / "
+        "8.0 Update 3 < 8.0 Update 3f (VMSA-2025-0013)"
+    )
+
+    VULN_OUT = """
+<fullName>VMware ESXi 7.0.2 build-17867351</fullName>
+<version>7.0.2</version>
+"""
+
+    FIXED_7_OUT = """
+<fullName>VMware ESXi 7.0 Update 3 build-24784741</fullName>
+<version>7.0.3</version>
+"""
+
+    FIXED_8U3_OUT = """
+<fullName>VMware ESXi 8.0.3 build-24784735</fullName>
+<version>8.0.3</version>
+"""
+
+    FIXED_8U2_OUT = """
+<fullName>VMware ESXi 8.0.2 build-24789317</fullName>
+<version>8.0.2</version>
+"""
+
+    def setup_method(self):
+        rule = match_rule(self.SUMMARY)
+        assert rule is not None
+        assert rule.tool == "curl"
+        assert rule.curl_method == "POST"
+        assert rule.curl_path == "/sdk"
+        self.parse = rule.parse
+
+    def test_vulnerable_702(self):
+        verdict, reason = self.parse(self.VULN_OUT, "")
+        assert verdict == "not_fixed"
+        assert "17867351" in reason
+        assert "24784741" in reason
+
+    def test_fixed_70u3w(self):
+        verdict, reason = self.parse(self.FIXED_7_OUT, "")
+        assert verdict == "fixed"
+        assert "7.0 Update 3w" in reason
+
+    def test_fixed_80u3f(self):
+        verdict, _ = self.parse(self.FIXED_8U3_OUT, "")
+        assert verdict == "fixed"
+
+    def test_fixed_80u2e(self):
+        verdict, _ = self.parse(self.FIXED_8U2_OUT, "")
+        assert verdict == "fixed"

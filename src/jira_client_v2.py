@@ -325,6 +325,24 @@ class JiraClientV2:
             timeout=15,
         ).raise_for_status()
 
+    def add_attachment(
+        self, key: str, filename: str, content: bytes, mime_type: str = "image/png"
+    ) -> str:
+        """Upload a file attachment; return the filename Jira stored."""
+        import io
+        files = {"file": (filename, io.BytesIO(content), mime_type)}
+        resp = self._session.post(
+            f"{self.cfg.url}/rest/api/2/issue/{key}/attachments",
+            files=files,
+            headers={"X-Atlassian-Token": "no-check"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        attachments = resp.json()
+        if attachments:
+            return attachments[0].get("filename", filename)
+        return filename
+
     # ── Serialise ─────────────────────────────────────────────────────────
 
     def _serialize(self, issue: Dict) -> Dict[str, Any]:

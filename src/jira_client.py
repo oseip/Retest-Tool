@@ -223,6 +223,19 @@ class JiraClient:
     def add_comment(self, key: str, body: str):
         self._j.add_comment(key, body)
 
+    def add_attachment(
+        self, key: str, filename: str, content: bytes, mime_type: str = "image/png"
+    ) -> str:
+        """Upload a file attachment; return the filename Jira stored."""
+        import io
+        bio = io.BytesIO(content)
+        bio.name = filename
+        result = self._j.add_attachment(issue=key, attachment=bio, filename=filename)
+        if isinstance(result, list) and result:
+            att = result[0]
+            return getattr(att, "filename", None) or filename
+        return getattr(result, "filename", None) or filename
+
     # Maps our button labels to the range of names Jira workflows actually use
     _TRANSITION_ALIASES = {
         "fixed": {

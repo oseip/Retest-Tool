@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Nemesis</title>
-  <link rel="stylesheet" href="/static/style.css?v=17">
+  <link rel="stylesheet" href="/static/style.css?v=19">
   <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
 </head>
 <body>
@@ -307,7 +307,7 @@
   </div>
 
   <!-- SHELL VIEW -->
-  <div id="shellView" style="display:none; flex:1; overflow-y:auto; padding:28px 32px; background:var(--bg); flex-direction:column;">
+  <div id="shellView" class="shell-view" style="display:none;">
 
     <div class="report-controls">
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
@@ -338,13 +338,13 @@
       <div class="pf-form">
         <div class="pf-field">
           <label class="report-label">Target host:port</label>
-          <input type="text" id="tunnelTarget" class="text-input pf-input" placeholder="127.0.0.1:8080" onkeydown="if(event.key==='Enter')startTunnel()">
+          <input type="text" id="tunnelTarget" class="text-input pf-input" placeholder="127.0.0.1:8080" onkeydown="if(event.key==='Enter')startTunnel(event)">
         </div>
         <div class="pf-field">
           <label class="report-label">Local port <span class="pf-optional">optional</span></label>
-          <input type="number" id="tunnelLocalPort" class="text-input pf-input pf-input-sm" placeholder="same as target" min="1" max="65535" onkeydown="if(event.key==='Enter')startTunnel()">
+          <input type="number" id="tunnelLocalPort" class="text-input pf-input pf-input-sm" placeholder="same as target" min="1" max="65535" onkeydown="if(event.key==='Enter')startTunnel(event)">
         </div>
-        <button class="btn btn-primary pf-start-btn" onclick="startTunnel()">▶ Start Tunnel</button>
+        <button type="button" class="btn btn-primary pf-start-btn" onclick="startTunnel(event)">▶ Start Tunnel</button>
       </div>
       <div id="tunnelList" class="pf-tunnels"></div>
     </div>
@@ -666,6 +666,8 @@
       <div class="form-group">
         <label>Comment (optional)</label>
         <textarea id="modalComment" rows="3" placeholder="Add a comment to the Jira ticket..."></textarea>
+        <p class="modal-hint">Paste a screenshot here with ⌘V / Ctrl+V — it will be attached to the Jira comment automatically.</p>
+        <div id="modalScreenshotPreview" class="screenshot-preview" style="display:none"></div>
       </div>
       <div class="modal-actions">
         <button class="btn btn-secondary" id="modalCancel">Cancel</button>
@@ -746,6 +748,6 @@
   <script src="/static/vendor/xterm/xterm.js"></script>
   <script src="/static/vendor/xterm/xterm-addon-fit.js"></script>
   <script src="/static/intake.js?v=7"></script>
-  <script src="/static/app.js?v=23"></script>
+  <script src="/static/app.js?v=25"></script>
 </body>
 </html>

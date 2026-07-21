@@ -126,16 +126,38 @@ def _queue_ticket(ticket: Dict[str, Any], client_label: str,
     nmap_cmd: Optional[str] = None
     if rule and ip:
         if rule.tool == "curl":
-            scheme = "https" if port in (443, 8443) else "http"
+            scheme = rule.curl_scheme or ("https" if port in (443, 8443) else "http")
             # extra_args can inject additional curl flags (e.g. -H 'Origin: ...' for CORS)
             curl_extra = f" {rule.extra_args}" if rule.extra_args else ""
-            nmap_cmd = (
-                f'curl -sk -L --max-time 15 '
-                f'-w "\\n[STATUS:%{{http_code}}][URL:%{{url_effective}}]\\n" '
-                f'-D -{curl_extra} {scheme}://{ip}:{port}{rule.curl_path}'
-            )
+            status_suffix = '-w "\\n[STATUS:%{http_code}][URL:%{url_effective}]\\n"'
+            url = f"{scheme}://{ip}:{port}{rule.curl_path}"
+            if rule.curl_method == "POST" and rule.curl_post_data:
+                body = rule.curl_post_data.replace("'", "'\\''")
+                nmap_cmd = (
+                    f"curl -sk --max-time 15 -X POST "
+                    f'-H "Content-Type: text/xml" '
+                    f"-d '{body}' "
+                    f"{status_suffix} "
+                    f"{url}"
+                )
+            elif rule.curl_paths:
+                urls = " ".join(f"{scheme}://{ip}:{port}{p}" for p in rule.curl_paths)
+                nmap_cmd = (
+                    f'curl -sk --max-time 15 '
+                    f'-w "\\n[STATUS:%{{http_code}}][URL:%{{url_effective}}]\\n" '
+                    f'-o /dev/null{curl_extra} {urls}'
+                )
+            else:
+                nmap_cmd = (
+                    f'curl -sk -L --max-time 15 '
+                    f'-w "\\n[STATUS:%{{http_code}}][URL:%{{url_effective}}]\\n" '
+                    f'-D -{curl_extra} {scheme}://{ip}:{port}{rule.curl_path}'
+                )
         elif rule.tool == "redis-cli":
-            nmap_cmd = f"timeout 15 redis-cli -h {ip} -p {port} INFO"
+            # Manual flow: redis-cli -h <ip> [-p <port>]  →  info
+            # Non-interactive equivalent passes info on the same invocation.
+            redis_port = port or 6379
+            nmap_cmd = f"timeout 15 redis-cli -h {ip} -p {redis_port} info"
         else:
             parts = ["sudo nmap" if rule.requires_root else "nmap"]
             if rule.extra_args:
@@ -193,6 +215,45 @@ def _queue_ticket(ticket: Dict[str, Any], client_label: str,
         JOBS[job_id] = job
 
     return job_id
+
+
+def _reconcile_manual_jobs(tag: str = "") -> int:
+    """Promote manual jobs to queued when a scan rule now matches their summary."""
+    promoted = 0
+    with _lock:
+        candidates = [
+            (job_id, job) for job_id, job in JOBS.items()
+            if job.get("status") == "manual"
+        ]
+    for job_id, job in candidates:
+        rule = match_rule(job.get("ticket_summary") or "")
+        if not rule:
+            continue
+        ticket = {
+            "key": job["ticket_key"],
+            "summary": job["ticket_summary"],
+            "description": job.get("ticket_description", ""),
+            "status": job.get("ticket_status", ""),
+            "cvss": job.get("ticket_cvss"),
+            "severity": job.get("ticket_severity"),
+            "technology": job.get("ticket_technology"),
+            "testtype": job.get("ticket_testtype", ""),
+            "cves": job.get("ticket_cves", []),
+            "ips": [job["ip"]] if job.get("ip") else [],
+            "ports": [str(job["port"])] if job.get("port") is not None else [],
+        }
+        with _lock:
+            JOBS.pop(job_id, None)
+        _queue_ticket(
+            ticket, job["client_label"],
+            source=job.get("source", "poll"),
+            manual=False,
+            session=job.get("session", "axian"),
+        )
+        promoted += 1
+    if promoted:
+        _app_log(f"{tag}Reconciled {promoted} manual job(s) — now auto-scan")
+    return promoted
 
 
 def _local_exec_stream(command: str, emit, timeout: int = 600, stop_event=None) -> int:
@@ -414,7 +475,8 @@ def run_scan(job_id: str, cfg: Config):
 
         if rule and rule.parse:
             ticket_desc = job.get("ticket_description", "")
-            verdict, reason = rule.parse(text_output, xml_out, ticket_desc)
+            ticket_ctx = f"{ticket_desc}\n{job.get('ticket_summary', '')}"
+            verdict, reason = rule.parse(text_output, xml_out, ticket_ctx)
         else:
             verdict, reason = "inconclusive", "No parser for this rule — review output manually"
 
@@ -784,6 +846,8 @@ def run_poll_cycle(cfg: Config, jira_client, session: str = "axian") -> None:
 
         except Exception as exc:
             _app_log(f"[ERROR] {tag}Poll failed for {client.label}: {exc}")
+
+    _reconcile_manual_jobs(tag)
 
     if session == "axian":
         _poll_count += 1

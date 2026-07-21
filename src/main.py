@@ -623,10 +623,28 @@ def add_tickets(req: AddTicketsRequest):
 
 # ── Jira transitions ───────────────────────────────────────────────────────
 
-class TransitionRequest(BaseModel):
-    job_id: str
-    to_status: str          # "Fixed" or "Not Fixed"
-    comment: Optional[str] = None
+def _apply_transition_comment(
+    jira_client,
+    ticket_key: str,
+    comment: Optional[str],
+    screenshot_bytes: Optional[bytes] = None,
+    screenshot_name: str = "screenshot.png",
+    screenshot_mime: str = "image/png",
+) -> None:
+    """Upload optional screenshot and post Jira comment (with thumbnail markup)."""
+    text = (comment or "").strip()
+    attach_name = None
+    if screenshot_bytes:
+        attach_name = jira_client.add_attachment(
+            ticket_key, screenshot_name, screenshot_bytes, screenshot_mime
+        )
+    if not text and not attach_name:
+        return
+    body = text
+    if attach_name:
+        embed = f"!{attach_name}|thumbnail!"
+        body = f"{body}\n\n{embed}".strip() if body else embed
+    jira_client.add_comment(ticket_key, body)
 
 
 class SweepRunRequest(BaseModel):
@@ -634,27 +652,44 @@ class SweepRunRequest(BaseModel):
 
 
 @app.post("/api/transition")
-def transition_ticket(req: TransitionRequest):
-    job = scanner.JOBS.get(req.job_id)
+async def transition_ticket(
+    job_id: str = Form(...),
+    to_status: str = Form(...),
+    comment: Optional[str] = Form(None),
+    screenshot: Optional[UploadFile] = File(None),
+):
+    job = scanner.JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
+
+    screenshot_bytes = None
+    screenshot_name = "screenshot.png"
+    screenshot_mime = "image/png"
+    if screenshot:
+        raw = await screenshot.read()
+        if raw:
+            screenshot_bytes = raw
+            screenshot_name = screenshot.filename or screenshot_name
+            screenshot_mime = screenshot.content_type or screenshot_mime
 
     ticket_key = job["ticket_key"]
     jira_client = _jira_for_job(job)
     try:
         # Transition first, then comment — so we never leave a "verified fixed"
         # comment on a ticket whose transition actually failed.
-        jira_client.transition(ticket_key, req.to_status)
-        if req.comment:
-            jira_client.add_comment(ticket_key, req.comment)
+        jira_client.transition(ticket_key, to_status)
+        _apply_transition_comment(
+            jira_client, ticket_key, comment,
+            screenshot_bytes, screenshot_name, screenshot_mime,
+        )
         # Remove job immediately — don't wait for poll to clean it up.
         # Jira's search index lags after a transition, so the poll would
         # still see the ticket as Remediated and leave it in the queue.
         with scanner._lock:
-            scanner.JOBS.pop(req.job_id, None)
+            scanner.JOBS.pop(job_id, None)
             scanner.SEEN_KEYS.discard(ticket_key)
-        scanner._app_log(f"Jira updated: {ticket_key} → {req.to_status} (removed from queue)")
-        return {"ok": True, "ticket": ticket_key, "status": req.to_status}
+        scanner._app_log(f"Jira updated: {ticket_key} → {to_status} (removed from queue)")
+        return {"ok": True, "ticket": ticket_key, "status": to_status}
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -662,13 +697,13 @@ def transition_ticket(req: TransitionRequest):
         raise HTTPException(500, str(exc))
 
 
-class FastTrackRequest(BaseModel):
-    target: str               # "Fixed" or "Not Fixed"
-    comment: Optional[str] = None
-
-
 @app.post("/api/jobs/{job_id}/fast-track")
-def fast_track_ticket(job_id: str, req: FastTrackRequest):
+async def fast_track_ticket(
+    job_id: str,
+    target: str = Form(...),
+    comment: Optional[str] = Form(None),
+    screenshot: Optional[UploadFile] = File(None),
+):
     """
     Two-phase fast-track.
 
@@ -677,7 +712,7 @@ def fast_track_ticket(job_id: str, req: FastTrackRequest):
       Returns {ok, partial:true, current_status, message} — job stays on board.
 
     Phase 2 (ticket already at Remediated):
-      Apply req.target (Fixed / Not Fixed) directly.
+      Apply target (Fixed / Not Fixed) directly.
       Returns {ok, partial:false, chain} — job removed from board.
 
     No comment is ever posted on Jira if any transition fails.
@@ -685,6 +720,16 @@ def fast_track_ticket(job_id: str, req: FastTrackRequest):
     job = scanner.JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
+
+    screenshot_bytes = None
+    screenshot_name = "screenshot.png"
+    screenshot_mime = "image/png"
+    if screenshot:
+        raw = await screenshot.read()
+        if raw:
+            screenshot_bytes = raw
+            screenshot_name = screenshot.filename or screenshot_name
+            screenshot_mime = screenshot.content_type or screenshot_mime
 
     ticket_key   = job["ticket_key"]
     jira_client  = _jira_for_job(job)
@@ -694,11 +739,13 @@ def fast_track_ticket(job_id: str, req: FastTrackRequest):
     at_remediated  = current_status.lower() == retest_status.lower()
 
     # Phase 1 → advance to Remediated; Phase 2 → go to final target
-    effective_target = req.target if at_remediated else retest_status
+    effective_target = target if at_remediated else retest_status
 
     try:
-        completed = jira_client.fast_track(
-            ticket_key, effective_target, comment=req.comment or ""
+        completed = jira_client.fast_track(ticket_key, effective_target, comment="")
+        _apply_transition_comment(
+            jira_client, ticket_key, comment,
+            screenshot_bytes, screenshot_name, screenshot_mime,
         )
 
         if not at_remediated:
@@ -718,7 +765,7 @@ def fast_track_ticket(job_id: str, req: FastTrackRequest):
                 "current_status": retest_status,
                 "message": (
                     f"Ticket moved to {retest_status}. "
-                    f"Click again to mark as {req.target}."
+                    f"Click again to mark as {target}."
                 ),
             }
         else:
@@ -815,7 +862,7 @@ def sweep_advance():
 
 class BulkFastTrackRequest(BaseModel):
     job_ids: List[str]
-    target: str  # always "Fixed"; backend applies two-phase logic per job
+    target: str  # "Remediated" (phase 1) or "Fixed" / "Not Fixed" (phase 2)
 
 
 @app.post("/api/jobs/bulk-fast-track")
@@ -1703,8 +1750,18 @@ def _batch_scan_one(kali, ip: str, port: int, rule) -> dict:
     xml_path = f"/tmp/batchscan_{job_id}.xml"
 
     if rule.tool == "curl":
-        scheme = "https" if port in (443, 8443, 10443) else "http"
-        cmd = (f"curl -sk -m 15 -D - {scheme}://{ip}:{port}{rule.curl_path} 2>&1")
+        scheme = rule.curl_scheme or ("https" if port in (443, 8443, 10443) else "http")
+        url = f"{scheme}://{ip}:{port}{rule.curl_path}"
+        if rule.curl_method == "POST" and rule.curl_post_data:
+            body = rule.curl_post_data.replace("'", "'\\''")
+            cmd = (
+                f"curl -sk -m 15 -X POST "
+                f'-H "Content-Type: text/xml" '
+                f"-d '{body}' "
+                f"{url} 2>&1"
+            )
+        else:
+            cmd = (f"curl -sk -m 15 -D - {scheme}://{ip}:{port}{rule.curl_path} 2>&1")
         stdout, _, _ = kali.exec(cmd, timeout=20)
         xml_out = ""
     else:
