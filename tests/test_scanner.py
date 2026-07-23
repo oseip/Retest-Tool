@@ -129,6 +129,126 @@ class TestQueueTicket:
         cmd = scanner.JOBS[job_id]["nmap_command"]
         assert "###XML###" in cmd
 
+    def test_smb_null_command_includes_smbclient(self):
+        ticket = make_ticket(
+            summary="SMB NULL Session Authentication",
+            ips=["10.135.159.39"],
+            ports=["445"],
+        )
+        job_id = scanner._queue_ticket(ticket, "TestClient")
+        cmd = scanner.JOBS[job_id]["nmap_command"]
+        assert "smb-enum-shares" in cmd
+        assert "###SMBCLIENT###" in cmd
+        assert 'smbclient -L //10.135.159.39 -U "" -N' in cmd
+
+    def test_mongodb_command_includes_mongosh_when_available(self):
+        ticket = make_ticket(
+            summary="MongoDB Unauthenticated Access",
+            ips=["10.0.0.1"],
+            ports=["27017"],
+        )
+        job_id = scanner._queue_ticket(ticket, "TestClient")
+        cmd = scanner.JOBS[job_id]["nmap_command"]
+        assert "mongodb-info" in cmd
+        assert "###MONGOSH###" in cmd
+        assert "command -v mongosh" in cmd
+        assert 'mongosh "mongodb://10.0.0.1:27017/"' in cmd
+        assert "listDatabases" in cmd
+
+    def test_nfs_shares_command_includes_showmount(self):
+        ticket = make_ticket(
+            summary="NFS Shares Accessible",
+            ips=["10.0.0.1"],
+            ports=["2049"],
+        )
+        job_id = scanner._queue_ticket(ticket, "TestClient")
+        cmd = scanner.JOBS[job_id]["nmap_command"]
+        assert "nfs-showmount" in cmd
+        assert "###SHOWMOUNT###" in cmd
+        assert "command -v showmount" in cmd
+        assert "showmount -e 10.0.0.1" in cmd
+
+    def test_ftp_anonymous_command_includes_ftp_login(self):
+        ticket = make_ticket(
+            summary="FTP Anonymous Access",
+            ips=["10.0.0.1"],
+            ports=["21"],
+        )
+        job_id = scanner._queue_ticket(ticket, "TestClient")
+        cmd = scanner.JOBS[job_id]["nmap_command"]
+        assert "ftp-anon" in cmd
+        assert "###FTP###" in cmd
+        assert "command -v ftp" in cmd
+        assert "user anonymous anonymous@" in cmd
+        assert "ftp -nv 10.0.0.1 21" in cmd
+
+    def test_idrac_command_includes_redfish_curl(self):
+        ticket = make_ticket(
+            summary="Dell EMC iDRAC Multiple Vulnerabilities",
+            ips=["10.0.0.1"],
+            ports=["443"],
+        )
+        job_id = scanner._queue_ticket(ticket, "TestClient")
+        cmd = scanner.JOBS[job_id]["nmap_command"]
+        assert "http-server-header" in cmd
+        assert "###CURL###" in cmd
+        assert "command -v curl" in cmd
+        assert "redfish/v1/Managers/iDRAC.Embedded.1" in cmd
+        assert "https://10.0.0.1:443" in cmd
+
+    def test_activemq_command_includes_web_console_curl(self):
+        ticket = make_ticket(
+            summary="ActiveMQ RCE CVE-2023-46604",
+            ips=["10.0.0.1"],
+            ports=["61616"],
+        )
+        job_id = scanner._queue_ticket(ticket, "TestClient")
+        cmd = scanner.JOBS[job_id]["nmap_command"]
+        assert "banner" in cmd
+        assert "###CURL###" in cmd
+        assert "8161/admin/" in cmd
+        assert "http://10.0.0.1:8161" in cmd
+
+    def test_activemq_multiple_vulns_command_includes_web_console(self):
+        ticket = make_ticket(
+            summary="Apache ActiveMQ 5.17 Multiple Vulnerabilities",
+            ips=["10.0.0.1"],
+            ports=["61616"],
+        )
+        job_id = scanner._queue_ticket(ticket, "TestClient")
+        cmd = scanner.JOBS[job_id]["nmap_command"]
+        assert "banner" in cmd
+        assert "###CURL###" in cmd
+        assert "8161/admin/" in cmd
+
+    def test_tomcat_version_command_includes_curl(self):
+        ticket = make_ticket(
+            summary="Apache Tomcat 9.0.35 Multiple Vulnerabilities",
+            ips=["10.0.0.1"],
+            ports=["8080"],
+        )
+        job_id = scanner._queue_ticket(ticket, "TestClient")
+        cmd = scanner.JOBS[job_id]["nmap_command"]
+        assert "http-server-header" in cmd
+        assert "###CURL###" in cmd
+        assert "curl -sk -I" in cmd
+        assert "VERSION.txt" in cmd
+        assert "http://10.0.0.1:8080" in cmd
+
+    def test_http_trace_command_uses_http_trace_and_track_curl(self):
+        ticket = make_ticket(
+            summary="HTTP TRACE Method Enabled",
+            ips=["10.0.0.1"],
+            ports=["80"],
+        )
+        job_id = scanner._queue_ticket(ticket, "TestClient")
+        cmd = scanner.JOBS[job_id]["nmap_command"]
+        assert "http-trace" in cmd
+        assert "http-methods" not in cmd
+        assert "###CURL###" in cmd
+        assert "-X TRACK" in cmd
+        assert "http://10.0.0.1:80" in cmd
+
     def test_nmap_command_contains_job_id_in_tmp_path(self):
         ticket = make_ticket(summary="SSL Certificate Expiry on 10.0.0.1")
         job_id = scanner._queue_ticket(ticket, "TestClient")
@@ -679,3 +799,21 @@ class TestCancelAllTriage:
 
         scanner._cancelled_ids.discard(job_a)
         scanner._pending_triage_ids.discard(job_b)
+
+
+class TestSudoNmap:
+    def test_sudo_prepended_when_client_requires_it(self):
+        from tests.conftest import make_test_config
+        cfg = make_test_config()
+        cfg.clients[0].sudo_nmap = True
+        ticket = make_ticket(summary="SSL Certificate Expiry on 10.0.0.1")
+        job_id = scanner._queue_ticket(ticket, "TestClient", cfg=cfg)
+        cmd = scanner.JOBS[job_id]["nmap_command"]
+        assert cmd.startswith("sudo nmap")
+
+    def test_no_sudo_by_default(self):
+        ticket = make_ticket(summary="SSL Certificate Expiry on 10.0.0.1")
+        job_id = scanner._queue_ticket(ticket, "TestClient")
+        cmd = scanner.JOBS[job_id]["nmap_command"]
+        assert cmd.startswith("nmap ")
+        assert not cmd.startswith("sudo nmap")

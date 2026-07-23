@@ -46,6 +46,23 @@ def _xml_elem(xml: str, key: str) -> Optional[str]:
     return None
 
 
+def _ssl_cert_dn(text: str, xml: str, field: str) -> Optional[str]:
+    """Return normalized subject/issuer DN from ssl-cert XML or nmap text output."""
+    val = _xml_elem(xml, field)
+    if not val:
+        m = re.search(rf'{field}:\s*(.+)', text, re.I)
+        val = m.group(1).strip() if m else None
+    return val.strip().lower() if val else None
+
+
+def _ssl_cert_self_signed(text: str, xml: str) -> Optional[bool]:
+    subject = _ssl_cert_dn(text, xml, "subject")
+    issuer = _ssl_cert_dn(text, xml, "issuer")
+    if subject and issuer:
+        return subject == issuer
+    return None
+
+
 # Patterns to extract the originally-vulnerable version from the Jira description.
 # Tried in order; first match wins.
 _VER_EXTRACT_PATTERNS = [
@@ -56,7 +73,6 @@ _VER_EXTRACT_PATTERNS = [
     r'wordpress|joomla|drupal|proftpd|vsftpd|postfix|exim|struts|spring|'
     r'confluence|jira|fortios|fortigate|pan-os|netscaler|citrix|'
     r'pulse|ivanti|exchange|rabbitmq|cassandra|couchdb)[/ ]+v?([\d]+[\d.p\-]+)',
-    r'/([\d]+\.\d+[\d.p\-]*)',
     r'v?([\d]+\.\d+\.\d+[\d.p\-]*)\s+(?:was|is|has been|are)\s+(?:detected|found|installed|running|vulnerable)',
 ]
 
@@ -128,16 +144,39 @@ def _parse_ssl_expiry(text: str, xml: str, description: str = "") -> Tuple[Verdi
 def _parse_ssl_trust(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
-    low = text.lower()
+
+    openssl_section = text
+    nmap_section = text
+    if re.search(r"###OPENSSL###", text, re.I):
+        parts = re.split(r"###OPENSSL###", text, maxsplit=1, flags=re.I)
+        nmap_section = parts[0]
+        openssl_section = parts[1]
+        if re.search(r"###XML###", openssl_section, re.I):
+            openssl_section = re.split(r"###XML###", openssl_section, maxsplit=1, flags=re.I)[0]
+
+    low = (nmap_section + "\n" + openssl_section).lower()
+    if "self-signed certificate" in low or "self signed certificate" in low:
+        return "not_fixed", "Certificate is still self-signed (openssl verify)"
+    if "verify return:1" in low or "verify return code: 1" in low:
+        return "not_fixed", "Certificate is still self-signed (openssl verify return 1)"
+    if "verify return:0" in low or "verify return code: 0" in low:
+        return "fixed", "Certificate chain verifies successfully (openssl verify return 0)"
+    if "unable to get local issuer certificate" in low or "certificate verify failed" in low:
+        return "not_fixed", "Certificate still not trusted by a known CA"
     if "self-signed" in low or "self signed" in low:
         return "not_fixed", "Certificate is still self-signed"
-    if "unable to get local issuer" in low or "certificate verify failed" in low:
-        return "not_fixed", "Certificate still not trusted by a known CA"
-    if "ssl-cert" in low and "self-signed" not in low and ("issuer" in low or _xml_elem(xml, "commonName")):
-        return "fixed", "Certificate appears to have a valid issuer"
-    if "ssl-cert" not in low:
-        return "inconclusive", "Could not retrieve certificate"
-    return "inconclusive", "Could not determine certificate trust status"
+
+    cert_self_signed = _ssl_cert_self_signed(nmap_section, xml)
+    if cert_self_signed is True:
+        return "not_fixed", "Certificate subject matches issuer — still self-signed"
+    if cert_self_signed is False:
+        return "inconclusive", (
+            "Certificate has distinct issuer — confirm full chain trust with openssl verify"
+        )
+
+    if "ssl-cert" in low:
+        return "inconclusive", "Certificate retrieved — could not confirm CA trust remotely"
+    return "inconclusive", "Could not retrieve certificate"
 
 
 def _parse_ssl_weak_hash(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
@@ -265,6 +304,74 @@ def _parse_dh_params(text: str, xml: str, description: str = "") -> Tuple[Verdic
     return "inconclusive", "Could not determine DH parameter size — check output"
 
 
+def _ssh_algo_field_tokens(text: str, field: str) -> List[str]:
+    """Return algorithm names listed under an ssh2-enum-algos field."""
+    tokens: List[str] = []
+    # Inline comma-separated: encryption_algorithms: aes256-ctr,aes128-ctr
+    for m in re.finditer(
+        rf"^[ \t]*{re.escape(field)}\s*(?:\(\d+\))?\s*:?\s*(.+)$",
+        text,
+        re.I | re.M,
+    ):
+        rest = m.group(1).strip()
+        if rest:
+            tokens.extend(t.strip().lower() for t in rest.split(",") if t.strip())
+    # Indented list under a header like "encryption_algorithms (3):"
+    block = re.search(
+        rf"^[ \t]*{re.escape(field)}\s*\(\d+\)\s*:?\s*\n((?:[ \t]+\S[^\n]*\n)+)",
+        text,
+        re.I | re.M,
+    )
+    if block:
+        for line in block.group(1).splitlines():
+            t = line.strip().lower()
+            if t:
+                tokens.append(t)
+    return tokens
+
+
+def _ssh_weak_mac(name: str) -> bool:
+    """True for weak MAC names; hmac-sha1-etm@openssh.com is acceptable."""
+    if name == "hmac-sha1-etm@openssh.com":
+        return False
+    if name == "hmac-sha1":
+        return True
+    return name in ("hmac-md5", "hmac-sha1-96", "hmac-md5-96", "umac-64@openssh.com")
+
+
+_WEAK_SSH_CIPHERS = (
+    "arcfour", "blowfish-cbc", "cast128-cbc", "3des-cbc", "des-cbc",
+)
+_WEAK_SSH_KEX = (
+    "diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1",
+    "diffie-hellman-group-exchange-sha1",
+    "gss-gex-sha1", "gss-group1-sha1", "gss-group14-sha1",
+)
+_TERRAPIN_CIPHER = "chacha20-poly1305@openssh.com"
+
+
+def _ssh_is_etm_mac(name: str) -> bool:
+    """Encrypt-then-MAC variants are not vulnerable to Terrapin via CBC."""
+    return "-etm" in name
+
+
+def _ssh_terrapin_hits(enc_tokens: List[str], mac_tokens: List[str]) -> List[str]:
+    """CVE-2023-48795: chacha20-poly1305 and CBC + Encrypt-and-MAC (non-EtM)."""
+    hits: List[str] = []
+    if _TERRAPIN_CIPHER in enc_tokens:
+        hits.append(f"{_TERRAPIN_CIPHER} enabled")
+    cbc = [t for t in enc_tokens if t.endswith("-cbc")]
+    if cbc and mac_tokens:
+        non_etm = [m for m in mac_tokens if not _ssh_is_etm_mac(m)]
+        if non_etm:
+            hits.append(
+                "CBC with Encrypt-and-MAC (non-EtM MACs: "
+                + ", ".join(non_etm[:4])
+                + ")"
+            )
+    return hits
+
+
 def _parse_ssh_algos(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
@@ -272,32 +379,103 @@ def _parse_ssh_algos(text: str, xml: str, description: str = "") -> Tuple[Verdic
     if _port_closed(low, 22):
         return "inconclusive", "SSH port closed or filtered"
 
-    problems = []
+    has_enum = (
+        "ssh2-enum-algos" in low
+        or "encryption_algorithms" in low
+        or "server_host_key_algorithms" in low
+    )
 
-    # hmac-sha1 without -etm suffix is weak; hmac-sha1-etm@openssh.com is acceptable
-    if re.search(r'hmac-sha1(?!-etm)', low):
-        problems.append("Weak MAC: hmac-sha1")
-    for mac in ("hmac-md5", "hmac-sha1-96", "hmac-md5-96", "umac-64@openssh.com"):
-        if mac in low:
-            problems.append(f"Weak MAC: {mac}")
+    enc_tokens = _ssh_algo_field_tokens(text, "encryption_algorithms")
+    mac_tokens = _ssh_algo_field_tokens(text, "mac_algorithms")
+    kex_tokens = _ssh_algo_field_tokens(text, "kex_algorithms")
 
-    for cipher in ("arcfour", "blowfish-cbc", "cast128-cbc", "3des-cbc", "des-cbc"):
-        if cipher in low:
-            problems.append(f"Weak cipher: {cipher}")
-    # CBC ciphers in the encryption_algorithms list = Terrapin risk
-    if re.search(r'\S+-cbc', low) and "encryption_algorithms" in low:
-        problems.append("CBC mode ciphers present (Terrapin vulnerability risk)")
+    mac_hits = sorted({t for t in mac_tokens if _ssh_weak_mac(t)})
+    cbc_hits = sorted({t for t in enc_tokens if t.endswith("-cbc")})
+    cipher_hits = sorted({
+        t for t in enc_tokens
+        if t in _WEAK_SSH_CIPHERS or any(w in t for w in _WEAK_SSH_CIPHERS)
+    })
+    kex_hits = sorted({t for t in kex_tokens if t in _WEAK_SSH_KEX})
 
-    for kex in ("diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1",
-                 "diffie-hellman-group-exchange-sha1",
-                 "gss-gex-sha1", "gss-group1-sha1", "gss-group14-sha1"):
-        if kex in low:
-            problems.append(f"Weak KEX: {kex}")
+    # Supplement with whole-text matches when enum output uses non-standard lines.
+    if has_enum:
+        if re.search(r"hmac-sha1(?![\w-])", low) and "hmac-sha1" not in mac_hits:
+            mac_hits.append("hmac-sha1")
+        for mac in ("hmac-md5", "hmac-sha1-96", "hmac-md5-96", "umac-64@openssh.com"):
+            if mac in low and mac not in mac_hits:
+                mac_hits.append(mac)
+        for cipher in _WEAK_SSH_CIPHERS:
+            if cipher in low and cipher not in cipher_hits and cipher not in cbc_hits:
+                cipher_hits.append(cipher)
+        for kex in _WEAK_SSH_KEX:
+            if kex in low and kex not in kex_hits:
+                kex_hits.append(kex)
+        if not cbc_hits and "encryption_algorithms" in low:
+            for m in re.finditer(r"(\S+-cbc)", low):
+                name = m.group(1)
+                if name not in cbc_hits:
+                    cbc_hits.append(name)
+
+    mac_hits = sorted(set(mac_hits))
+    cbc_hits = sorted(set(cbc_hits))
+    cipher_hits = sorted(set(cipher_hits))
+    kex_hits = sorted(set(kex_hits))
+    terrapin_hits = _ssh_terrapin_hits(enc_tokens, mac_tokens)
+    if has_enum and _TERRAPIN_CIPHER in low and not any(
+        _TERRAPIN_CIPHER in h for h in terrapin_hits
+    ):
+        terrapin_hits.append(f"{_TERRAPIN_CIPHER} enabled")
+
+    checked_enc = bool(enc_tokens) or "encryption_algorithms" in low
+    checked_mac = bool(mac_tokens) or "mac_algorithms" in low
+    checked_kex = bool(kex_tokens) or "kex_algorithms" in low or bool(kex_hits)
+    checked_terrapin = checked_enc and (
+        _TERRAPIN_CIPHER in enc_tokens
+        or bool(cbc_hits)
+        or checked_mac
+    )
+
+    problems: List[str] = []
+    notes: List[str] = []
+
+    if checked_enc:
+        if cbc_hits:
+            problems.append("CBC: ciphers present — " + ", ".join(cbc_hits))
+        else:
+            notes.append("CBC: OK (no CBC ciphers)")
+        for c in cipher_hits:
+            if c not in cbc_hits:
+                problems.append(f"Weak cipher: {c}")
+        if checked_enc and not cipher_hits and not cbc_hits:
+            notes.append("Ciphers: OK")
+
+    if checked_terrapin:
+        if terrapin_hits:
+            problems.append("Terrapin: " + "; ".join(terrapin_hits))
+        else:
+            notes.append(
+                "Terrapin: OK (no chacha20-poly1305; no CBC + non-EtM MAC pairing)"
+            )
+
+    if checked_mac:
+        if mac_hits:
+            problems.append("Weak MAC: " + ", ".join(mac_hits))
+        else:
+            notes.append("MAC: OK")
+
+    if checked_kex:
+        if kex_hits:
+            problems.append("Weak KEX: " + ", ".join(kex_hits))
+        else:
+            notes.append("KEX: OK")
 
     if problems:
-        return "not_fixed", "; ".join(problems[:5])
+        detail = "; ".join(problems)
+        if notes:
+            detail += " | " + "; ".join(notes)
+        return "not_fixed", detail
 
-    if "ssh2-enum-algos" in low or "server_host_key_algorithms" in low or "encryption_algorithms" in low:
+    if has_enum:
         return "fixed", "No weak SSH algorithms detected"
     return "inconclusive", "Could not retrieve SSH algorithm list — script may not have connected"
 
@@ -550,27 +728,29 @@ def _parse_bluekeep(text: str, xml: str, description: str = "") -> Tuple[Verdict
     return "inconclusive", "Could not determine BlueKeep exposure — review rdp-enum-encryption output"
 
 
-def _parse_http_methods(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+def _parse_http_trace_track(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    """Parse nmap http-trace (TRACE) plus curl -X TRACK supplement."""
     if _host_down(text):
         return "inconclusive", "Host unreachable"
     low = text.lower()
     problems = []
-    if "http-methods" in low:
-        if re.search(r'\btrace\b', low):
-            problems.append("TRACE method still enabled")
-        if re.search(r'\btrack\b', low):
-            problems.append("TRACK method still enabled")
-        if re.search(r'\bput\b', low):
-            problems.append("PUT method enabled (file upload risk)")
-        if re.search(r'\bdelete\b', low):
-            problems.append("DELETE method enabled")
-        if re.search(r'\bconnect\b', low):
-            problems.append("CONNECT method enabled (proxy tunnelling risk)")
+    if "trace is enabled" in low:
+        problems.append("TRACE method still enabled")
+
+    track_m = re.search(r"\[TRACK_STATUS:(\d+)\]", text, re.I)
+    if track_m and int(track_m.group(1)) == 200:
+        problems.append("TRACK method still enabled")
+
     if problems:
         return "not_fixed", "; ".join(problems)
-    if "http-methods" in low:
-        return "fixed", "Dangerous HTTP methods (TRACE/TRACK/PUT/DELETE/CONNECT) not detected"
-    return "inconclusive", "Could not determine HTTP methods — port may be closed"
+
+    if not _got_response(low):
+        return "inconclusive", "Could not determine HTTP methods — port may be closed"
+
+    if track_m is None:
+        return "inconclusive", "TRACE not enabled — TRACK check did not complete (review curl -X TRACK output)"
+
+    return "fixed", "TRACE and TRACK methods not enabled"
 
 
 def _parse_hsts(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
@@ -589,8 +769,7 @@ def _parse_hsts(text: str, xml: str, description: str = "") -> Tuple[Verdict, st
     # Script ran but HSTS was not in response headers
     if "http-security-headers" in low or "http-headers" in low:
         return "not_fixed", "HSTS header not found in server response"
-    # curl output: HTTP/1.1 or HTTP/2 response line, or [STATUS:...] sentinel
-    if re.search(r'http/[12]|\[status:\d', low) or re.search(r'\d+/tcp open', low):
+    if _got_http_response(low):
         return "not_fixed", "Got HTTP response but HSTS header not found"
     return "inconclusive", "Could not check HSTS — port may be closed or filtered"
 
@@ -610,7 +789,7 @@ def _parse_clickjacking(text: str, xml: str, description: str = "") -> Tuple[Ver
         return "fixed", "Content-Security-Policy with frame-ancestors protection is present"
     if "http-security-headers" in low or "http-headers" in low:
         return "not_fixed", "X-Frame-Options / CSP frame-ancestors header not found in response"
-    if re.search(r'http/[12]|\[status:\d', low) or re.search(r'\d+/tcp open', low):
+    if _got_http_response(low):
         return "not_fixed", "Got HTTP response but X-Frame-Options / CSP frame-ancestors not found"
     return "inconclusive", "Could not check clickjacking protection"
 
@@ -618,7 +797,9 @@ def _parse_clickjacking(text: str, xml: str, description: str = "") -> Tuple[Ver
 def _parse_service_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
-    versions = re.findall(r'(?:server|version)[:\s/]+(\d+\.\d+[\d.]*)', text, re.I)
+    versions = re.findall(
+        r'(?:server|version)[:\s/=]+(\d+\.\d+[\d.]*)', text, re.I,
+    )
     if not versions:
         versions = re.findall(r'/([\d]+\.[\d]+\.[\d]+)', text)
     if versions:
@@ -810,9 +991,22 @@ def _parse_vnc(text: str, xml: str, description: str = "") -> Tuple[Verdict, str
     low = text.lower()
     if _port_closed(low, 5900):
         return "inconclusive", "VNC port closed or filtered"
-    if "authentication: none" in low or "no authentication" in low or "securitytype: none" in low:
+    if (
+        re.search(r"\bnone\s*\(\s*1\s*\)", low)
+        or "authentication: none" in low
+        or "no authentication" in low
+        or "securitytype: none" in low
+        or "server does not require authentication" in low
+    ):
         return "not_fixed", "VNC still accessible without authentication"
-    if "vnc authentication" in low or "authentication: vnc" in low or "invalid security" in low:
+    if (
+        re.search(r"vnc authentication\s*\(\s*2\s*\)", low)
+        or "vnc authentication" in low
+        or "authentication: vnc" in low
+        or "authentication: ra2" in low
+        or ("valid credentials" in low and "vnc-brute" in low)
+        or "invalid security" in low
+    ):
         return "fixed", "VNC requires authentication"
     return "inconclusive", "Could not determine VNC authentication status"
 
@@ -821,11 +1015,90 @@ def _parse_telnet(text: str, xml: str, description: str = "") -> Tuple[Verdict, 
     if _host_down(text):
         return "inconclusive", "Host unreachable"
     low = text.lower()
-    if "23/tcp open" in low or ("telnet" in low and "open" in low):
+    if "23/tcp open" in low:
         return "not_fixed", "Telnet service still running and accessible"
     if _port_closed(low, 23):
         return "fixed", "Telnet port is closed/filtered"
     return "inconclusive", "Could not determine Telnet service status"
+
+
+def _parse_r_services(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    low = text.lower()
+    open_ports = []
+    for port in (512, 513, 514):
+        if f"rsh_port_open:{port}" in low or f"{port}/tcp open" in low:
+            open_ports.append(str(port))
+    if open_ports:
+        return "not_fixed", f"r-commands port(s) {', '.join(open_ports)} still open"
+    if "rsh_check_done" in low:
+        return "fixed", "r-commands ports 512/513/514 closed or filtered"
+    closed = [
+        p for p in (512, 513, 514)
+        if f"{p}/tcp closed" in low or f"{p}/tcp filtered" in low
+    ]
+    if len(closed) == 3:
+        return "fixed", "r-commands ports closed or filtered"
+    return "inconclusive", "Could not determine rsh/rexec/rlogin service status"
+
+
+def _parse_pgsql_brute_nmap(text: str) -> Tuple[Verdict, str]:
+    low = text.lower()
+    if _port_closed(low, 5432):
+        return "inconclusive", "PostgreSQL port closed or filtered"
+    if "valid credentials" in low or re.search(r"account:\s*postgres.*valid", low):
+        return "not_fixed", "nmap: PostgreSQL accepts default/blank postgres credentials"
+    if "pgsql-brute" in low and ("no valid accounts" in low or "0 valid" in low):
+        return "fixed", "nmap: default PostgreSQL credentials not accepted"
+    if "5432/tcp open" in low or "postgresql" in low:
+        return "inconclusive", "nmap: PostgreSQL port open — review psql output"
+    return "inconclusive", "nmap: could not determine PostgreSQL authentication status"
+
+
+def _parse_psql_client(text: str) -> Optional[Tuple[Verdict, str]]:
+    if not text.strip():
+        return None
+    low = text.lower()
+    if "psql_skip" in low or "psql not installed" in low:
+        return None
+    if re.search(r"\b1 row\b", text) or (
+        "select 1" in low and "error" not in low and "fatal" not in low
+    ):
+        return "not_fixed", "psql: postgres account accessible without password"
+    if any(x in low for x in (
+        "password authentication failed", "fe_sendauth", "no password supplied",
+        "authentication failed", "role \"postgres\" does not exist",
+    )):
+        return "fixed", "psql: postgres account requires authentication"
+    if any(x in low for x in ("connection refused", "timed out", "could not connect")):
+        return "inconclusive", "psql: could not connect to PostgreSQL"
+    return "inconclusive", "psql: could not determine PostgreSQL authentication status"
+
+
+def _parse_pgsql(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+
+    nmap_section = text
+    psql_section = ""
+    if re.search(r"###PSQL###", text, re.I):
+        parts = re.split(r"###PSQL###", text, maxsplit=1, flags=re.I)
+        nmap_section = parts[0]
+        psql_section = parts[1]
+        if re.search(r"###XML###", psql_section, re.I):
+            psql_section = re.split(r"###XML###", psql_section, maxsplit=1, flags=re.I)[0]
+
+    psql_result = _parse_psql_client(psql_section)
+    if psql_result and psql_result[0] != "inconclusive":
+        return psql_result
+
+    nmap_result = _parse_pgsql_brute_nmap(nmap_section)
+    if psql_result and psql_result[0] == "inconclusive" and nmap_result[0] != "inconclusive":
+        return nmap_result
+    if psql_result:
+        return psql_result
+    return nmap_result
 
 
 def _parse_snmp(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
@@ -842,18 +1115,102 @@ def _parse_snmp(text: str, xml: str, description: str = "") -> Tuple[Verdict, st
     return "inconclusive", "SNMP port closed/filtered or not detected"
 
 
-def _parse_mongodb(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
-    if _host_down(text):
-        return "inconclusive", "Host unreachable"
+def _parse_mongodb_nmap(text: str) -> Tuple[Verdict, str]:
     low = text.lower()
     if _port_closed(low, 27017):
         return "inconclusive", "MongoDB port closed or filtered"
     if ("databases" in low or "listdatabases" in low or "mongodb_version" in low
             or "totalsize" in low):
-        return "not_fixed", "MongoDB still accessible without authentication"
+        return "not_fixed", "nmap: MongoDB still accessible without authentication"
     if "authentication required" in low or "not authorized" in low:
-        return "fixed", "MongoDB now requires authentication"
-    return "inconclusive", "Could not determine MongoDB authentication status"
+        return "fixed", "nmap: MongoDB now requires authentication"
+    return "inconclusive", "nmap: could not determine MongoDB authentication status"
+
+
+def _parse_mongosh_mongodb(text: str) -> Optional[Tuple[Verdict, str]]:
+    if not text.strip():
+        return None
+    low = text.lower()
+    if "mongosh_skip" in low or "mongosh not installed" in low:
+        return None
+    if any(x in low for x in (
+        "requires authentication", "authentication failed", "not authorized",
+        "auth required", "need to authenticate", "user is not authorized",
+    )):
+        return "fixed", "mongosh: MongoDB requires authentication"
+    if re.search(r"\bok\s*:\s*1", text) and ("databases" in low or "totalsize" in low):
+        return "not_fixed", "mongosh: MongoDB still accessible without authentication"
+    if any(x in low for x in ("econnrefused", "connection refused", "timed out", "networkerror")):
+        return "inconclusive", "mongosh: could not connect to MongoDB"
+    return "inconclusive", "mongosh: could not determine MongoDB authentication status"
+
+
+def _parse_mongodb(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+
+    nmap_section = text
+    mongosh_section = ""
+    if re.search(r"###MONGOSH###", text, re.I):
+        parts = re.split(r"###MONGOSH###", text, maxsplit=1, flags=re.I)
+        nmap_section = parts[0]
+        mongosh_section = parts[1]
+        if re.search(r"###XML###", mongosh_section, re.I):
+            mongosh_section = re.split(r"###XML###", mongosh_section, maxsplit=1, flags=re.I)[0]
+
+    mongosh_result = _parse_mongosh_mongodb(mongosh_section)
+    if mongosh_result and mongosh_result[0] != "inconclusive":
+        return mongosh_result
+
+    nmap_result = _parse_mongodb_nmap(nmap_section)
+    if mongosh_result and mongosh_result[0] == "inconclusive" and nmap_result[0] != "inconclusive":
+        return nmap_result
+    if mongosh_result:
+        return mongosh_result
+    return nmap_result
+
+
+def _extract_mongodb_version(text: str) -> Optional[str]:
+    for pattern in (
+        r"version\s*=\s*([0-9]+\.[0-9]+\.[0-9.]+)",
+        r"mongodb_version:\s*([0-9]+\.[0-9]+\.[0-9.]+)",
+        r'"version"\s*:\s*"([0-9]+\.[0-9]+\.[0-9.]+)"',
+        r"db\.version\(\)\s*=>\s*['\"]([0-9]+\.[0-9]+\.[0-9.]+)['\"]",
+        r"mongodb[^\d]*([0-9]+\.[0-9]+\.[0-9.]+)",
+        r"(?:^|\n)([0-9]+\.[0-9]+\.[0-9.]+)\s*(?:\n|$)",
+    ):
+        m = re.search(pattern, text, re.I | re.M)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _parse_mongodb_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+
+    nmap_section = text
+    mongosh_section = ""
+    if re.search(r"###MONGOSH###", text, re.I):
+        parts = re.split(r"###MONGOSH###", text, maxsplit=1, flags=re.I)
+        nmap_section = parts[0]
+        mongosh_section = parts[1]
+        if re.search(r"###XML###", mongosh_section, re.I):
+            mongosh_section = re.split(r"###XML###", mongosh_section, maxsplit=1, flags=re.I)[0]
+
+    detected = _extract_mongodb_version(mongosh_section) or _extract_mongodb_version(nmap_section)
+    if detected:
+        vuln_ver = _extract_version_from_description(description)
+        if vuln_ver:
+            return _compare_versions(detected, vuln_ver)
+        return "inconclusive", f"Detected MongoDB {detected} — compare against vulnerable version in ticket"
+
+    low = nmap_section.lower()
+    if _port_closed(low, 27017):
+        return "inconclusive", "MongoDB port closed or filtered"
+    if "27017/tcp open" in low or "mongodb" in low:
+        return "inconclusive", "MongoDB detected but version not parsed — check mongosh/db.version() output"
+    return "inconclusive", "Could not detect MongoDB version — port may be closed"
 
 
 def _parse_redis(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
@@ -920,54 +1277,202 @@ def _parse_solr(text: str, xml: str, description: str = "") -> Tuple[Verdict, st
     return "inconclusive", "Could not determine Solr access status"
 
 
-def _parse_nfs(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
-    if _host_down(text):
-        return "inconclusive", "Host unreachable"
+def _parse_nfs_nmap(text: str) -> Tuple[Verdict, str]:
     low = text.lower()
     if _port_closed(low, 2049):
         return "inconclusive", "NFS port closed or filtered"
-    if "exports" in low and ("/" in text or "nfs-showmount" in low):
-        return "not_fixed", "NFS shares still accessible"
-    if "no exports" in low or "export list" not in low:
-        return "fixed", "No NFS shares accessible"
-    return "inconclusive", "Could not determine NFS share status"
+    if ("nfs-showmount" in low or "export list for" in low) and re.search(
+        r"(?:^\s*|\s)/[\w./-]+", text, re.M
+    ):
+        return "not_fixed", "nmap: NFS shares still accessible"
+    if "no exports" in low:
+        return "fixed", "nmap: no NFS exports accessible"
+    if "2049/tcp open" in low or "nfs" in low:
+        return "inconclusive", "nmap: NFS port open but exports not confirmed — review showmount output"
+    return "inconclusive", "nmap: could not determine NFS share status"
+
+
+def _parse_showmount_nfs(text: str) -> Optional[Tuple[Verdict, str]]:
+    if not text.strip():
+        return None
+    low = text.lower()
+    if "showmount_skip" in low or "showmount not installed" in low:
+        return None
+    if "no exports" in low:
+        return "fixed", "showmount: no NFS exports published"
+    if "export list for" in low:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("/"):
+                return "not_fixed", "showmount: NFS exports still accessible"
+        return "fixed", "showmount: no NFS exports listed"
+    if any(x in low for x in (
+        "program not registered", "rpc:", "timed out", "cannot connect",
+        "connection refused", "access denied",
+    )):
+        return "inconclusive", "showmount: could not query NFS exports"
+    return "inconclusive", "showmount: could not determine NFS export status"
+
+
+def _parse_nfs(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+
+    nmap_section = text
+    showmount_section = ""
+    if re.search(r"###SHOWMOUNT###", text, re.I):
+        parts = re.split(r"###SHOWMOUNT###", text, maxsplit=1, flags=re.I)
+        nmap_section = parts[0]
+        showmount_section = parts[1]
+        if re.search(r"###XML###", showmount_section, re.I):
+            showmount_section = re.split(r"###XML###", showmount_section, maxsplit=1, flags=re.I)[0]
+
+    showmount_result = _parse_showmount_nfs(showmount_section)
+    if showmount_result and showmount_result[0] != "inconclusive":
+        return showmount_result
+
+    nmap_result = _parse_nfs_nmap(nmap_section)
+    if showmount_result and showmount_result[0] == "inconclusive" and nmap_result[0] != "inconclusive":
+        return nmap_result
+    if showmount_result:
+        return showmount_result
+    return nmap_result
 
 
 def _parse_x11(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
     low = text.lower()
-    if "access: open" in low or ("x11 access" in low and "open" in low):
+    if (
+        "access is granted" in low
+        or "x server access is granted" in low
+        or "access: open" in low
+    ):
         return "not_fixed", "X11 server still accessible without authentication"
-    if _port_closed(low, 6000) or "access: closed" in low or "access: restricted" in low:
+    if (
+        "access is denied" in low
+        or "access: denied" in low
+        or "access: closed" in low
+        or "access: restricted" in low
+        or _port_closed(low, 6000)
+    ):
         return "fixed", "X11 port is closed/filtered or access is restricted"
     return "inconclusive", "Could not determine X11 access status"
+
+
+def _parse_ftp_anon_nmap(text: str) -> Tuple[Verdict, str]:
+    low = text.lower()
+    if _port_closed(low, 21):
+        return "inconclusive", "FTP port closed or filtered"
+    if "anonymous ftp login allowed" in low or "ftp-anon: anonymous" in low:
+        return "not_fixed", "nmap: anonymous FTP login still allowed"
+    if "ftp-anon" in low:
+        return "fixed", "nmap: anonymous FTP login not allowed"
+    if "21/tcp open" in low or "ftp" in low:
+        return "inconclusive", "nmap: FTP port open but anonymous login unclear — review ftp client output"
+    return "inconclusive", "nmap: could not determine FTP anonymous access status"
+
+
+def _parse_ftp_client(text: str) -> Optional[Tuple[Verdict, str]]:
+    if not text.strip():
+        return None
+    low = text.lower()
+    if "ftp_skip" in low or "ftp/curl not installed" in low:
+        return None
+    if re.search(r"\b230[-\s]", text) or "login successful" in low or "login ok" in low:
+        return "not_fixed", "ftp: anonymous login succeeded"
+    if "remote directory:" in low or "257 " in text:
+        return "not_fixed", "ftp: anonymous login succeeded"
+    if re.search(r"\b530[-\s]", text) or "anonymous access denied" in low:
+        return "fixed", "ftp: anonymous login denied"
+    if "login failed" in low or "access denied" in low:
+        return "fixed", "ftp: anonymous login denied"
+    if any(x in low for x in ("connection refused", "timed out", "could not connect", "connection timed out")):
+        return "inconclusive", "ftp: could not connect to FTP service"
+    return "inconclusive", "ftp: could not determine anonymous FTP status"
 
 
 def _parse_ftp_anon(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
+
+    nmap_section = text
+    ftp_section = ""
+    if re.search(r"###FTP###", text, re.I):
+        parts = re.split(r"###FTP###", text, maxsplit=1, flags=re.I)
+        nmap_section = parts[0]
+        ftp_section = parts[1]
+        if re.search(r"###XML###", ftp_section, re.I):
+            ftp_section = re.split(r"###XML###", ftp_section, maxsplit=1, flags=re.I)[0]
+
+    ftp_result = _parse_ftp_client(ftp_section)
+    if ftp_result and ftp_result[0] != "inconclusive":
+        return ftp_result
+
+    nmap_result = _parse_ftp_anon_nmap(nmap_section)
+    if ftp_result and ftp_result[0] == "inconclusive" and nmap_result[0] != "inconclusive":
+        return nmap_result
+    if ftp_result:
+        return ftp_result
+    return nmap_result
+
+
+def _parse_smbclient_null(text: str) -> Optional[Tuple[Verdict, str]]:
+    """Parse smbclient -L //ip -U \"\" -N output; None if section empty/unusable."""
+    if not text.strip():
+        return None
     low = text.lower()
-    if "anonymous ftp login allowed" in low or "ftp-anon: anonymous" in low:
-        return "not_fixed", "Anonymous FTP login still allowed"
-    if _port_closed(low, 21):
-        return "inconclusive", "FTP port closed or filtered"
-    if "ftp-anon" in low:
-        return "fixed", "Anonymous FTP login not allowed"
-    return "inconclusive", "Could not determine FTP anonymous access status"
+    if "command not found" in low or "smbclient:" in low and "not found" in low:
+        return None
+    if "sharename" in low and re.search(r"-{3,}", text):
+        return "not_fixed", "smbclient: null session succeeded — shares listed anonymously"
+    if re.search(r"\b(ipc\$|[a-z0-9_$+-]+)\s+(disk|ipc|print)", low):
+        return "not_fixed", "smbclient: null session succeeded — anonymous share access"
+    for phrase in (
+        "nt_status_access_denied", "anonymous login not allowed",
+        "nt_status_logon_failure", "access denied", "session setup failed",
+    ):
+        if phrase in low:
+            return "fixed", "smbclient: null session blocked"
+    if "connection to" in low and "failed" in low:
+        return "inconclusive", "smbclient: could not connect — check host/port 445"
+    return "inconclusive", "smbclient: result unclear — review output"
+
+
+def _parse_smb_null_nmap(text: str) -> Tuple[Verdict, str]:
+    low = text.lower()
+    if _port_closed(low, 445):
+        return "inconclusive", "SMB port closed or filtered"
+    if "null session" in low or "account: " in low:
+        return "not_fixed", "nmap: SMB null session still allowed"
+    if "access denied" in low or "nt_status_access_denied" in low:
+        return "fixed", "nmap: SMB null session is blocked"
+    return "inconclusive", "nmap: could not determine SMB null session status"
 
 
 def _parse_smb_null(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
-    low = text.lower()
-    if _port_closed(low, 445):
-        return "inconclusive", "SMB port closed or filtered"
-    if "null session" in low or "account: " in low:
-        return "not_fixed", "SMB null session still allowed"
-    if "access denied" in low or "nt_status_access_denied" in low:
-        return "fixed", "SMB null session is blocked"
-    return "inconclusive", "Could not determine SMB null session status"
+
+    nmap_section = text
+    smb_section = ""
+    if re.search(r"###SMBCLIENT###", text, re.I):
+        parts = re.split(r"###SMBCLIENT###", text, maxsplit=1, flags=re.I)
+        nmap_section = parts[0]
+        smb_section = parts[1]
+        if re.search(r"###XML###", smb_section, re.I):
+            smb_section = re.split(r"###XML###", smb_section, maxsplit=1, flags=re.I)[0]
+
+    smb_result = _parse_smbclient_null(smb_section)
+    if smb_result and smb_result[0] != "inconclusive":
+        return smb_result
+
+    nmap_result = _parse_smb_null_nmap(nmap_section)
+    if smb_result and smb_result[0] == "inconclusive" and nmap_result[0] != "inconclusive":
+        return nmap_result
+    if smb_result:
+        return smb_result
+    return nmap_result
 
 
 def _parse_ipmiv2(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
@@ -985,10 +1490,14 @@ def _parse_iscsi(text: str, xml: str, description: str = "") -> Tuple[Verdict, s
     if _host_down(text):
         return "inconclusive", "Host unreachable"
     low = text.lower()
+    if "authentication required" in low or "login required" in low or "chap" in low:
+        return "fixed", "iSCSI appears to require authentication"
     if "target name" in low or "iqn." in low:
-        return "not_fixed", "iSCSI target still accessible without authentication"
+        return "inconclusive", (
+            "iSCSI target discoverable — confirm CHAP authentication is required for sessions"
+        )
     if _port_closed(low, 3260):
-        return "inconclusive", "iSCSI port closed or filtered"
+        return "fixed", "iSCSI port closed or filtered"
     return "inconclusive", "Could not determine iSCSI access status"
 
 
@@ -996,24 +1505,189 @@ def _parse_hadoop_yarn(text: str, xml: str, description: str = "") -> Tuple[Verd
     if _host_down(text):
         return "inconclusive", "Host unreachable"
     low = text.lower()
-    if "cluster" in low or "resourcemanager" in low or ("yarn" in low and "200" in text):
+    if "401" in text or "403" in text or "unauthorized" in low or "forbidden" in low:
+        return "fixed", "Hadoop YARN ResourceManager requires authentication"
+    if (
+        '"clusterinfo"' in low
+        or '"resourcemanagerversion"' in low
+        or "resourcemanager" in low and "[status:200" in low
+    ):
         return "not_fixed", "Hadoop YARN ResourceManager still accessible unauthenticated"
     if _port_closed(low, 8088):
-        return "inconclusive", "YARN port closed or filtered"
+        return "fixed", "YARN port closed or filtered"
     return "inconclusive", "Could not determine Hadoop YARN status"
+
+
+# CVE-2023-46604 minimum fixed releases per 5.x line (OpenWire RCE)
+_ACTIVEMQ_CVE_2023_46604_FIX: dict[int, tuple] = {
+    15: (5, 15, 16),
+    16: (5, 16, 7),
+    17: (5, 17, 6),
+    18: (5, 18, 3),
+}
+
+
+def _extract_activemq_version(text: str) -> Optional[str]:
+    for pattern in (
+        r"apache activemq[^\d]*(\d+\.\d+\.\d+)",
+        r"activemq[/\s]+(\d+\.\d+\.\d+)",
+        r"activemq[^\d]*(\d+\.\d+\.\d+)",
+        r"version[^\d]*(\d+\.\d+\.\d+)",
+    ):
+        m = re.search(pattern, text, re.I)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _activemq_cve_2023_46604_verdict(
+    version: str, source: str,
+) -> Tuple[Verdict, str]:
+    vt = _ver_tuple(version)
+    if not vt:
+        return "inconclusive", f"{source}: detected ActiveMQ {version} — could not compare versions"
+    if vt[0] >= 6:
+        return "fixed", f"{source}: ActiveMQ {version} is outside affected 5.x OpenWire scope"
+    if vt[0] != 5:
+        return "inconclusive", f"{source}: ActiveMQ {version} — CVE-2023-46604 targets 5.x brokers"
+
+    minor = vt[1]
+    if minor < 15:
+        return "not_fixed", (
+            f"{source}: ActiveMQ {version} is below minimum patched release 5.15.16 "
+            "(CVE-2023-46604)"
+        )
+    if minor > 18:
+        return "fixed", f"{source}: ActiveMQ {version} is above affected 5.18.x line"
+
+    min_fix = _ACTIVEMQ_CVE_2023_46604_FIX.get(minor)
+    if not min_fix:
+        return "inconclusive", f"{source}: ActiveMQ {version} — unknown 5.x branch for CVE-2023-46604"
+
+    fix_label = ".".join(str(x) for x in min_fix)
+    if vt >= min_fix:
+        return "fixed", f"{source}: ActiveMQ {version} >= {fix_label} (CVE-2023-46604 patched)"
+    return "not_fixed", (
+        f"{source}: ActiveMQ {version} < {fix_label} (still vulnerable to CVE-2023-46604)"
+    )
+
+
+def _parse_activemq_nmap(text: str) -> Tuple[Verdict, str]:
+    low = text.lower()
+    if _port_closed(low, 61616):
+        return "inconclusive", "nmap: ActiveMQ OpenWire port 61616 closed or filtered"
+    detected = _extract_activemq_version(text)
+    if detected:
+        return _activemq_cve_2023_46604_verdict(detected, "nmap")
+    if "61616/tcp open" in low or "activemq" in low:
+        return "inconclusive", "nmap: ActiveMQ port open but version not parsed — review web console output"
+    return "inconclusive", "nmap: could not detect ActiveMQ on port 61616"
+
+
+def _parse_activemq_web(text: str) -> Optional[Tuple[Verdict, str]]:
+    if not text.strip():
+        return None
+    low = text.lower()
+    if "activemq_skip" in low or "curl not installed" in low:
+        return None
+    detected = _extract_activemq_version(text)
+    if detected:
+        return _activemq_cve_2023_46604_verdict(detected, "web console")
+    if "401" in text or "403" in text or "unauthorized" in low:
+        return "inconclusive", "web console: ActiveMQ admin requires authentication — check version manually"
+    if "activemq" in low or "apache" in low:
+        return "inconclusive", "web console: ActiveMQ admin UI responded but version not parsed"
+    return "inconclusive", "web console: could not retrieve ActiveMQ version from :8161/admin/"
 
 
 def _parse_activemq(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
+
+    nmap_section = text
+    web_section = ""
+    if re.search(r"###CURL###", text, re.I):
+        parts = re.split(r"###CURL###", text, maxsplit=1, flags=re.I)
+        nmap_section = parts[0]
+        web_section = parts[1]
+        if re.search(r"###XML###", web_section, re.I):
+            web_section = re.split(r"###XML###", web_section, maxsplit=1, flags=re.I)[0]
+
+    web_result = _parse_activemq_web(web_section)
+    if web_result and web_result[0] != "inconclusive":
+        return web_result
+
+    nmap_result = _parse_activemq_nmap(nmap_section)
+    if web_result and web_result[0] == "inconclusive" and nmap_result[0] != "inconclusive":
+        return nmap_result
+    if web_result:
+        return web_result
+    return nmap_result
+
+
+def _activemq_ticket_version_verdict(
+    detected: str, description: str, source: str,
+) -> Tuple[Verdict, str]:
+    vuln_ver = _extract_version_from_description(description)
+    if vuln_ver:
+        verdict, reason = _compare_versions(detected, vuln_ver)
+        return verdict, f"{source}: {reason}"
+    return "inconclusive", (
+        f"{source}: detected ActiveMQ {detected} — vulnerable version not found in ticket description"
+    )
+
+
+def _parse_activemq_version_nmap(text: str, description: str = "") -> Tuple[Verdict, str]:
     low = text.lower()
-    if "cve-2023-46604" in low and "vulnerable" in low:
-        return "not_fixed", "ActiveMQ RCE (CVE-2023-46604) still present"
-    if "not vulnerable" in low:
-        return "fixed", "ActiveMQ is not vulnerable to CVE-2023-46604"
     if _port_closed(low, 61616):
-        return "inconclusive", "ActiveMQ port closed or filtered"
-    return "inconclusive", "Could not determine ActiveMQ vulnerability status"
+        return "inconclusive", "nmap: ActiveMQ OpenWire port 61616 closed or filtered"
+    detected = _extract_activemq_version(text)
+    if detected:
+        return _activemq_ticket_version_verdict(detected, description, "nmap")
+    if "61616/tcp open" in low or "activemq" in low:
+        return "inconclusive", "nmap: ActiveMQ port open but version not parsed — review web console output"
+    return "inconclusive", "nmap: could not detect ActiveMQ on port 61616"
+
+
+def _parse_activemq_version_web(text: str, description: str = "") -> Optional[Tuple[Verdict, str]]:
+    if not text.strip():
+        return None
+    low = text.lower()
+    if "activemq_skip" in low or "curl not installed" in low:
+        return None
+    detected = _extract_activemq_version(text)
+    if detected:
+        return _activemq_ticket_version_verdict(detected, description, "web console")
+    if "401" in text or "403" in text or "unauthorized" in low:
+        return "inconclusive", "web console: ActiveMQ admin requires authentication — check version manually"
+    if "activemq" in low or "apache" in low:
+        return "inconclusive", "web console: ActiveMQ admin UI responded but version not parsed"
+    return "inconclusive", "web console: could not retrieve ActiveMQ version from :8161/admin/"
+
+
+def _parse_activemq_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+
+    nmap_section = text
+    web_section = ""
+    if re.search(r"###CURL###", text, re.I):
+        parts = re.split(r"###CURL###", text, maxsplit=1, flags=re.I)
+        nmap_section = parts[0]
+        web_section = parts[1]
+        if re.search(r"###XML###", web_section, re.I):
+            web_section = re.split(r"###XML###", web_section, maxsplit=1, flags=re.I)[0]
+
+    web_result = _parse_activemq_version_web(web_section, description)
+    if web_result and web_result[0] != "inconclusive":
+        return web_result
+
+    nmap_result = _parse_activemq_version_nmap(nmap_section, description)
+    if web_result and web_result[0] == "inconclusive" and nmap_result[0] != "inconclusive":
+        return nmap_result
+    if web_result:
+        return web_result
+    return nmap_result
 
 
 def _parse_openssl_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
@@ -1034,16 +1708,22 @@ def _parse_openssl_version(text: str, xml: str, description: str = "") -> Tuple[
 def _parse_tomcat_version(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable — could not connect to Tomcat"
-    m = re.search(r'apache[- ]tomcat[/\s]+([0-9]+\.[0-9]+\.[0-9.]+)', text, re.I)
-    if m:
-        detected = m.group(1)
-        vuln_ver = _extract_version_from_description(description)
-        if vuln_ver:
-            return _compare_versions(detected, vuln_ver)
-        return "inconclusive", f"Detected Apache Tomcat {detected} — vulnerable version not found in ticket description"
+    version_patterns = (
+        r"apache[- ]tomcat[/\s]+([0-9]+\.[0-9]+\.[0-9.]+)",
+        r"apache tomcat version[:\s]+([0-9]+\.[0-9]+\.[0-9.]+)",
+        r"server:\s*apache[- ]?tomcat/([0-9]+\.[0-9]+\.[0-9.]+)",
+    )
+    for pattern in version_patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            detected = m.group(1)
+            vuln_ver = _extract_version_from_description(description)
+            if vuln_ver:
+                return _compare_versions(detected, vuln_ver)
+            return "inconclusive", f"Detected Apache Tomcat {detected} — vulnerable version not found in ticket description"
     low = text.lower()
     if "coyote" in low or "tomcat" in low:
-        return "inconclusive", "Apache Tomcat detected but version not in headers — check /manager/text or /VERSION.txt manually"
+        return "inconclusive", "Apache Tomcat detected but version not in headers — check /VERSION.txt manually"
     if re.search(r'\d+/tcp open', low):
         return "inconclusive", "Port open but Tomcat not identified — may be behind a reverse proxy"
     return "inconclusive", "Could not detect Apache Tomcat — port may be closed or filtered"
@@ -1090,17 +1770,6 @@ def _parse_tomcat_default_files(text: str, xml: str, description: str = "") -> T
     if not_found and not exposed:
         return "fixed", f"Checked Tomcat default paths return 404 ({len(not_found)} path(s))"
     return "inconclusive", "Could not check all default Tomcat paths — review curl output"
-
-
-def _parse_ghostcat(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
-    if _host_down(text):
-        return "inconclusive", "Host unreachable"
-    low = text.lower()
-    if "8009/tcp open" in low or "ajp" in low:
-        return "not_fixed", "AJP connector (port 8009) is open — Ghostcat risk present; disable AJP or restrict to localhost"
-    if "8009/tcp closed" in low or "8009/tcp filtered" in low:
-        return "fixed", "AJP port 8009 is closed/filtered — Ghostcat risk mitigated"
-    return "inconclusive", "Could not determine AJP connector status — check port 8009 manually"
 
 
 def _parse_jboss(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
@@ -1208,6 +1877,85 @@ def _parse_hp_ilo(text: str, xml: str, description: str = "") -> Tuple[Verdict, 
     if re.search(r'\d+/tcp open', low):
         return "inconclusive", "Port open but HP iLO firmware version not detected — check iLO admin interface at https://<IP>"
     return "inconclusive", "Could not detect HP iLO — HTTPS port may be closed or filtered"
+
+
+def _extract_idrac_firmware(text: str) -> Optional[str]:
+    for pattern in (
+        r'"FirmwareVersion"\s*:\s*"([^"]+)"',
+        r'"firmwareversion"\s*:\s*"([^"]+)"',
+        r'idrac[/\s-]+([0-9]+\.[0-9]+\.[0-9.]+)',
+    ):
+        m = re.search(pattern, text, re.I)
+        if m:
+            return m.group(1).strip(".")
+    return None
+
+
+def _parse_idrac_nmap(text: str, description: str = "") -> Tuple[Verdict, str]:
+    low = text.lower()
+    if _port_closed(low, 443):
+        return "inconclusive", "iDRAC HTTPS port closed or filtered"
+    detected = _extract_idrac_firmware(text)
+    if not detected:
+        versions = re.findall(r"(?:server|version)[:\s/]+(\d+\.\d+[\d.]*)", text, re.I)
+        if versions:
+            detected = sorted(set(versions))[-1]
+    if detected:
+        vuln_ver = _extract_version_from_description(description)
+        if vuln_ver:
+            verdict, reason = _compare_versions(detected, vuln_ver)
+            return verdict, f"nmap: {reason}"
+        return "inconclusive", f"nmap: detected iDRAC/firmware {detected} — vulnerable version not found in ticket description"
+    if "idrac" in low or ("dell" in low and "443/tcp open" in low):
+        return "inconclusive", "nmap: iDRAC interface suspected but firmware not in headers — review Redfish output"
+    if re.search(r"\d+/tcp open", low):
+        return "inconclusive", "nmap: HTTPS open but iDRAC firmware not detected"
+    return "inconclusive", "nmap: could not detect Dell iDRAC"
+
+
+def _parse_idrac_redfish(text: str, description: str = "") -> Optional[Tuple[Verdict, str]]:
+    if not text.strip():
+        return None
+    low = text.lower()
+    if "redfish_skip" in low or "curl not installed" in low:
+        return None
+    detected = _extract_idrac_firmware(text)
+    if detected:
+        vuln_ver = _extract_version_from_description(description)
+        if vuln_ver:
+            verdict, reason = _compare_versions(detected, vuln_ver)
+            return verdict, f"redfish: {reason}"
+        return "inconclusive", f"redfish: detected iDRAC firmware {detected} — vulnerable version not found in ticket description"
+    if "401" in text or "unauthorized" in low or "authentication" in low:
+        return "inconclusive", "redfish: iDRAC requires authentication — check firmware in iDRAC UI"
+    if "idrac" in low or "redfish" in low or "@odata" in low:
+        return "inconclusive", "redfish: iDRAC Redfish responded but FirmwareVersion not returned"
+    return "inconclusive", "redfish: could not query iDRAC Redfish API"
+
+
+def _parse_idrac(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    if _host_down(text):
+        return "inconclusive", "Host unreachable — could not connect to iDRAC"
+
+    nmap_section = text
+    redfish_section = ""
+    if re.search(r"###CURL###", text, re.I):
+        parts = re.split(r"###CURL###", text, maxsplit=1, flags=re.I)
+        nmap_section = parts[0]
+        redfish_section = parts[1]
+        if re.search(r"###XML###", redfish_section, re.I):
+            redfish_section = re.split(r"###XML###", redfish_section, maxsplit=1, flags=re.I)[0]
+
+    redfish_result = _parse_idrac_redfish(redfish_section, description)
+    if redfish_result and redfish_result[0] != "inconclusive":
+        return redfish_result
+
+    nmap_result = _parse_idrac_nmap(nmap_section, description)
+    if redfish_result and redfish_result[0] == "inconclusive" and nmap_result[0] != "inconclusive":
+        return nmap_result
+    if redfish_result:
+        return redfish_result
+    return nmap_result
 
 
 def _parse_vmware(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
@@ -1321,15 +2069,6 @@ def _parse_esxi_vmsa_2025_0013(text: str, xml: str, description: str = "") -> Tu
     )
 
 
-def _parse_log4shell(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
-    if _host_down(text):
-        return "inconclusive", "Host unreachable"
-    low = text.lower()
-    if re.search(r'\d+/tcp open', low):
-        return "inconclusive", "Service is running — Log4Shell requires application-level verification; confirm Log4j version ≥ 2.17.1 via authenticated scan or package audit"
-    return "inconclusive", "Port closed or unreachable — could not perform Log4Shell service check"
-
-
 def _parse_msmq(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
@@ -1344,13 +2083,33 @@ def _parse_msmq(text: str, xml: str, description: str = "") -> Tuple[Verdict, st
 def _parse_minio(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
-    low = text.lower()
+
+    main_section = text
+    login_section = ""
+    if re.search(r"###MINIO###", text, re.I):
+        parts = re.split(r"###MINIO###", text, maxsplit=1, flags=re.I)
+        main_section = parts[0]
+        login_section = parts[1]
+
+    login_low = login_section.lower()
+    if login_section.strip():
+        if '"token"' in login_low or '"sessionid"' in login_low or '"accesskey"' in login_low:
+            return "not_fixed", "MinIO accepts default minioadmin/minioadmin credentials"
+        if any(x in login_low for x in (
+            "invalid login", "access denied", "unauthorized", "403 forbidden", "401",
+            "invalid credentials", "authentication failed",
+        )):
+            return "fixed", "MinIO default credentials rejected"
+
+    low = main_section.lower()
     if "minio" in low or ("9000/tcp open" in low or "9001/tcp open" in low):
-        if "401" in text or "403" in text:
-            return "fixed", "MinIO requires authentication — verify default credentials are not in use"
-        return "not_fixed", "MinIO admin interface accessible — verify default credentials (minioadmin/minioadmin) have been changed"
+        if "401" in main_section or "403" in main_section:
+            return "fixed", "MinIO requires authentication"
+        if login_section.strip():
+            return "inconclusive", "MinIO console reachable — default credential test inconclusive"
+        return "inconclusive", "MinIO console reachable — could not test default credentials"
     if "9000/tcp closed" in low or "9001/tcp closed" in low:
-        return "inconclusive", "MinIO port closed — service may have been removed or port changed"
+        return "fixed", "MinIO port closed — service may have been removed or port changed"
     return "inconclusive", "Could not detect MinIO service — verify manually at https://<IP>:9001"
 
 
@@ -1391,10 +2150,12 @@ def _parse_amqp(text: str, xml: str, description: str = "") -> Tuple[Verdict, st
     if _host_down(text):
         return "inconclusive", "Host unreachable"
     low = text.lower()
-    if "5672/tcp open" in low or "amqp" in low:
-        return "not_fixed", "AMQP port 5672 is open and cleartext — enable TLS (AMQPS on 5671) or restrict network access"
     if "5672/tcp closed" in low or "5672/tcp filtered" in low:
-        return "inconclusive", "AMQP port closed or filtered — service may have been secured"
+        return "fixed", "AMQP cleartext port 5672 closed or filtered"
+    if "5672/tcp open" in low and ("amqp" in low or "rabbitmq" in low):
+        return "not_fixed", "AMQP port 5672 is open and cleartext — enable TLS (AMQPS on 5671) or restrict network access"
+    if "5672/tcp open" in low:
+        return "inconclusive", "Port 5672 open — confirm whether cleartext AMQP is still exposed"
     return "inconclusive", "Could not determine AMQP service status — check port 5672"
 
 
@@ -1467,13 +2228,13 @@ def _parse_smtp_info(text: str, xml: str, description: str = "") -> Tuple[Verdic
     if _host_down(text):
         return "inconclusive", "Host unreachable"
     low = text.lower()
-    if "smtp-commands" in low or "220" in text or "ehlo" in low:
+    if "smtp-commands" in low or re.search(r'^220 ', text, re.M):
         for sw in ("postfix", "sendmail", "exim", "microsoft esmtp", "exchange"):
             if sw in low:
                 return "not_fixed", f"SMTP banner discloses server software ({sw}) — configure to suppress banner details"
-        return "inconclusive", "SMTP accessible — verify banner does not reveal server version or internal hostnames"
+        return "fixed", "SMTP banner does not disclose server software version"
     if "25/tcp closed" in low or "587/tcp closed" in low:
-        return "inconclusive", "SMTP port closed or filtered"
+        return "fixed", "SMTP port closed or filtered"
     return "inconclusive", "Could not reach SMTP service — ports 25/587 may be closed"
 
 
@@ -1550,6 +2311,11 @@ def _got_response(low: str) -> bool:
     return bool(_CURL_RESPONSE.search(low) or re.search(r'\d+/tcp open', low))
 
 
+def _got_http_response(low: str) -> bool:
+    """True if output contains an actual HTTP response body/headers (not just nmap port state)."""
+    return bool(_CURL_RESPONSE.search(low))
+
+
 def _parse_react_rce(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
@@ -1573,13 +2339,13 @@ def _parse_heartbleed(text: str, xml: str, description: str = "") -> Tuple[Verdi
     if _host_down(text):
         return "inconclusive", "Host unreachable"
     low = text.lower()
-    if re.search(r'heartbleed.*vulnerable|state:\s*vulnerable', low):
+    if re.search(r'not vulnerable|state:\s*not\s*vulnerable|heartbleed.*false', low):
+        return "fixed", "Host is not vulnerable to Heartbleed"
+    if re.search(r'state:\s*vulnerable\b|heartbleed:\s*vulnerable', low):
         return "not_fixed", (
             "Heartbleed (CVE-2014-0160) still present — "
             "upgrade OpenSSL to 1.0.1g+ / 1.0.2+ and restart all TLS services"
         )
-    if re.search(r'not vulnerable|heartbleed.*false', low):
-        return "fixed", "Host is not vulnerable to Heartbleed"
     if "ssl-heartbleed" in low:
         return "inconclusive", "ssl-heartbleed script ran but result unclear — check raw output"
     if re.search(r'\d+/tcp open', low):
@@ -1624,7 +2390,7 @@ def _parse_content_type_options(text: str, xml: str, description: str = "") -> T
         if re.search(r'x-content-type-options\s*:\s*nosniff', low):
             return "fixed", "X-Content-Type-Options: nosniff is present"
         return "not_fixed", "X-Content-Type-Options header found but not set to 'nosniff'"
-    if _got_response(low):
+    if _got_http_response(low):
         return "not_fixed", "X-Content-Type-Options header not found in response — add 'X-Content-Type-Options: nosniff'"
     return "inconclusive", "Could not check X-Content-Type-Options — port may be closed or filtered"
 
@@ -1642,7 +2408,7 @@ def _parse_referrer_policy(text: str, xml: str, description: str = "") -> Tuple[
                 "change to 'no-referrer' or 'strict-origin-when-cross-origin'"
             )
         return "fixed", "Referrer-Policy header is present"
-    if _got_response(low):
+    if _got_http_response(low):
         return "not_fixed", "Referrer-Policy header not found — add 'Referrer-Policy: strict-origin-when-cross-origin'"
     return "inconclusive", "Could not check Referrer-Policy — port may be closed or filtered"
 
@@ -1664,7 +2430,7 @@ def _parse_csp(text: str, xml: str, description: str = "") -> Tuple[Verdict, str
         if problems:
             return "not_fixed", "CSP present but weak: " + "; ".join(problems)
         return "fixed", "Content-Security-Policy header is present"
-    if _got_response(low):
+    if _got_http_response(low):
         return "not_fixed", "Content-Security-Policy header not found in response"
     return "inconclusive", "Could not check Content-Security-Policy — port may be closed or filtered"
 
@@ -1920,7 +2686,9 @@ def _parse_memcached(text: str, xml: str, description: str = "") -> Tuple[Verdic
     low = text.lower()
     if _port_closed(low, 11211):
         return "inconclusive", "Memcached port (11211) closed or filtered"
-    if "memcached" in low or ("version" in low and "bytes" in low and "curr_items" in low):
+    if "memcached-info" in low or (
+        "version" in low and "bytes" in low and "curr_items" in low
+    ):
         if "sasl" in low or "authentication" in low:
             return "fixed", "Memcached has SASL authentication configured"
         return "not_fixed", (
@@ -1928,7 +2696,7 @@ def _parse_memcached(text: str, xml: str, description: str = "") -> Tuple[Verdic
             "restrict via host-based firewall rules (bind to 127.0.0.1) or enable SASL auth"
         )
     if re.search(r'11211/tcp open', low):
-        return "not_fixed", "Memcached port is open — verify unauthenticated access is blocked at the network level"
+        return "inconclusive", "Port 11211 open — confirm whether Memcached stats are accessible without auth"
     return "inconclusive", "Could not determine Memcached access status — port may be closed"
 
 
@@ -1960,7 +2728,29 @@ def _parse_couchdb(text: str, xml: str, description: str = "") -> Tuple[Verdict,
 def _parse_cassandra(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
-    low = text.lower()
+
+    nmap_section = text
+    cqlsh_section = ""
+    if re.search(r"###CQLSH###", text, re.I):
+        parts = re.split(r"###CQLSH###", text, maxsplit=1, flags=re.I)
+        nmap_section = parts[0]
+        cqlsh_section = parts[1]
+        if re.search(r"###XML###", cqlsh_section, re.I):
+            cqlsh_section = re.split(r"###XML###", cqlsh_section, maxsplit=1, flags=re.I)[0]
+
+    if cqlsh_section.strip():
+        cql_low = cqlsh_section.lower()
+        if "cqlsh_skip" in cql_low or "cqlsh not installed" in cql_low:
+            pass
+        elif any(x in cql_low for x in (
+            "authentication failed", "provided username", "password",
+            "no host specified", "unable to connect",
+        )) and "authentication" in cql_low:
+            return "fixed", "cqlsh: Cassandra requires authentication"
+        elif re.search(r"\brows?\b", cqlsh_section) or "system.local" in cql_low:
+            return "not_fixed", "cqlsh: Cassandra accessible without authentication"
+
+    low = nmap_section.lower()
     if _port_closed(low, 9042):
         return "inconclusive", "Cassandra port (9042) closed or filtered"
     if "cassandra" in low or re.search(r'9042/tcp open', low):
@@ -1969,7 +2759,9 @@ def _parse_cassandra(text: str, xml: str, description: str = "") -> Tuple[Verdic
                 "Cassandra uses AllowAllAuthenticator — no credentials required; "
                 "set authenticator: PasswordAuthenticator in cassandra.yaml"
             )
-        if "authentication" in low or "password" in low or "cassandra-info" in low:
+        if "passwordauthenticator" in low or (
+            "authentication" in low and "cassandra-info" in low
+        ):
             return "fixed", "Cassandra appears to require authentication"
         return "inconclusive", "Cassandra port open — verify PasswordAuthenticator is set in cassandra.yaml"
     return "inconclusive", "Could not detect Cassandra — port 9042 may be closed"
@@ -2010,10 +2802,12 @@ def _parse_etcd(text: str, xml: str, description: str = "") -> Tuple[Verdict, st
             "etcd API is accessible without authentication — "
             "Kubernetes secrets and cluster config may be readable; enable etcd authentication"
         )
-    if "401" in text and "unauthorized" in low:
+    if '"etcdserver"' in low and '"version"' in low:
+        return "not_fixed", "etcd /version endpoint accessible without authentication"
+    if "401" in text and ("unauthorized" in low or _got_response(low)):
         return "fixed", "etcd requires authentication"
     if re.search(r'2379/tcp open', low):
-        return "not_fixed", "etcd port is open — verify unauthenticated API access is blocked"
+        return "inconclusive", "etcd port is open — verify unauthenticated API access is blocked"
     return "inconclusive", "Could not determine etcd access status"
 
 
@@ -2033,8 +2827,10 @@ def _parse_docker_api(text: str, xml: str, description: str = "") -> Tuple[Verdi
         return "not_fixed", "Docker Remote API returns container/image data without authentication"
     if "401" in text or "403" in text:
         return "fixed", "Docker API requires authentication"
-    if re.search(r'(2375|2376)/tcp open', low):
-        return "not_fixed", "Docker API port is open — verify unauthenticated access is blocked"
+    if re.search(r'2375/tcp open', low):
+        return "inconclusive", "Docker cleartext API port 2375 open — confirm unauthenticated access is blocked"
+    if re.search(r'2376/tcp open', low):
+        return "inconclusive", "Docker TLS port 2376 open — confirm client-cert mutual TLS is enforced"
     return "inconclusive", "Could not determine Docker API access status"
 
 
@@ -2064,16 +2860,33 @@ def _parse_kubernetes_api(text: str, xml: str, description: str = "") -> Tuple[V
 def _parse_rabbitmq(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
-    low = text.lower()
-    if '"rabbitmq_version"' in low or ('"overview"' in low and '"message_stats"' in low):
-        return "not_fixed", (
-            "RabbitMQ management API is accessible — "
-            "verify default guest/guest credentials are disabled and UI is restricted to internal networks"
+
+    main_section = text
+    guest_section = ""
+    if re.search(r"###CURL###", text, re.I):
+        parts = re.split(r"###CURL###", text, maxsplit=1, flags=re.I)
+        main_section = parts[0]
+        guest_section = parts[1]
+
+    def _guest_overview(section: str) -> bool:
+        low = section.lower()
+        return '"rabbitmq_version"' in low or ('"overview"' in low and '"message_stats"' in low)
+
+    guest_low = guest_section.lower()
+    if _guest_overview(guest_section):
+        return "not_fixed", "RabbitMQ management API accepts default guest/guest credentials"
+    if guest_section.strip() and ("401" in guest_section or "403" in guest_section):
+        return "fixed", "RabbitMQ guest user disabled or management API requires authentication"
+
+    low = main_section.lower()
+    if _guest_overview(main_section):
+        return "inconclusive", (
+            "RabbitMQ management API responded without auth — guest credential test inconclusive"
         )
-    if "200" in text and ("rabbitmq" in low or re.search(r'15672/tcp open', low)):
-        return "not_fixed", "RabbitMQ management UI appears accessible — confirm guest user is disabled"
-    if "401" in text and _got_response(low):
+    if "401" in main_section and _got_response(low):
         return "fixed", "RabbitMQ management requires authentication"
+    if "200" in main_section and ("rabbitmq" in low or re.search(r'15672/tcp open', low)):
+        return "inconclusive", "RabbitMQ management UI responded — verify guest user is disabled"
     if re.search(r'15672/tcp open', low):
         return "inconclusive", "RabbitMQ management port open — verify guest user is disabled or UI is IP-restricted"
     return "inconclusive", "Could not detect RabbitMQ management UI — check port 15672"
@@ -2266,6 +3079,9 @@ class VulnRule:
     curl_method: str = "GET"           # "GET" | "POST"
     curl_post_data: Optional[str] = None
     requires_root: bool = False  # True for UDP scans (-sU) and other raw-socket ops
+    # Optional shell snippet run after nmap, before XML collection ({ip}, {port}, {scheme}).
+    post_shell: Optional[str] = None
+    post_shell_tag: str = "AUX"  # output delimiter: ###{tag}###
 
 
 RULES: List[VulnRule] = [
@@ -2281,6 +3097,12 @@ RULES: List[VulnRule] = [
         name="SSL Certificate Cannot Be Trusted / Self-Signed",
         patterns=[r"ssl certificate cannot be trusted", r"ssl self.signed", r"self.signed certificate"],
         nmap_script="ssl-cert",
+        post_shell=(
+            'if command -v openssl >/dev/null 2>&1; then '
+            'echo | timeout 15 openssl s_client -connect {ip}:{port} -servername {ip} 2>&1; '
+            'else echo "[OPENSSL_SKIP] openssl not installed"; fi'
+        ),
+        post_shell_tag="OPENSSL",
         parse=_parse_ssl_trust,
     ),
     VulnRule(
@@ -2432,6 +3254,8 @@ RULES: List[VulnRule] = [
         ],
         nmap_script="smb-enum-shares",
         default_port=445,
+        post_shell='timeout 15 smbclient -L //{ip} -U "" -N 2>&1',
+        post_shell_tag="SMBCLIENT",
         parse=_parse_smb_null,
     ),
     VulnRule(
@@ -2463,14 +3287,16 @@ RULES: List[VulnRule] = [
     #     default_port=445,
     #     parse=_parse_ms17010,
     # ),
-    VulnRule(
-        name="Microsoft MSMQ RCE QueueJumper (CVE-2023-21554)",
-        patterns=[r"microsoft message queuing", r"queuejumper", r"cve-2023-21554", r"msmq"],
-        nmap_script="banner",
-        extra_args="-sV",
-        default_port=1801,
-        parse=_parse_msmq,
-    ),
+    # Disabled: CVE-2023-21554 patch status cannot be confirmed from MSMQ port/banner alone.
+    # Set verdict manually after KB/patch verification.
+    # VulnRule(
+    #     name="Microsoft MSMQ RCE QueueJumper (CVE-2023-21554)",
+    #     patterns=[r"microsoft message queuing", r"queuejumper", r"cve-2023-21554", r"msmq"],
+    #     nmap_script="banner",
+    #     extra_args="-sV",
+    #     default_port=1801,
+    #     parse=_parse_msmq,
+    # ),
 
     # --- RDP ---
     VulnRule(
@@ -2505,22 +3331,28 @@ RULES: List[VulnRule] = [
     ),
 
     # --- HTTP / Web (most specific first to avoid generic rule swallowing them) ---
-    VulnRule(
-        name="Apache Log4Shell RCE (CVE-2021-44228)",
-        patterns=[r"log4shell", r"log4j.*rce", r"cve-2021-44228", r"log4.*jndi"],
-        nmap_script="http-server-header",
-        extra_args="-sV",
-        default_port=8080,
-        parse=_parse_log4shell,
-    ),
-    VulnRule(
-        name="Apache Tomcat AJP Connector / Ghostcat",
-        patterns=[r"ghostcat", r"ajp connector", r"tomcat.*ajp", r"apache tomcat ajp"],
-        nmap_script="banner",
-        extra_args="-sV",
-        default_port=8009,
-        parse=_parse_ghostcat,
-    ),
+    # Disabled: Log4Shell is an embedded library issue — no safe remote version/JNDI
+    # probe from nmap/curl. Confirm Log4j ≥ 2.17.1 via package audit or authenticated
+    # scan and set the verdict manually (see MANUAL_ONLY_RULES).
+    # VulnRule(
+    #     name="Apache Log4Shell RCE (CVE-2021-44228)",
+    #     patterns=[r"log4shell", r"log4j.*rce", r"cve-2021-44228", r"log4.*jndi"],
+    #     nmap_script="http-server-header",
+    #     extra_args="-sV",
+    #     default_port=8080,
+    #     parse=_parse_log4shell,
+    # ),
+    # Disabled: Ghostcat/AJP retest needs Tomcat server.xml review (AJP disabled or
+    # bound to 127.0.0.1) and often authenticated confirmation — not reliable from
+    # port-8009 banner alone. Set verdict manually (see MANUAL_ONLY_RULES).
+    # VulnRule(
+    #     name="Apache Tomcat AJP Connector / Ghostcat",
+    #     patterns=[r"ghostcat", r"ajp connector", r"tomcat.*ajp", r"apache tomcat ajp"],
+    #     nmap_script="banner",
+    #     extra_args="-sV",
+    #     default_port=8009,
+    #     parse=_parse_ghostcat,
+    # ),
     VulnRule(
         name="JBoss JMX Console / Deserialization RCE",
         patterns=[
@@ -2558,6 +3390,13 @@ RULES: List[VulnRule] = [
         nmap_script="http-server-header",
         extra_args="-sV",
         default_port=8080,
+        post_shell=(
+            'curl -sk -I --max-time 15 '
+            '-w "\\n[STATUS:%{{http_code}}][URL:%{{url_effective}}]\\n" '
+            '{scheme}://{ip}:{port}/ 2>&1; '
+            'curl -sk --max-time 15 {scheme}://{ip}:{port}/VERSION.txt 2>&1'
+        ),
+        post_shell_tag="CURL",
         parse=_parse_tomcat_version,
     ),
     VulnRule(
@@ -2575,9 +3414,15 @@ RULES: List[VulnRule] = [
         name="HTTP TRACE / TRACK Methods Allowed",
         patterns=[r"http trace", r"http track", r"options method allowed", r"http.*dangerous method",
                   r"dangerous.*http.*method", r"http.*unsafe.*method"],
-        nmap_script="http-methods",
+        nmap_script="http-trace",
         default_port=80,
-        parse=_parse_http_methods,
+        post_shell=(
+            'timeout 15 curl -sk --max-time 15 -X TRACK -D - -o /dev/null '
+            '-w "\\n[TRACK_STATUS:%{{http_code}}]\\n" '
+            '{scheme}://{ip}:{port}/ 2>&1'
+        ),
+        post_shell_tag="CURL",
+        parse=_parse_http_trace_track,
     ),
     # Apache-specific patterns removed — Apache scans producing inaccurate results, moved to manual review.
     VulnRule(
@@ -2679,6 +3524,13 @@ RULES: List[VulnRule] = [
         parse=_parse_minio,
         tool="curl",
         curl_path="/",
+        post_shell=(
+            'timeout 15 curl -sk --max-time 15 -X POST '
+            '{scheme}://{ip}:{port}/api/v1/login '
+            '-H "Content-Type: application/json" '
+            '-d \'{"accessKey":"minioadmin","secretKey":"minioadmin"}\' 2>&1'
+        ),
+        post_shell_tag="MINIO",
     ),
 
     # --- Database ---
@@ -2690,6 +3542,13 @@ RULES: List[VulnRule] = [
         ],
         nmap_script="mongodb-info",
         default_port=27017,
+        post_shell=(
+            'if command -v mongosh >/dev/null 2>&1; then '
+            'timeout 15 mongosh "mongodb://{ip}:{port}/" '
+            '--eval \'db.adminCommand({{listDatabases:1}})\' --quiet 2>&1; '
+            'else echo "[MONGOSH_SKIP] mongosh not installed"; fi'
+        ),
+        post_shell_tag="MONGOSH",
         parse=_parse_mongodb,
     ),
     VulnRule(
@@ -2752,7 +3611,14 @@ RULES: List[VulnRule] = [
         nmap_script="pgsql-brute",
         extra_args="--script-args=brute.firstonly=true,pgsql-brute.db=postgres",
         default_port=5432,
-        parse=_parse_service_version,
+        post_shell=(
+            'if command -v psql >/dev/null 2>&1; then '
+            'PGPASSWORD=\'\' timeout 15 psql -h {ip} -p {port} -U postgres -d postgres '
+            '-c \'SELECT 1\' 2>&1; '
+            'else echo "[PSQL_SKIP] psql not installed"; fi'
+        ),
+        post_shell_tag="PSQL",
+        parse=_parse_pgsql,
     ),
 
     # --- Network Services ---
@@ -2800,6 +3666,12 @@ RULES: List[VulnRule] = [
         ],
         nmap_script="nfs-ls,nfs-showmount",
         default_port=2049,
+        post_shell=(
+            'if command -v showmount >/dev/null 2>&1; then '
+            'timeout 15 showmount -e {ip} 2>&1; '
+            'else echo "[SHOWMOUNT_SKIP] showmount not installed"; fi'
+        ),
+        post_shell_tag="SHOWMOUNT",
         parse=_parse_nfs,
     ),
     VulnRule(
@@ -2807,7 +3679,13 @@ RULES: List[VulnRule] = [
         patterns=[r"rsh service", r"rexecd service", r"rlogin service"],
         nmap_script="banner",
         default_port=514,
-        parse=_parse_telnet,
+        post_shell=(
+            'for p in 512 513 514; do '
+            'timeout 3 nc -z {ip} $p 2>/dev/null && echo "RSH_PORT_OPEN:$p"; '
+            'done; echo RSH_CHECK_DONE'
+        ),
+        post_shell_tag="RSH",
+        parse=_parse_r_services,
     ),
     VulnRule(
         name="iSCSI Unauthenticated Target",
@@ -2830,25 +3708,39 @@ RULES: List[VulnRule] = [
         patterns=[r"ftp.*anonymous", r"ftp.*anon"],
         nmap_script="ftp-anon",
         default_port=21,
+        post_shell=(
+            'if command -v ftp >/dev/null 2>&1; then '
+            'timeout 15 ftp -nv {ip} 21 <<EOF 2>&1\n'
+            'user anonymous anonymous@\n'
+            'pwd\n'
+            'quit\n'
+            'EOF\n'
+            'elif command -v curl >/dev/null 2>&1; then '
+            'timeout 15 curl -sk --max-time 15 -u anonymous: ftp://{ip}/ 2>&1; '
+            'else echo "[FTP_SKIP] ftp/curl not installed"; fi'
+        ),
+        post_shell_tag="FTP",
         parse=_parse_ftp_anon,
     ),
 
     # --- Application / Platform ---
-    VulnRule(
-        name="Cisco IOS XE Web UI Vulnerabilities",
-        patterns=[
-            r"cisco ios xe.*command execution", r"cisco ios xe.*rce",
-            r"cisco ios xe.*privilege escalation", r"cisco ios xe.*web ui",
-            r"cisco ios xe.*authentication bypass", r"cisco ios xe.*command injection",
-            r"cisco ios xe.*netconf", r"cisco ios xe.*iox", r"cisco ios xe.*bgp",
-            r"cisco ios xe.*firewall", r"cisco ios xe.*dns",
-            r"cisco-sa-iosxe", r"cve-2023-20198",
-        ],
-        nmap_script="http-server-header",
-        extra_args="-sV",
-        default_port=443,
-        parse=_parse_cisco_iosxe,
-    ),
+    # Disabled: IOS XE Web UI/CVE retest needs authenticated show version or PSIRT
+    # comparison — http-server-header cannot confirm patch status. Set verdict manually.
+    # VulnRule(
+    #     name="Cisco IOS XE Web UI Vulnerabilities",
+    #     patterns=[
+    #         r"cisco ios xe.*command execution", r"cisco ios xe.*rce",
+    #         r"cisco ios xe.*privilege escalation", r"cisco ios xe.*web ui",
+    #         r"cisco ios xe.*authentication bypass", r"cisco ios xe.*command injection",
+    #         r"cisco ios xe.*netconf", r"cisco ios xe.*iox", r"cisco ios xe.*bgp",
+    #         r"cisco ios xe.*firewall", r"cisco ios xe.*dns",
+    #         r"cisco-sa-iosxe", r"cve-2023-20198",
+    #     ],
+    #     nmap_script="http-server-header",
+    #     extra_args="-sV",
+    #     default_port=443,
+    #     parse=_parse_cisco_iosxe,
+    # ),
     VulnRule(
         name="Cisco Prime Infrastructure Vulnerabilities",
         patterns=[r"cisco prime infrastructure", r"cisco prime.*tftp", r"cisco prime.*command"],
@@ -2860,10 +3752,10 @@ RULES: List[VulnRule] = [
     VulnRule(
         name="HP iLO / Ripple20 Vulnerabilities",
         patterns=[
-            r"hp ilo [345]", r"hpe ilo", r"ilo [0-9]",
+            r"hp ilo [345]", r"hpe ilo", r"(?:hp|hpe)\s*ilo\s+[0-9]",
             r"hp ilo.*ripple20", r"hp ilo.*rce",
-            r"hp ilo.*multiple vulnerabilities", r"ilo.*ripple20",
-            r"ilo.*xss", r"ilo.*vulnerabilit",
+            r"hp ilo.*multiple vulnerabilities", r"(?:hp|hpe)\s*ilo.*ripple20",
+            r"(?:hp|hpe)\s*ilo.*xss", r"(?:hp|hpe)\s*ilo.*vulnerabilit",
         ],
         nmap_script="http-server-header",
         extra_args="-sV",
@@ -2887,7 +3779,17 @@ RULES: List[VulnRule] = [
         nmap_script="http-server-header",
         extra_args="-sV",
         default_port=443,
-        parse=_parse_service_version,
+        post_shell=(
+            'if command -v curl >/dev/null 2>&1; then '
+            'timeout 15 curl -sk --max-time 15 '
+            '{scheme}://{ip}:{port}/redfish/v1/Managers/iDRAC.Embedded.1 2>&1; '
+            'echo "---"; '
+            'timeout 15 curl -sk --max-time 15 '
+            '{scheme}://{ip}:{port}/redfish/v1/Managers/iDRAC.0 2>&1; '
+            'else echo "[REDFISH_SKIP] curl not installed"; fi'
+        ),
+        post_shell_tag="CURL",
+        parse=_parse_idrac,
     ),
     # VulnRule(
     #     name="VMware ESXi / vCenter / Aria / Workspace ONE Vulnerabilities",
@@ -2924,10 +3826,16 @@ RULES: List[VulnRule] = [
     ),
     VulnRule(
         name="ActiveMQ RCE CVE-2023-46604",
-        patterns=[r"activemq.*rce", r"cve-2023-46604", r"activemq.*5\."],
+        patterns=[r"activemq.*rce", r"cve-2023-46604"],
         nmap_script="banner",
         extra_args="-sV",
         default_port=61616,
+        post_shell=(
+            'if command -v curl >/dev/null 2>&1; then '
+            'timeout 15 curl -sk --max-time 15 {scheme}://{ip}:8161/admin/ 2>&1; '
+            'else echo "[ACTIVEMQ_SKIP] curl not installed"; fi'
+        ),
+        post_shell_tag="CURL",
         parse=_parse_activemq,
     ),
     VulnRule(
@@ -2936,7 +3844,13 @@ RULES: List[VulnRule] = [
         nmap_script="banner",
         extra_args="-sV",
         default_port=61616,
-        parse=_parse_service_version,
+        post_shell=(
+            'if command -v curl >/dev/null 2>&1; then '
+            'timeout 15 curl -sk --max-time 15 {scheme}://{ip}:8161/admin/ 2>&1; '
+            'else echo "[ACTIVEMQ_SKIP] curl not installed"; fi'
+        ),
+        post_shell_tag="CURL",
+        parse=_parse_activemq_version,
     ),
     VulnRule(
         name="Hadoop YARN Unauthenticated RCE",
@@ -2994,14 +3908,16 @@ RULES: List[VulnRule] = [
         default_port=80,
         parse=_parse_service_version,
     ),
-    VulnRule(
-        name="Python Unsupported Version Detection",
-        patterns=[r"python unsupported", r"python.*end.of.life", r"python.*eol"],
-        nmap_script="banner",
-        extra_args="-sV",
-        default_port=22,
-        parse=_parse_service_version,
-    ),
+    # Disabled: Python EOL detection needs authenticated app/runtime inspection — SSH
+    # banner on port 22 is not a reliable indicator. Set verdict manually.
+    # VulnRule(
+    #     name="Python Unsupported Version Detection",
+    #     patterns=[r"python unsupported", r"python.*end.of.life", r"python.*eol"],
+    #     nmap_script="banner",
+    #     extra_args="-sV",
+    #     default_port=22,
+    #     parse=_parse_service_version,
+    # ),
 
     # --- MongoDB version (distinct from auth bypass) ---
     VulnRule(
@@ -3013,38 +3929,48 @@ RULES: List[VulnRule] = [
         nmap_script="mongodb-info",
         extra_args="-sV",
         default_port=27017,
-        parse=_parse_service_version,
+        post_shell=(
+            'if command -v mongosh >/dev/null 2>&1; then '
+            'timeout 15 mongosh "mongodb://{ip}:{port}/" '
+            '--eval \'db.version()\' --quiet 2>&1; '
+            'else echo "[MONGOSH_SKIP] mongosh not installed"; fi'
+        ),
+        post_shell_tag="MONGOSH",
+        parse=_parse_mongodb_version,
     ),
 
     # --- Web application / framework ---
-    VulnRule(
-        name="React Server Components RCE (React2Shell)",
-        patterns=[r"react.*react2shell", r"react2shell", r"react server components.*rce",
-                  r"react server components.*remote code"],
-        nmap_script="",
-        default_port=443,
-        parse=_parse_react_rce,
-        tool="curl",
-        curl_path="/",
-    ),
-    VulnRule(
-        name="Moodle Outdated Version",
-        patterns=[r"moodle.*version", r"outdated moodle", r"moodle\s+[0-9]"],
-        nmap_script="",
-        default_port=80,
-        parse=_parse_moodle,
-        tool="curl",
-        curl_path="/lib/upgrade.txt",
-    ),
-    VulnRule(
-        name="Alfresco Default Credentials",
-        patterns=[r"alfresco.*guest", r"alfresco.*default", r"alfresco.*credentials", r"alfresco.*admin"],
-        nmap_script="",
-        default_port=8080,
-        parse=_parse_alfresco,
-        tool="curl",
-        curl_path="/alfresco/",
-    ),
+    # Disabled: overlaps MANUAL_ONLY_RULES — React2Shell needs app-level RSC version check.
+    # VulnRule(
+    #     name="React Server Components RCE (React2Shell)",
+    #     patterns=[r"react.*react2shell", r"react2shell", r"react server components.*rce",
+    #               r"react server components.*remote code"],
+    #     nmap_script="",
+    #     default_port=443,
+    #     parse=_parse_react_rce,
+    #     tool="curl",
+    #     curl_path="/",
+    # ),
+    # Disabled: overlaps MANUAL_ONLY_RULES — Moodle version needs authenticated admin pages.
+    # VulnRule(
+    #     name="Moodle Outdated Version",
+    #     patterns=[r"moodle.*version", r"outdated moodle", r"moodle\s+[0-9]"],
+    #     nmap_script="",
+    #     default_port=80,
+    #     parse=_parse_moodle,
+    #     tool="curl",
+    #     curl_path="/lib/upgrade.txt",
+    # ),
+    # Disabled: overlaps MANUAL_ONLY_RULES — Alfresco default creds need authenticated login test.
+    # VulnRule(
+    #     name="Alfresco Default Credentials",
+    #     patterns=[r"alfresco.*guest", r"alfresco.*default", r"alfresco.*credentials", r"alfresco.*admin"],
+    #     nmap_script="",
+    #     default_port=8080,
+    #     parse=_parse_alfresco,
+    #     tool="curl",
+    #     curl_path="/alfresco/",
+    # ),
     VulnRule(
         name="Browsable Web Directories / Apache Multiviews",
         patterns=[
@@ -3119,16 +4045,17 @@ RULES: List[VulnRule] = [
         default_port=5672,
         parse=_parse_amqp,
     ),
-    VulnRule(
-        name="DNS Server Cache Snooping",
-        patterns=[r"dns.*cache snooping", r"dns server cache snoop",
-                  r"dns.*remote information disclosure"],
-        nmap_script="dns-cache-snoop",
-        extra_args="-sU",
-        default_port=53,
-        parse=_parse_dns_cache,
-        requires_root=True,
-    ),
+    # Disabled: overlaps MANUAL_ONLY_RULES — dns-cache-snoop is slow/unreliable on UDP 53.
+    # VulnRule(
+    #     name="DNS Server Cache Snooping",
+    #     patterns=[r"dns.*cache snooping", r"dns server cache snoop",
+    #               r"dns.*remote information disclosure"],
+    #     nmap_script="dns-cache-snoop",
+    #     extra_args="-sU",
+    #     default_port=53,
+    #     parse=_parse_dns_cache,
+    #     requires_root=True,
+    # ),
     # Disabled: NTP Mode 6 scans taking too long and producing inaccurate results — moved to manual review.
     # VulnRule(
     #     name="NTP Mode 6 Scanner",
@@ -3140,15 +4067,16 @@ RULES: List[VulnRule] = [
     #     parse=_parse_ntp,
     #     requires_root=True,
     # ),
-    VulnRule(
-        name="Cisco IOS TFTP File Disclosure",
-        patterns=[r"cisco.*tftp", r"cisco ios.*tftp", r"cisco.*tftp.*disclosure"],
-        nmap_script="tftp-enum",
-        extra_args="-sU",
-        default_port=69,
-        parse=_parse_cisco_tftp,
-        requires_root=True,
-    ),
+    # Disabled: overlaps MANUAL_ONLY_RULES — Cisco TFTP disclosure needs UDP 69 access review.
+    # VulnRule(
+    #     name="Cisco IOS TFTP File Disclosure",
+    #     patterns=[r"cisco.*tftp", r"cisco ios.*tftp", r"cisco.*tftp.*disclosure"],
+    #     nmap_script="tftp-enum",
+    #     extra_args="-sU",
+    #     default_port=69,
+    #     parse=_parse_cisco_tftp,
+    #     requires_root=True,
+    # ),
     VulnRule(
         name="SMTP Configuration Information Disclosure",
         patterns=[r"smtp.*configuration.*information", r"smtp.*disclosure",
@@ -3319,29 +4247,29 @@ RULES: List[VulnRule] = [
         parse=_parse_iis_version,
     ),
 
-    # --- Apache Struts ---
-    VulnRule(
-        name="Apache Struts Remote Code Execution",
-        patterns=[r"\bstruts\b", r"apache.*struts", r"struts.*rce",
-                  r"struts.*remote.*code.*execution", r"struts.*ognl.*injection",
-                  r"cve.2017.5638", r"s2-045", r"s2-057", r"struts.*vulnerability"],
-        tool="curl",
-        curl_path="/",
-        default_port=8080,
-        parse=_parse_struts,
-    ),
+    # Disabled: overlaps MANUAL_ONLY_RULES — Struts RCE needs authenticated app testing.
+    # VulnRule(
+    #     name="Apache Struts Remote Code Execution",
+    #     patterns=[r"\bstruts\b", r"apache.*struts", r"struts.*rce",
+    #               r"struts.*remote.*code.*execution", r"struts.*ognl.*injection",
+    #               r"cve.2017.5638", r"s2-045", r"s2-057", r"struts.*vulnerability"],
+    #     tool="curl",
+    #     curl_path="/",
+    #     default_port=8080,
+    #     parse=_parse_struts,
+    # ),
 
-    # --- Spring4Shell ---
-    VulnRule(
-        name="Spring4Shell Spring Framework RCE (CVE-2022-22965)",
-        patterns=[r"spring4shell", r"cve.2022.22965", r"spring.*framework.*rce",
-                  r"spring.*remote.*code.*execution", r"spring.*classloader.*manipulation",
-                  r"spring.*classloader.*rce"],
-        tool="curl",
-        curl_path="/",
-        default_port=8080,
-        parse=_parse_spring4shell,
-    ),
+    # Disabled: overlaps MANUAL_ONLY_RULES — Spring4Shell needs JDK/Tomcat context.
+    # VulnRule(
+    #     name="Spring4Shell Spring Framework RCE (CVE-2022-22965)",
+    #     patterns=[r"spring4shell", r"cve.2022.22965", r"spring.*framework.*rce",
+    #               r"spring.*remote.*code.*execution", r"spring.*classloader.*manipulation",
+    #               r"spring.*classloader.*rce"],
+    #     tool="curl",
+    #     curl_path="/",
+    #     default_port=8080,
+    #     parse=_parse_spring4shell,
+    # ),
 
     # --- Microsoft Exchange ---
     VulnRule(
@@ -3386,6 +4314,12 @@ RULES: List[VulnRule] = [
                   r"cassandra.*exposed"],
         nmap_script="cassandra-info",
         default_port=9042,
+        post_shell=(
+            'if command -v cqlsh >/dev/null 2>&1; then '
+            'timeout 15 cqlsh {ip} {port} -e \'SELECT now() FROM system.local\' 2>&1; '
+            'else echo "[CQLSH_SKIP] cqlsh not installed"; fi'
+        ),
+        post_shell_tag="CQLSH",
         parse=_parse_cassandra,
     ),
 
@@ -3410,7 +4344,7 @@ RULES: List[VulnRule] = [
                   r"etcd.*without.*auth", r"etcd.*open.*access",
                   r"etcd.*kubernetes.*exposed"],
         tool="curl",
-        curl_path="/v2/members",
+        curl_paths=["/version", "/v2/members"],
         default_port=2379,
         parse=_parse_etcd,
     ),
@@ -3422,7 +4356,7 @@ RULES: List[VulnRule] = [
                   r"docker.*api.*unauthenticated", r"docker.*daemon.*exposed",
                   r"docker.*socket.*exposed", r"unauthenticated.*docker"],
         tool="curl",
-        curl_path="/v1/version",
+        curl_path="/version",
         default_port=2375,
         parse=_parse_docker_api,
     ),
@@ -3448,6 +4382,11 @@ RULES: List[VulnRule] = [
         tool="curl",
         curl_path="/api/overview",
         default_port=15672,
+        post_shell=(
+            'timeout 15 curl -sk --max-time 15 -u guest:guest '
+            '{scheme}://{ip}:{port}/api/overview 2>&1'
+        ),
+        post_shell_tag="CURL",
         parse=_parse_rabbitmq,
     ),
 
@@ -3542,6 +4481,14 @@ MANUAL_ONLY_RULES = [
     r"dns.*cache snooping",
     
     # 2. Complex Web Applications & Framework RCEs
+    r"log4shell",
+    r"log4j.*rce",
+    r"cve-2021-44228",
+    r"log4.*jndi",
+    r"ghostcat",
+    r"ajp connector",
+    r"tomcat.*ajp",
+    r"apache tomcat ajp",
     r"spring4shell",
     r"spring.*framework.*rce",
     r"struts",
@@ -3553,11 +4500,18 @@ MANUAL_ONLY_RULES = [
     r"exchange.*proxyshell",
     
     # 3. Deep Protocol / Authenticated Checks
-    r"terminal services encryption level",
+    r"terminal services.*encryption",
+    r"msmq",
+    r"queuejumper",
+    r"cve-2023-21554",
+    r"microsoft message queuing",
     r"ipmi v2\.0 password hash disclosure",
     r"smb signing disabled",
     r"ldap null base",
     r"apache 2\.4\.x.*windows",
+    r"cisco ios xe",       # patch level requires show version / PSIRT — not banner scan
+    r"cisco-sa-iosxe",
+    r"cve-2023-20198",
     
     # 4. Flaky Web Configurations (False Positives)
     r"info\.php",
@@ -3570,7 +4524,12 @@ MANUAL_ONLY_RULES = [
     r"ms16-047",
     r"badlock",
 
-    # 6. No safe automated probe available (would DoS the host or require a
+    # 6. Runtime version checks that need app-level context, not SSH banners
+    r"python unsupported",
+    r"python.*end.of.life",
+    r"python.*eol",
+
+    # 7. No safe automated probe available (would DoS the host or require a
     #    non-nmap/curl protocol) — verify manually.
     r"ms09-050",           # only NSE is smb-vuln-cve2009-3103, an intrusive DoS/bluescreen
     r"educatedscholar",

@@ -297,7 +297,16 @@ class TestMatchRule:
             "NTP Mode 6 Scanner",
             "Apache Struts Remote Code Execution",
             "Spring4Shell Spring Framework RCE",
-            "Exposed phpinfo.php page"
+            "Apache Log4Shell RCE (CVE-2021-44228)",
+            "Apache Tomcat AJP Connector / Ghostcat",
+            "Cisco IOS XE Web UI Authentication Bypass (CVE-2023-20198)",
+            "Exposed phpinfo.php page",
+            "React Server Components RCE (React2Shell)",
+            "Moodle Outdated Version",
+            "Python Unsupported Version Detection",
+            "DNS Server Cache Snooping",
+            "Cisco IOS TFTP File Disclosure",
+            "Microsoft MSMQ RCE QueueJumper (CVE-2023-21554)",
         ]
         for summary in manual_summaries:
             rule = match_rule(summary)
@@ -479,6 +488,74 @@ class TestParseSshAlgos:
         verdict, reason = self.parse("22/tcp closed", "")
         assert verdict == "inconclusive"
 
+    def test_hmac_sha1_96_reported_once_with_cbc_ok(self):
+        # Colleague scenario: CBC ticket but only CTR ciphers; weak MAC still fails.
+        text = (
+            "22/tcp open  ssh\n"
+            "ssh2-enum-algos:\n"
+            "  encryption_algorithms (3):\n"
+            "    aes256-ctr\n"
+            "    aes192-ctr\n"
+            "    aes128-ctr\n"
+            "  mac_algorithms (2):\n"
+            "    hmac-sha1-96\n"
+            "    hmac-ripemd160\n"
+            "  kex_algorithms:\n"
+            "    ecdh-sha2-nistp256\n"
+        )
+        verdict, reason = self.parse(text, "")
+        assert verdict == "not_fixed"
+        assert reason.count("hmac-sha1-96") == 1
+        assert "Weak MAC: hmac-sha1-96" in reason
+        assert "Weak MAC: hmac-sha1;" not in reason
+        assert "CBC: OK" in reason
+        assert "Terrapin: OK" in reason
+
+    def test_cbc_cipher_only_flags_encryption_list(self):
+        text = (
+            "ssh2-enum-algos:\n"
+            "  encryption_algorithms: aes256-ctr,aes128-cbc\n"
+            "  mac_algorithms: hmac-sha2-256\n"
+        )
+        verdict, reason = self.parse(text, "")
+        assert verdict == "not_fixed"
+        assert "aes128-cbc" in reason
+        assert "CBC:" in reason
+        assert "Terrapin:" in reason
+
+    def test_terrapin_chacha20_is_not_fixed(self):
+        text = (
+            "ssh2-enum-algos:\n"
+            "  encryption_algorithms: aes256-ctr,chacha20-poly1305@openssh.com\n"
+            "  mac_algorithms: hmac-sha2-256\n"
+        )
+        verdict, reason = self.parse(text, "")
+        assert verdict == "not_fixed"
+        assert "chacha20-poly1305@openssh.com" in reason
+        assert "Terrapin:" in reason
+
+    def test_terrapin_cbc_with_etm_mac_only_is_ok(self):
+        text = (
+            "ssh2-enum-algos:\n"
+            "  encryption_algorithms: aes128-cbc\n"
+            "  mac_algorithms: hmac-sha2-256-etm@openssh.com\n"
+        )
+        verdict, reason = self.parse(text, "")
+        assert verdict == "not_fixed"
+        assert "CBC:" in reason
+        assert "Terrapin: OK" in reason
+
+    def test_terrapin_cbc_with_non_etm_mac_is_not_fixed(self):
+        text = (
+            "ssh2-enum-algos:\n"
+            "  encryption_algorithms: aes128-cbc\n"
+            "  mac_algorithms: hmac-sha2-256\n"
+        )
+        verdict, reason = self.parse(text, "")
+        assert verdict == "not_fixed"
+        assert "Terrapin:" in reason
+        assert "Encrypt-and-MAC" in reason
+
     def test_hmac_sha1_etm_is_acceptable(self):
         # hmac-sha1-etm@openssh.com is NOT weak; only bare hmac-sha1 is
         text = (
@@ -524,6 +601,409 @@ class TestParseSmbSigning:
     def test_port_closed_is_inconclusive(self):
         verdict, reason = self.parse("445/tcp closed", "")
         assert verdict == "inconclusive"
+
+
+class TestParseSmbNull:
+    def setup_method(self):
+        rule = match_rule("SMB NULL Session")
+        assert rule is not None
+        self.parse = rule.parse
+        assert rule.post_shell is not None
+        assert "smbclient" in rule.post_shell
+
+    def test_smbclient_share_list_is_not_fixed(self):
+        text = (
+            "###SMBCLIENT###\n"
+            "Anonymous login successful\n\n"
+            "        Sharename       Type      Comment\n"
+            "        ---------       ----      -------\n"
+            "        IPC$            IPC       IPC Service\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "smbclient" in reason.lower()
+
+    def test_smbclient_access_denied_is_fixed(self):
+        text = "###SMBCLIENT###\nsession setup failed: NT_STATUS_ACCESS_DENIED\n"
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "fixed"
+        assert "smbclient" in reason.lower()
+
+    def test_smbclient_preferred_over_nmap_disagreement(self):
+        text = (
+            "445/tcp open\naccount: guest\n"
+            "###SMBCLIENT###\n"
+            "session setup failed: NT_STATUS_ACCESS_DENIED\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "fixed"
+        assert "smbclient" in reason.lower()
+
+    def test_nmap_fallback_when_no_smbclient(self):
+        text = "445/tcp open\nsmb-enum-shares:\n  Account: guest\n"
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "nmap" in reason.lower()
+
+
+class TestParseMongoDB:
+    def setup_method(self):
+        rule = match_rule("MongoDB Unauthenticated Access")
+        assert rule is not None
+        assert rule.nmap_script == "mongodb-info"
+        assert rule.post_shell is not None
+        assert "mongosh" in rule.post_shell
+        assert rule.post_shell_tag == "MONGOSH"
+        self.parse = rule.parse
+
+    def test_nmap_still_open(self):
+        text = "27017/tcp open mongodb\nmongodb-info:\n  databases: admin\n"
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "nmap" in reason.lower()
+
+    def test_mongosh_fixed_when_auth_required(self):
+        text = (
+            "27017/tcp open mongodb\n"
+            "###MONGOSH###\n"
+            "MongoServerError: command listDatabases requires authentication\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "fixed"
+        assert "mongosh" in reason.lower()
+
+    def test_mongosh_not_fixed_lists_databases(self):
+        text = (
+            "27017/tcp open mongodb\n"
+            "###MONGOSH###\n"
+            "{ databases: [ { name: 'admin' } ], totalSize: 8192, ok: 1 }\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "mongosh" in reason.lower()
+
+    def test_mongosh_skip_falls_back_to_nmap(self):
+        text = (
+            "27017/tcp open mongodb\nmongodb-info:\n  mongodb_version: 6.0.3\n"
+            "###MONGOSH###\n"
+            "[MONGOSH_SKIP] mongosh not installed\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "nmap" in reason.lower()
+
+
+class TestParseNfsShares:
+    def setup_method(self):
+        rule = match_rule("NFS Shares Accessible")
+        assert rule is not None
+        assert "nfs-showmount" in rule.nmap_script
+        assert rule.post_shell is not None
+        assert "showmount -e" in rule.post_shell
+        assert rule.post_shell_tag == "SHOWMOUNT"
+        self.parse = rule.parse
+
+    def test_nmap_exports_still_accessible(self):
+        text = (
+            "2049/tcp open nfs\n"
+            "nfs-showmount:\n"
+            "Export list for 10.0.0.1:\n"
+            "/data *\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "nmap" in reason.lower()
+
+    def test_showmount_exports_still_accessible(self):
+        text = (
+            "2049/tcp open nfs\n"
+            "###SHOWMOUNT###\n"
+            "Export list for 10.0.0.1:\n"
+            "/public 192.168.0.0/24\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "showmount" in reason.lower()
+
+    def test_showmount_no_exports_is_fixed(self):
+        text = (
+            "2049/tcp open nfs\n"
+            "###SHOWMOUNT###\n"
+            "Export list for 10.0.0.1:\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "fixed"
+        assert "showmount" in reason.lower()
+
+    def test_showmount_skip_falls_back_to_nmap(self):
+        text = (
+            "2049/tcp open nfs\n"
+            "nfs-showmount:\n"
+            "Export list for 10.0.0.1:\n"
+            "/backup *\n"
+            "###SHOWMOUNT###\n"
+            "[SHOWMOUNT_SKIP] showmount not installed\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "nmap" in reason.lower()
+
+
+class TestParseFtpAnonymous:
+    def setup_method(self):
+        rule = match_rule("FTP Anonymous Access")
+        assert rule is not None
+        assert rule.nmap_script == "ftp-anon"
+        assert rule.post_shell is not None
+        assert "user anonymous" in rule.post_shell
+        assert rule.post_shell_tag == "FTP"
+        self.parse = rule.parse
+
+    def test_nmap_anonymous_allowed(self):
+        text = "21/tcp open ftp\n| ftp-anon: Anonymous FTP login allowed\n"
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "nmap" in reason.lower()
+
+    def test_ftp_client_login_succeeded(self):
+        text = (
+            "21/tcp open ftp\n"
+            "###FTP###\n"
+            "230 Login successful.\n"
+            "Remote directory: /\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "ftp:" in reason.lower()
+
+    def test_ftp_client_login_denied(self):
+        text = (
+            "21/tcp open ftp\n"
+            "###FTP###\n"
+            "530 Login incorrect.\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "fixed"
+        assert "ftp:" in reason.lower()
+
+    def test_ftp_skip_falls_back_to_nmap(self):
+        text = (
+            "21/tcp open ftp\n| ftp-anon: Anonymous FTP login allowed\n"
+            "###FTP###\n"
+            "[FTP_SKIP] ftp/curl not installed\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "nmap" in reason.lower()
+
+
+class TestParseIdrac:
+    DESCRIPTION = "Installed version : 6.00.02.00\nFixed version : 6.10.80.00"
+
+    def setup_method(self):
+        rule = match_rule("Dell EMC iDRAC Multiple Vulnerabilities")
+        assert rule is not None
+        assert rule.post_shell is not None
+        assert "redfish/v1/Managers" in rule.post_shell
+        assert rule.post_shell_tag == "CURL"
+        self.parse = rule.parse
+
+    def test_redfish_firmware_still_vulnerable(self):
+        text = (
+            "443/tcp open https\n"
+            "###CURL###\n"
+            '{"@odata.id":"/redfish/v1/Managers/iDRAC.Embedded.1",'
+            '"FirmwareVersion":"6.00.02.00","Model":"iDRAC9"}\n'
+        )
+        verdict, reason = self.parse(text, "", self.DESCRIPTION)
+        assert verdict == "not_fixed"
+        assert "redfish" in reason.lower()
+
+    def test_redfish_firmware_fixed(self):
+        text = (
+            "443/tcp open https\n"
+            "###CURL###\n"
+            '{"FirmwareVersion":"6.10.80.00","Model":"iDRAC9"}\n'
+        )
+        verdict, reason = self.parse(text, "", self.DESCRIPTION)
+        assert verdict == "fixed"
+        assert "redfish" in reason.lower()
+
+    def test_redfish_auth_required(self):
+        text = (
+            "443/tcp open https\n"
+            "###CURL###\n"
+            "HTTP/1.1 401 Unauthorized\n"
+        )
+        verdict, reason = self.parse(text, "", self.DESCRIPTION)
+        assert verdict == "inconclusive"
+        assert "authentication" in reason.lower() or "401" in reason.lower()
+
+    def test_redfish_skip_falls_back_to_nmap(self):
+        text = (
+            '443/tcp open https\nServer: idrac/6.10.80.00\n'
+            "###CURL###\n"
+            "[REDFISH_SKIP] curl not installed\n"
+        )
+        verdict, reason = self.parse(text, "", self.DESCRIPTION)
+        assert verdict == "fixed"
+        assert "nmap" in reason.lower()
+
+
+class TestParseActivemqVersion:
+    DESCRIPTION = "Installed version : 5.17.4\nFixed version : 5.18.3"
+
+    def setup_method(self):
+        rule = match_rule("Apache ActiveMQ 5.17 Multiple Vulnerabilities")
+        assert rule is not None
+        assert rule.post_shell is not None
+        assert ":8161/admin/" in rule.post_shell
+        self.parse = rule.parse
+
+    def test_web_console_version_fixed(self):
+        text = (
+            "61616/tcp open\n"
+            "###CURL###\n"
+            "<html>Apache ActiveMQ 5.18.3 Console</html>\n"
+        )
+        verdict, reason = self.parse(text, "", self.DESCRIPTION)
+        assert verdict == "fixed"
+        assert "web console" in reason.lower()
+
+    def test_nmap_version_still_vulnerable(self):
+        text = "61616/tcp open apache-activemq Apache ActiveMQ 5.17.4\n"
+        verdict, reason = self.parse(text, "", self.DESCRIPTION)
+        assert verdict == "not_fixed"
+        assert "nmap" in reason.lower()
+
+    def test_no_ticket_version_is_inconclusive(self):
+        text = "###CURL###\nApache ActiveMQ 5.18.3\n"
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "inconclusive"
+        assert "not found in ticket" in reason.lower()
+
+
+class TestParseActivemqCve46604:
+    def setup_method(self):
+        rule = match_rule("ActiveMQ RCE CVE-2023-46604")
+        assert rule is not None
+        assert rule.nmap_script == "banner"
+        assert rule.post_shell is not None
+        assert ":8161/admin/" in rule.post_shell
+        self.parse = rule.parse
+
+    def test_nmap_still_vulnerable(self):
+        text = "61616/tcp open  apache-activemq Apache ActiveMQ 5.17.4\n"
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "5.17.6" in reason or "CVE-2023-46604" in reason
+
+    def test_web_console_fixed(self):
+        text = (
+            "61616/tcp open\n"
+            "###CURL###\n"
+            "<html>Apache ActiveMQ 5.18.3 Console</html>\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "fixed"
+        assert "web console" in reason.lower()
+
+    def test_web_console_vulnerable(self):
+        text = (
+            "61616/tcp open\n"
+            "###CURL###\n"
+            "ActiveMQ/5.16.6 admin console\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+
+    def test_skip_falls_back_to_nmap_fixed(self):
+        text = (
+            "61616/tcp open apache-activemq Apache ActiveMQ 5.15.16\n"
+            "###CURL###\n"
+            "[ACTIVEMQ_SKIP] curl not installed\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "fixed"
+        assert "nmap" in reason.lower()
+
+
+class TestParseHttpTraceTrack:
+    def setup_method(self):
+        rule = match_rule("HTTP TRACE Method Enabled")
+        assert rule is not None
+        assert rule.nmap_script == "http-trace"
+        assert rule.post_shell is not None
+        assert "-X TRACK" in rule.post_shell
+        self.parse = rule.parse
+
+    def test_trace_still_enabled(self):
+        text = (
+            "80/tcp open http\n"
+            "| http-trace: TRACE is enabled\n"
+            "###CURL###\n"
+            "[TRACK_STATUS:405]\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "TRACE" in reason
+
+    def test_track_still_enabled(self):
+        text = (
+            "80/tcp open http\n"
+            "###CURL###\n"
+            "[TRACK_STATUS:200]\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "not_fixed"
+        assert "TRACK" in reason
+
+    def test_both_disabled(self):
+        text = (
+            "80/tcp open http\n"
+            "###CURL###\n"
+            "[TRACK_STATUS:405]\n"
+        )
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "fixed"
+        assert "TRACE and TRACK" in reason
+
+    def test_inconclusive_when_track_check_missing(self):
+        text = "80/tcp open http\n| http-trace:\n"
+        verdict, reason = self.parse(text, "", "")
+        assert verdict == "inconclusive"
+        assert "TRACK" in reason
+
+
+class TestParseTomcatVersion:
+    def setup_method(self):
+        rule = match_rule("Apache Tomcat 9.0.35 Multiple Vulnerabilities")
+        assert rule is not None
+        assert rule.post_shell is not None
+        assert "curl" in rule.post_shell
+        assert rule.post_shell_tag == "CURL"
+        self.parse = rule.parse
+
+    def test_version_from_curl_version_txt(self):
+        text = (
+            "8080/tcp open http\n"
+            "###CURL###\n"
+            "HTTP/1.1 404\n"
+            "Apache Tomcat Version 9.0.85\n"
+        )
+        desc = "Vulnerable version 9.0.35 was detected during assessment."
+        verdict, reason = self.parse(text, "", desc)
+        assert verdict == "fixed"
+
+    def test_version_from_curl_server_header(self):
+        text = (
+            "###CURL###\n"
+            "HTTP/1.1 200 OK\n"
+            "Server: Apache-Tomcat/9.0.35\n"
+        )
+        desc = "Installed version: 9.0.35"
+        verdict, reason = self.parse(text, "", desc)
+        assert verdict == "not_fixed"
 
 
 # ---------------------------------------------------------------------------
@@ -879,3 +1359,237 @@ class TestEsxiVmsa20250013:
     def test_fixed_80u2e(self):
         verdict, _ = self.parse(self.FIXED_8U2_OUT, "")
         assert verdict == "fixed"
+
+
+class TestParseVnc:
+    def setup_method(self):
+        rule = match_rule("VNC Server Unauthenticated Access")
+        assert rule is not None
+        self.parse = rule.parse
+
+    def test_none_security_type(self):
+        out = "5900/tcp open vnc\n| vnc-info:\n|   Security types:\n|     None (1)\n"
+        assert self.parse(out, "")[0] == "not_fixed"
+
+    def test_vnc_auth_required(self):
+        out = "5900/tcp open vnc\n| vnc-info:\n|   Security types:\n|     VNC Authentication (2)\n"
+        assert self.parse(out, "")[0] == "fixed"
+
+
+class TestParseX11:
+    def setup_method(self):
+        rule = match_rule("X11 Server Unauthenticated Access")
+        assert rule is not None
+        self.parse = rule.parse
+
+    def test_access_granted(self):
+        out = "6000/tcp open x11\n| x11-access: X server access is granted\n"
+        assert self.parse(out, "")[0] == "not_fixed"
+
+    def test_access_denied(self):
+        out = "6000/tcp open x11\n| x11-access: X server access is denied\n"
+        assert self.parse(out, "")[0] == "fixed"
+
+
+class TestParsePgsql:
+    def setup_method(self):
+        rule = match_rule("PostgreSQL Default Unpassworded Account")
+        assert rule is not None
+        self.parse = rule.parse
+
+    def test_psql_no_password(self):
+        out = "5432/tcp open postgresql\n###PSQL###\n ?column? \n----------\n         1\n(1 row)\n"
+        assert self.parse(out, "")[0] == "not_fixed"
+
+    def test_psql_auth_required(self):
+        out = (
+            "5432/tcp open postgresql\n###PSQL###\n"
+            "psql: error: FATAL: password authentication failed for user \"postgres\"\n"
+        )
+        assert self.parse(out, "")[0] == "fixed"
+
+
+class TestParseRServices:
+    def setup_method(self):
+        rule = match_rule("rsh service detected")
+        assert rule is not None
+        self.parse = rule.parse
+
+    def test_port_open(self):
+        out = "514/tcp open shell\n###RSH###\nRSH_PORT_OPEN:514\nRSH_CHECK_DONE\n"
+        assert self.parse(out, "")[0] == "not_fixed"
+
+    def test_all_closed(self):
+        out = "###RSH###\nRSH_CHECK_DONE\n"
+        assert self.parse(out, "")[0] == "fixed"
+
+
+class TestParseHadoopYarn:
+    def setup_method(self):
+        rule = match_rule("Hadoop YARN ResourceManager Unauthenticated")
+        assert rule is not None
+        self.parse = rule.parse
+
+    def test_unauthenticated(self):
+        out = '[STATUS:200][URL:http://10.0.0.1:8088/ws/v1/cluster/info]\n{"clusterInfo":{"resourceManagerVersion":"3.3.4"}}\n'
+        assert self.parse(out, "")[0] == "not_fixed"
+
+    def test_requires_auth(self):
+        out = '[STATUS:401][URL:http://10.0.0.1:8088/ws/v1/cluster/info]\nUnauthorized\n'
+        assert self.parse(out, "")[0] == "fixed"
+
+
+class TestParseRabbitmq:
+    def setup_method(self):
+        rule = match_rule("RabbitMQ Management Interface Default Credentials")
+        assert rule is not None
+        self.parse = rule.parse
+
+    def test_guest_credentials_work(self):
+        out = '[STATUS:401]\n###CURL###\n{"rabbitmq_version":"3.12.0","overview":{},"message_stats":{}}\n'
+        assert self.parse(out, "")[0] == "not_fixed"
+
+    def test_guest_disabled(self):
+        out = '[STATUS:401]\n###CURL###\n{"error":"not_authorized"}\n401 Unauthorized\n'
+        assert self.parse(out, "")[0] == "fixed"
+
+
+class TestParseMongodbVersion:
+    SUMMARY = "MongoDB 4.4.18 Incorrect Enforcement of Security Requirements"
+
+    def setup_method(self):
+        rule = match_rule(self.SUMMARY)
+        assert rule is not None
+        self.parse = rule.parse
+
+    def test_version_from_mongosh(self):
+        out = (
+            "27017/tcp open mongodb\n###MONGOSH###\n"
+            "6.0.3\n"
+        )
+        verdict, reason = self.parse(out, "", "")
+        assert verdict == "inconclusive"
+        assert "6.0.3" in reason
+
+    def test_version_from_nmap(self):
+        out = "27017/tcp open mongodb\nmongodb-info:\n  version = 4.4.18\n"
+        verdict, reason = self.parse(out, "", "")
+        assert "4.4.18" in reason
+
+
+class TestParseDockerApi:
+    def setup_method(self):
+        rule = match_rule("Docker Remote API Exposed Without Authentication")
+        assert rule is not None
+        assert rule.curl_path == "/version"
+        self.parse = rule.parse
+
+    def test_exposed(self):
+        out = '{"ApiVersion":"1.41","Version":"20.10.7","MinAPIVersion":"1.12"}\n'
+        assert self.parse(out, "")[0] == "not_fixed"
+
+    def test_auth_required(self):
+        out = "401 Unauthorized\n"
+        assert self.parse(out, "")[0] == "fixed"
+
+
+class TestParseSslTrust:
+    SELF_SIGNED_NMAP = """
+443/tcp open ssl/https
+| ssl-cert: Subject: commonName=web.local
+| Issuer: commonName=web.local
+"""
+
+    CA_SIGNED_NMAP = """
+443/tcp open ssl/https
+| ssl-cert: Subject: commonName=web.example.com
+| Issuer: commonName=R3
+"""
+
+    OPENSSL_SELF = "###OPENSSL###\nverify return:1\nself-signed certificate\n"
+    OPENSSL_TRUSTED = "###OPENSSL###\nverify return:0\n"
+
+    def setup_method(self):
+        rule = match_rule("SSL Certificate Cannot Be Trusted / Self-Signed")
+        assert rule is not None
+        assert rule.post_shell_tag == "OPENSSL"
+        self.parse = rule.parse
+
+    def test_nmap_self_signed_never_fixed(self):
+        verdict, _ = self.parse(self.SELF_SIGNED_NMAP, "")
+        assert verdict != "fixed"
+
+    def test_openssl_verify_self_signed(self):
+        out = self.SELF_SIGNED_NMAP + self.OPENSSL_SELF
+        assert self.parse(out, "")[0] == "not_fixed"
+
+    def test_openssl_verify_trusted(self):
+        out = self.CA_SIGNED_NMAP + self.OPENSSL_TRUSTED
+        assert self.parse(out, "")[0] == "fixed"
+
+    def test_distinct_issuer_not_auto_fixed(self):
+        verdict, reason = self.parse(self.CA_SIGNED_NMAP, "")
+        assert verdict == "inconclusive"
+        assert "distinct issuer" in reason.lower() or "confirm" in reason.lower()
+
+
+class TestParseMinio:
+    def setup_method(self):
+        rule = match_rule("MinIO Admin Default Credentials")
+        assert rule is not None
+        self.parse = rule.parse
+
+    def test_default_creds_work(self):
+        out = "HTTP/1.1 200\n###MINIO###\n{\"token\":\"abc123\"}\n"
+        assert self.parse(out, "")[0] == "not_fixed"
+
+    def test_default_creds_rejected(self):
+        out = "HTTP/1.1 200\n###MINIO###\nInvalid login credentials\n401\n"
+        assert self.parse(out, "")[0] == "fixed"
+
+    def test_console_only_not_not_fixed(self):
+        out = "HTTP/1.1 200\n<html>MinIO Console</html>\n"
+        assert self.parse(out, "")[0] != "not_fixed"
+
+
+class TestParseHeartbleed:
+    def setup_method(self):
+        rule = match_rule("Heartbleed OpenSSL CVE-2014-0160")
+        assert rule is not None
+        self.parse = rule.parse
+
+    def test_not_vulnerable_on_one_line(self):
+        out = "| ssl-heartbleed: State: NOT VULNERABLE"
+        assert self.parse(out, "")[0] == "fixed"
+
+    def test_vulnerable(self):
+        out = "| ssl-heartbleed:\n|   State: VULNERABLE\n"
+        assert self.parse(out, "")[0] == "not_fixed"
+
+
+class TestParseMemcached:
+    def setup_method(self):
+        rule = match_rule("Memcached Accessible Without Authentication")
+        assert rule is not None
+        self.parse = rule.parse
+
+    def test_bare_port_inconclusive(self):
+        out = "11211/tcp open memcached"
+        assert self.parse(out, "")[0] == "inconclusive"
+
+    def test_stats_without_auth(self):
+        out = "11211/tcp open memcached\n| memcached-info:\n|   Version 1.6.9\n|   curr_items 0\n|   bytes 0\n"
+        assert self.parse(out, "")[0] == "not_fixed"
+
+
+class TestVersionExtraction:
+    def test_url_path_not_used_as_vulnerable_version(self):
+        from src.vuln_rules import _extract_version_from_description, _parse_service_version
+        desc = "See https://example.com/path/3.1/docs for details. nginx 1.18.0 detected."
+        vuln = _extract_version_from_description(desc)
+        assert vuln == "1.18.0"
+        out = "Server: nginx/1.24.0\n"
+        verdict, _ = _parse_service_version(out, "", desc)
+        assert verdict == "fixed"
+
+

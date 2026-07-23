@@ -84,23 +84,100 @@ def _job_line(job_id: str, line: str):
         JOBS[job_id]["output_lines"].append(line)
 
 
-def _build_triage_command(rule, ip: Optional[str], port: Optional[int]) -> Optional[str]:
-    """Lightweight port-reachability check — no version-detection scripts, no PTY.
-    Used to flag likely-already-fixed tickets before committing to the full scan.
-    Skipped for curl-based rules since those scans are already fast."""
+def _client_sudo_nmap(cfg: Optional[Config], client_label: str) -> bool:
+    if not cfg:
+        return False
+    all_clients = list(cfg.clients) + list(cfg.clients_secondary or [])
+    client_cfg = next((c for c in all_clients if c.label == client_label), None)
+    return bool(client_cfg and getattr(client_cfg, "sudo_nmap", False))
+
+
+def _nmap_cmd_prefix(rule, sudo_nmap: bool) -> str:
+    return "sudo nmap" if (rule.requires_root or sudo_nmap) else "nmap"
+
+
+def _build_triage_command(
+    rule, ip: Optional[str], port: Optional[int], sudo_nmap: bool = False,
+) -> Optional[str]:
+    """Lightweight port-reachability check — no version-detection scripts, no PTY."""
     if not (rule and ip and port) or rule.tool == "curl":
         return None
-    parts = ["sudo nmap" if rule.requires_root else "nmap",
-              "-Pn", "-T4", "--max-retries", "1", "--host-timeout", "10s"]
+    parts = [
+        _nmap_cmd_prefix(rule, sudo_nmap),
+        "-Pn", "-T4", "--max-retries", "1", "--host-timeout", "10s",
+    ]
     if rule.requires_root:
         parts.append("-sU")
     parts += ["-p", str(port), "--open", ip]
     return " ".join(parts)
 
 
+def _build_scan_command(
+    rule, ip: str, port: Optional[int], sudo_nmap: bool = False,
+) -> Optional[str]:
+    """Build the full scan shell command. {JOB_ID} is left as a placeholder."""
+    if rule.tool == "curl":
+        scheme = rule.curl_scheme or ("https" if port in (443, 8443) else "http")
+        curl_extra = f" {rule.extra_args}" if rule.extra_args else ""
+        status_suffix = '-w "\\n[STATUS:%{http_code}][URL:%{url_effective}]\\n"'
+        target_port = port or rule.default_port or (443 if scheme == "https" else 80)
+        if rule.curl_method == "POST" and rule.curl_post_data:
+            body = rule.curl_post_data.replace("'", "'\\''")
+            nmap_cmd = (
+                f"curl -sk --max-time 15 -X POST "
+                f'-H "Content-Type: text/xml" '
+                f"-d '{body}' "
+                f"{status_suffix} "
+                f"{scheme}://{ip}:{target_port}{rule.curl_path}"
+            )
+        elif rule.curl_paths:
+            urls = " ".join(f"{scheme}://{ip}:{target_port}{p}" for p in rule.curl_paths)
+            nmap_cmd = (
+                f'curl -sk --max-time 15 '
+                f'-w "\\n[STATUS:%{{http_code}}][URL:%{{url_effective}}]\\n" '
+                f'-o /dev/null{curl_extra} {urls}'
+            )
+        else:
+            nmap_cmd = (
+                f'curl -sk -L --max-time 15 '
+                f'-w "\\n[STATUS:%{{http_code}}][URL:%{{url_effective}}]\\n" '
+                f'-D -{curl_extra} {scheme}://{ip}:{target_port}{rule.curl_path}'
+            )
+        if rule.post_shell:
+            shell_cmd = rule.post_shell.format(ip=ip, port=target_port, scheme=scheme)
+            tag = rule.post_shell_tag or "AUX"
+            nmap_cmd += f'; echo "###{tag}###"; {shell_cmd}'
+        return nmap_cmd
+
+    if rule.tool == "redis-cli":
+        redis_port = port or 6379
+        return f"timeout 15 redis-cli -h {ip} -p {redis_port} info"
+
+    parts = [_nmap_cmd_prefix(rule, sudo_nmap)]
+    if rule.extra_args:
+        parts.append(rule.extra_args)
+    if rule.nmap_script:
+        parts += ["--script", rule.nmap_script]
+    if port:
+        parts += ["-p", str(port)]
+    parts += [ip, "-oX", "/tmp/retest_{JOB_ID}.xml", "-v"]
+    suffix = ""
+    if rule.post_shell:
+        scheme = "https" if port in (443, 8443) else "http"
+        target_port = port or rule.default_port or (443 if scheme == "https" else 80)
+        shell_cmd = rule.post_shell.format(ip=ip, port=target_port, scheme=scheme)
+        tag = rule.post_shell_tag or "AUX"
+        suffix += f'; echo "###{tag}###"; {shell_cmd}'
+    return (
+        " ".join(parts)
+        + suffix
+        + '; echo "###XML###"; cat /tmp/retest_{JOB_ID}.xml; rm -f /tmp/retest_{JOB_ID}.xml'
+    )
+
+
 def _queue_ticket(ticket: Dict[str, Any], client_label: str,
                   source: str = "poll", manual: bool = False,
-                  session: str = "axian") -> str:
+                  session: str = "axian", cfg: Optional[Config] = None) -> str:
     """Create a queued job from a Jira ticket. Returns job_id.
 
     manual=True marks the job status as 'manual' (no scan command will be run;
@@ -122,57 +199,10 @@ def _queue_ticket(ticket: Dict[str, Any], client_label: str,
     if port is None and rule and rule.default_port:
         port = rule.default_port
 
-    # Build scan command (nmap or curl)
+    sudo_nmap = _client_sudo_nmap(cfg, client_label)
     nmap_cmd: Optional[str] = None
     if rule and ip:
-        if rule.tool == "curl":
-            scheme = rule.curl_scheme or ("https" if port in (443, 8443) else "http")
-            # extra_args can inject additional curl flags (e.g. -H 'Origin: ...' for CORS)
-            curl_extra = f" {rule.extra_args}" if rule.extra_args else ""
-            status_suffix = '-w "\\n[STATUS:%{http_code}][URL:%{url_effective}]\\n"'
-            url = f"{scheme}://{ip}:{port}{rule.curl_path}"
-            if rule.curl_method == "POST" and rule.curl_post_data:
-                body = rule.curl_post_data.replace("'", "'\\''")
-                nmap_cmd = (
-                    f"curl -sk --max-time 15 -X POST "
-                    f'-H "Content-Type: text/xml" '
-                    f"-d '{body}' "
-                    f"{status_suffix} "
-                    f"{url}"
-                )
-            elif rule.curl_paths:
-                urls = " ".join(f"{scheme}://{ip}:{port}{p}" for p in rule.curl_paths)
-                nmap_cmd = (
-                    f'curl -sk --max-time 15 '
-                    f'-w "\\n[STATUS:%{{http_code}}][URL:%{{url_effective}}]\\n" '
-                    f'-o /dev/null{curl_extra} {urls}'
-                )
-            else:
-                nmap_cmd = (
-                    f'curl -sk -L --max-time 15 '
-                    f'-w "\\n[STATUS:%{{http_code}}][URL:%{{url_effective}}]\\n" '
-                    f'-D -{curl_extra} {scheme}://{ip}:{port}{rule.curl_path}'
-                )
-        elif rule.tool == "redis-cli":
-            # Manual flow: redis-cli -h <ip> [-p <port>]  →  info
-            # Non-interactive equivalent passes info on the same invocation.
-            redis_port = port or 6379
-            nmap_cmd = f"timeout 15 redis-cli -h {ip} -p {redis_port} info"
-        else:
-            parts = ["sudo nmap" if rule.requires_root else "nmap"]
-            if rule.extra_args:
-                parts.append(rule.extra_args)
-            if rule.nmap_script:
-                parts += ["--script", rule.nmap_script]
-            if port:
-                parts += ["-p", str(port)]
-            parts += [ip, "-oX", f"/tmp/retest_{{JOB_ID}}.xml", "-v"]
-            # Embed the XML read and cleanup in the same PTY session to avoid
-            # opening a second SSH channel (which deadlocks after a PTY session).
-            nmap_cmd = (
-                " ".join(parts)
-                + f'; echo "###XML###"; cat /tmp/retest_{{JOB_ID}}.xml; rm -f /tmp/retest_{{JOB_ID}}.xml'
-            )
+        nmap_cmd = _build_scan_command(rule, ip, port, sudo_nmap)
 
     job_id = str(uuid.uuid4())
     if nmap_cmd:
@@ -196,7 +226,7 @@ def _queue_ticket(ticket: Dict[str, Any], client_label: str,
         "scan_tool": rule.tool if rule else "nmap",
         "nmap_script": rule.nmap_script if rule else None,
         "nmap_command": nmap_cmd,
-        "triage_command": _build_triage_command(rule, ip, port),
+        "triage_command": _build_triage_command(rule, ip, port, sudo_nmap),
         "triage": None,              # None | running | open | closed | host_down | error | skipped
         "triage_note": None,
         "status": "manual" if manual else "queued",  # queued | scanning | completed | error | manual
@@ -217,7 +247,7 @@ def _queue_ticket(ticket: Dict[str, Any], client_label: str,
     return job_id
 
 
-def _reconcile_manual_jobs(tag: str = "") -> int:
+def _reconcile_manual_jobs(cfg: Optional[Config] = None, tag: str = "") -> int:
     """Promote manual jobs to queued when a scan rule now matches their summary."""
     promoted = 0
     with _lock:
@@ -249,6 +279,7 @@ def _reconcile_manual_jobs(tag: str = "") -> int:
             source=job.get("source", "poll"),
             manual=False,
             session=job.get("session", "axian"),
+            cfg=cfg,
         )
         promoted += 1
     if promoted:
@@ -323,6 +354,16 @@ def run_scan(job_id: str, cfg: Config):
             JOBS[job_id]["error"] = f"Client '{client_label}' not in config"
         return
 
+    rule = match_rule(job["ticket_summary"])
+    sudo_nmap = getattr(client_cfg, "sudo_nmap", False)
+    if rule and job.get("ip"):
+        fresh_cmd = _build_scan_command(rule, job["ip"], job.get("port"), sudo_nmap)
+        if fresh_cmd:
+            fresh_cmd = fresh_cmd.replace("{JOB_ID}", job_id)
+            with _lock:
+                JOBS[job_id]["nmap_command"] = fresh_cmd
+                job = JOBS[job_id]
+
     # Register a stop event for this job before marking it scanning
     stop_event = threading.Event()
     with _lock:
@@ -337,6 +378,13 @@ def run_scan(job_id: str, cfg: Config):
     def emit(line: str):
         # Match the sentinel exactly — the [INFO] Command display line also contains
         # this string as a substring, so substring matching would silence all output.
+        if line.strip() in (
+            "###SMBCLIENT###", "###CURL###", "###MONGOSH###", "###SHOWMOUNT###",
+            "###FTP###", "###PSQL###", "###CQLSH###", "###MINIO###", "###OPENSSL###",
+            "###RSH###",
+        ):
+            _collecting_xml[0] = False
+            return
         if line.strip() == "###XML###":
             _collecting_xml[0] = True
             return
@@ -524,6 +572,13 @@ def run_triage(job_id: str, cfg: Config):
     job = JOBS[job_id]
     client_label = job["client_label"]
     cmd = job.get("triage_command")
+    if cfg:
+        rule = match_rule(job.get("ticket_summary") or "")
+        rebuilt = _build_triage_command(
+            rule, job.get("ip"), job.get("port"), _client_sudo_nmap(cfg, client_label),
+        )
+        if rebuilt:
+            cmd = rebuilt
     if not cmd:
         with _lock:
             JOBS[job_id]["triage"] = "skipped"
@@ -813,7 +868,7 @@ def run_poll_cycle(cfg: Config, jira_client, session: str = "axian") -> None:
                 
                 # If we have a scan rule, it's auto-scan. Otherwise, it's manual.
                 is_manual = rule_obj is None
-                job_id = _queue_ticket(ticket, client.label, manual=is_manual, session=session)
+                job_id = _queue_ticket(ticket, client.label, manual=is_manual, session=session, cfg=cfg)
                 new_count += 1
                 rule = JOBS[job_id].get("rule_name")
                 if is_manual:
@@ -847,7 +902,7 @@ def run_poll_cycle(cfg: Config, jira_client, session: str = "axian") -> None:
         except Exception as exc:
             _app_log(f"[ERROR] {tag}Poll failed for {client.label}: {exc}")
 
-    _reconcile_manual_jobs(tag)
+    _reconcile_manual_jobs(cfg, tag)
 
     if session == "axian":
         _poll_count += 1

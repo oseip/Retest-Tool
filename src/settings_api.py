@@ -96,6 +96,7 @@ def get_settings():
                 "kali_password_set": bool(c.get("kali_password")),
                 "nessus_access_key_set": bool(c.get("nessus_access_key")),
                 "nessus_secret_key_set": bool(c.get("nessus_secret_key")),
+                "sudo_nmap": bool(c.get("sudo_nmap", False)),
             }
             for c in clients
         ],
@@ -108,6 +109,7 @@ def get_settings():
                 "kali_password_set": bool(c.get("kali_password")),
                 "nessus_access_key_set": bool(c.get("nessus_access_key")),
                 "nessus_secret_key_set": bool(c.get("nessus_secret_key")),
+                "sudo_nmap": bool(c.get("sudo_nmap", False)),
             }
             for c in clients2
         ],
@@ -138,6 +140,7 @@ class ClientSettings(BaseModel):
     kali_password: Optional[str] = None          # blank/omitted = keep existing
     nessus_access_key: Optional[str] = None       # blank/omitted = keep existing
     nessus_secret_key: Optional[str] = None       # blank/omitted = keep existing
+    sudo_nmap: bool = False                       # prepend sudo to all nmap scans for this opco
 
 
 class JiraSecondarySettings(BaseModel):
@@ -194,6 +197,7 @@ def update_settings(req: SettingsUpdate):
             "kali_password": kali_password,
             "nessus_access_key": c.nessus_access_key if c.nessus_access_key is not None else old.get("nessus_access_key", ""),
             "nessus_secret_key": c.nessus_secret_key if c.nessus_secret_key is not None else old.get("nessus_secret_key", ""),
+            "sudo_nmap": c.sudo_nmap,
         })
 
     _test_jira(req.jira.url, req.jira.username, jira_token)
@@ -234,6 +238,7 @@ def update_settings(req: SettingsUpdate):
             "kali_password": kali_pass2,
             "nessus_access_key": c.nessus_access_key if c.nessus_access_key is not None else old2.get("nessus_access_key", ""),
             "nessus_secret_key": c.nessus_secret_key if c.nessus_secret_key is not None else old2.get("nessus_secret_key", ""),
+            "sudo_nmap": c.sudo_nmap,
         })
 
     config = {

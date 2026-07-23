@@ -41,6 +41,7 @@ class ClientConfig:
     nessus_secret_key: Optional[str] = None
     nessus_username: Optional[str] = None   # unused — kept for config compatibility
     nessus_password: Optional[str] = None   # unused — kept for config compatibility
+    sudo_nmap: bool = False                 # prepend sudo to nmap when opco Kali requires it
 
 
 @dataclass

@@ -422,3 +422,140 @@ class TestTunnelsApi:
     def test_delete_unknown_tunnel_returns_404(self, client):
         resp = client.delete("/api/tunnels/no-such-tunnel")
         assert resp.status_code == 404
+
+
+class TestNotFixedKeysApi:
+    def test_returns_completed_not_fixed_keys(self, client):
+        import src.scanner as scanner
+        from tests.conftest import make_ticket
+
+        ticket = make_ticket(key="NF-1", summary="SSL Certificate Expiry on 10.0.0.1")
+        job_id = scanner._queue_ticket(ticket, "TestClient")
+        with scanner._lock:
+            scanner.JOBS[job_id]["status"] = "completed"
+            scanner.JOBS[job_id]["verdict"] = "not_fixed"
+
+        resp = client.get("/api/jobs/not-fixed-keys")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "NF-1" in data["keys"]
+        assert data["count"] >= 1
+
+    def test_csv_format(self, client):
+        import src.scanner as scanner
+        from tests.conftest import make_ticket
+
+        ticket = make_ticket(key="NF-2", summary="SSL Certificate Expiry on 10.0.0.1")
+        job_id = scanner._queue_ticket(ticket, "TestClient")
+        with scanner._lock:
+            scanner.JOBS[job_id]["status"] = "completed"
+            scanner.JOBS[job_id]["verdict"] = "not_fixed"
+
+        resp = client.get("/api/jobs/not-fixed-keys?format=csv")
+        assert resp.status_code == 200
+        assert "NF-2" in resp.text
+
+
+class TestBulkTransitionCandidates:
+    def test_fixed_always_eligible(self):
+        from src.main import _bulk_transition_candidates
+        import src.scanner as scanner
+        from tests.conftest import make_ticket
+
+        job_id = scanner._queue_ticket(make_ticket(key="FX-1"), "TestClient")
+        with scanner._lock:
+            scanner.JOBS[job_id]["status"] = "completed"
+            scanner.JOBS[job_id]["verdict"] = "fixed"
+            scanner.JOBS[job_id]["ticket_status"] = "Remediated"
+
+        to_fixed, to_not_fixed = _bulk_transition_candidates()
+        assert any(j["ticket_key"] == "FX-1" for j in to_fixed)
+        assert not any(j["ticket_key"] == "FX-1" for j in to_not_fixed)
+
+    def test_not_fixed_only_when_at_retest_status(self):
+        from src.main import _bulk_transition_candidates, jira
+        import src.scanner as scanner
+        from tests.conftest import make_ticket
+
+        jira.cfg.retest_status = "Remediated"
+
+        rem_id = scanner._queue_ticket(make_ticket(key="NF-R"), "TestClient")
+        open_id = scanner._queue_ticket(make_ticket(key="NF-O"), "TestClient")
+        with scanner._lock:
+            scanner.JOBS[rem_id]["status"] = "completed"
+            scanner.JOBS[rem_id]["verdict"] = "not_fixed"
+            scanner.JOBS[rem_id]["ticket_status"] = "Remediated"
+            scanner.JOBS[open_id]["status"] = "completed"
+            scanner.JOBS[open_id]["verdict"] = "not_fixed"
+            scanner.JOBS[open_id]["ticket_status"] = "Open"
+
+        _, to_not_fixed = _bulk_transition_candidates()
+        keys = {j["ticket_key"] for j in to_not_fixed}
+        assert "NF-R" in keys
+        assert "NF-O" not in keys
+
+
+class TestScanBatch:
+    def test_returns_enqueued_ids_and_skips_non_queued(self, client, monkeypatch):
+        from tests.conftest import make_ticket
+
+        q1 = scanner._queue_ticket(make_ticket(key="SB-1"), "TestClient")
+        q2 = scanner._queue_ticket(make_ticket(key="SB-2"), "TestClient")
+        with scanner._lock:
+            scanner.JOBS[q2]["status"] = "completed"
+
+        triggered = []
+        monkeypatch.setattr(scanner, "trigger_scan", lambda jid, cfg: triggered.append(jid))
+
+        resp = client.post("/api/jobs/scan-batch", json={"job_ids": [q1, q2, "missing"]})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["enqueued"] == 1
+        assert data["skipped"] == 2
+        assert data["enqueued_ids"] == [q1]
+        assert triggered == [q1]
+
+
+class TestBatchScanHelpers:
+    def test_csv_filters_unsafe_targets(self):
+        from src.main import _parse_assets
+
+        csv_data = b"IP,Port\n10.0.0.1,443\n$(id),80\n"
+        assets = _parse_assets(csv_data, "targets.csv")
+        assert assets == [{"ip": "10.0.0.1", "port": 443}]
+
+    def test_batch_scan_one_uses_build_scan_command(self, monkeypatch):
+        from src.main import _batch_scan_one
+        from src.vuln_rules import RULES
+
+        rule = next(r for r in RULES if r.name == "SSL Certificate Expiry")
+        captured = {}
+
+        class FakeKali:
+            def exec(self, cmd, timeout=60):
+                captured["cmd"] = cmd
+                captured["timeout"] = timeout
+                return ("nmap done\n###XML###\n<xml/>", "", 0)
+
+        _batch_scan_one(FakeKali(), "10.0.0.1", 443, rule, sudo_nmap=True)
+        assert captured["cmd"].startswith("sudo nmap ")
+        assert "10.0.0.1" in captured["cmd"]
+        assert captured["timeout"] == 600
+
+    def test_batch_scan_one_retries_with_pn(self, monkeypatch):
+        from src.main import _batch_scan_one
+        from src.vuln_rules import RULES
+
+        rule = next(r for r in RULES if r.name == "SSL Certificate Expiry")
+        calls = []
+
+        class FakeKali:
+            def exec(self, cmd, timeout=60):
+                calls.append(cmd)
+                if "-Pn" in cmd:
+                    return ("host up\n###XML###\n<xml/>", "", 0)
+                return ("Host seems down.\n0 hosts up\n###XML###\n<xml/>", "", 0)
+
+        _batch_scan_one(FakeKali(), "10.0.0.1", 443, rule, sudo_nmap=False)
+        assert len(calls) == 2
+        assert "-Pn" in calls[1]

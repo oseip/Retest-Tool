@@ -232,6 +232,12 @@ def index():
     return FileResponse(_resource_path("frontend", "index.html"), headers=_NO_CACHE)
 
 
+@app.get("/setup-preview")
+def setup_preview():
+    """Always serve the first-run setup wizard (for docs / screenshots)."""
+    return FileResponse(_resource_path("frontend", "setup.html"), headers=_NO_CACHE)
+
+
 @app.post("/api/setup/activate")
 def setup_activate():
     """Called by setup.html after config.yaml has been written.
@@ -358,6 +364,52 @@ def transition_preview():
     }
 
 
+def _not_fixed_scan_jobs(client_label: Optional[str] = None) -> List[dict]:
+    """Completed scans with verdict not_fixed — for export / colleague handoff."""
+    with scanner._lock:
+        jobs = list(scanner.JOBS.values())
+    results = []
+    for job in jobs:
+        if job.get("session", "axian") != active_session:
+            continue
+        if job["status"] != "completed" or job.get("verdict") != "not_fixed":
+            continue
+        if client_label and job.get("client_label") != client_label:
+            continue
+        results.append({
+            "job_id": job["id"],
+            "ticket_key": job["ticket_key"],
+            "ticket_summary": job.get("ticket_summary", ""),
+            "ticket_status": job.get("ticket_status", ""),
+            "client_label": job.get("client_label", ""),
+            "ip": job.get("ip"),
+            "port": job.get("port"),
+            "verdict_reason": job.get("verdict_reason", ""),
+        })
+    results.sort(key=lambda j: j["ticket_key"])
+    return results
+
+
+@app.get("/api/jobs/not-fixed-keys")
+def not_fixed_keys(client_label: Optional[str] = None, format: str = "json"):
+    """Return issue keys for all completed not_fixed scans.
+
+    ?format=csv  → plain newline-separated keys (easy paste into Jira/Excel)
+    ?format=json → structured list (default)
+    """
+    jobs = _not_fixed_scan_jobs(client_label)
+    keys = [j["ticket_key"] for j in jobs]
+    if format.lower() == "csv":
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse("\n".join(keys) + ("\n" if keys else ""))
+    return {
+        "count": len(keys),
+        "keys": keys,
+        "keys_csv": ", ".join(keys),
+        "jobs": jobs,
+    }
+
+
 @app.post("/api/jobs/stop-all")
 def stop_all_jobs():
     result = scanner.cancel_all_active()
@@ -444,6 +496,7 @@ def scan_batch(body: ScanBatchRequest):
     Allows enqueuing queued or errored jobs; others are skipped."""
     enqueued = 0
     skipped = 0
+    enqueued_ids: List[str] = []
     for job_id in body.job_ids:
         job = scanner.JOBS.get(job_id)
         if not job or job["status"] not in ("queued", "error"):
@@ -457,8 +510,9 @@ def scan_batch(body: ScanBatchRequest):
             job["completed_at"] = None
         scanner.trigger_scan(job_id, cfg)
         enqueued += 1
+        enqueued_ids.append(job_id)
     scanner._app_log(f"[Scan Batch] Enqueued {enqueued} jobs ({skipped} skipped)")
-    return {"ok": True, "enqueued": enqueued, "skipped": skipped}
+    return {"ok": True, "enqueued": enqueued, "skipped": skipped, "enqueued_ids": enqueued_ids}
 
 
 @app.post("/api/jobs/resume-worker")
@@ -604,7 +658,7 @@ def add_tickets(req: AddTicketsRequest):
                     results.append({"key": key, "status": "already_queued", "summary": ticket.get("summary", "")})
                     continue
                 scanner.SEEN_KEYS.add(key)
-            job_id = scanner._queue_ticket(ticket, req.client_label, source="manual", session=client_session)
+            job_id = scanner._queue_ticket(ticket, req.client_label, source="manual", session=client_session, cfg=cfg)
             rule = scanner.JOBS[job_id].get("rule_name")
             scanner._app_log(
                 f"Manual add: {key} ({req.client_label}) | "
@@ -1651,7 +1705,7 @@ def _parse_assets(data: bytes, filename: str = "") -> list:
                 assets.append({"ip": ip, "port": int(row[port_idx])})
             except (TypeError, ValueError):
                 continue
-        return assets
+        return [a for a in assets if _is_safe_scan_target(a["ip"])]
 
     def _from_csv(raw):
         text   = raw.decode("utf-8-sig", errors="replace")
@@ -1673,7 +1727,7 @@ def _parse_assets(data: bytes, filename: str = "") -> list:
                 assets.append({"ip": ip, "port": int(row[port_key])})
             except (TypeError, ValueError):
                 continue
-        return assets
+        return [a for a in assets if _is_safe_scan_target(a["ip"])]
 
     if (filename or "").lower().endswith(".csv"):
         return _from_csv(data)
@@ -1736,47 +1790,52 @@ def _is_safe_scan_target(ip: str) -> bool:
         r'(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$', ip))
 
 
-def _batch_scan_one(kali, ip: str, port: int, rule) -> dict:
-    """Run a scan for one IP:port using the given VulnRule and return a result row."""
+def _batch_scan_one(kali, ip: str, port: int, rule, sudo_nmap: bool = False) -> dict:
+    """Run a scan for one IP:port using the same command builder as the retest queue."""
     import re as _re
     from .vuln_rules import _xml_elem
+    from .scanner import _build_scan_command
 
     if not _is_safe_scan_target(ip):
         raise ValueError(f"Refusing to scan unsafe/invalid target: {ip!r}")
 
-    # uuid keeps concurrent scans of the same ip:port from colliding on /tmp and
-    # avoids a predictable, symlink-attackable path on the shared Kali host.
-    job_id   = f"batch_{uuid.uuid4().hex}"
-    xml_path = f"/tmp/batchscan_{job_id}.xml"
+    job_id = f"batch_{uuid.uuid4().hex}"
+    cmd = _build_scan_command(rule, ip, port, sudo_nmap)
+    if not cmd:
+        return {
+            "ip": ip, "port": port,
+            "valid_to": "N/A", "days": "N/A",
+            "verdict": "inconclusive", "status": "⚠️ Inconclusive",
+            "detail": "No scan command for this rule",
+        }
 
+    cmd = cmd.replace("{JOB_ID}", job_id)
     if rule.tool == "curl":
-        scheme = rule.curl_scheme or ("https" if port in (443, 8443, 10443) else "http")
-        url = f"{scheme}://{ip}:{port}{rule.curl_path}"
-        if rule.curl_method == "POST" and rule.curl_post_data:
-            body = rule.curl_post_data.replace("'", "'\\''")
-            cmd = (
-                f"curl -sk -m 15 -X POST "
-                f'-H "Content-Type: text/xml" '
-                f"-d '{body}' "
-                f"{url} 2>&1"
-            )
-        else:
-            cmd = (f"curl -sk -m 15 -D - {scheme}://{ip}:{port}{rule.curl_path} 2>&1")
-        stdout, _, _ = kali.exec(cmd, timeout=20)
-        xml_out = ""
+        timeout = 120
+    elif rule.tool == "redis-cli":
+        timeout = 15
     else:
-        parts = ["nmap", "-Pn", "-T4"]
-        if rule.nmap_script:
-            parts += ["--script", rule.nmap_script]
-        if rule.extra_args:
-            parts += rule.extra_args.split()
-        parts += ["-p", str(port), ip, "-oX", xml_path]
-        cmd = " ".join(parts) + " 2>&1"
-        stdout, _, _ = kali.exec(cmd, timeout=45)
-        xml_out, _, _ = kali.exec(f"cat {xml_path} 2>/dev/null || echo ''", timeout=10)
-        kali.exec(f"rm -f {xml_path}", timeout=5)
+        timeout = 600
+    stdout, _, _ = kali.exec(cmd, timeout=timeout)
 
-    # Parse verdict using the rule's parse function if available
+    # Mirror retest queue: retry nmap with -Pn when ICMP ping is blocked
+    if rule.tool not in ("curl", "redis-cli") and "-Pn" not in cmd:
+        _down = ("host seems down", "0 hosts up", "skipping host")
+        if any(p in stdout.lower() for p in _down):
+            if cmd.startswith("sudo nmap "):
+                pn_cmd = "sudo nmap -Pn " + cmd[len("sudo nmap "):]
+            elif cmd.startswith("nmap "):
+                pn_cmd = "nmap -Pn " + cmd[len("nmap "):]
+            else:
+                pn_cmd = None
+            if pn_cmd:
+                stdout, _, _ = kali.exec(pn_cmd, timeout=timeout)
+
+    xml_out = ""
+    if "###XML###" in stdout:
+        nmap_section, xml_out = stdout.split("###XML###", 1)
+        stdout = nmap_section
+
     if rule.parse:
         verdict, detail = rule.parse(stdout, xml_out)
     else:
@@ -1849,6 +1908,9 @@ async def batch_scan_run(
     if not kali:
         raise HTTPException(503, f"No active SSH connection for '{client}'. Connect via Shell tab first.")
 
+    _, client_cfg = _get_client(client)
+    sudo_nmap = bool(client_cfg and getattr(client_cfg, "sudo_nmap", False))
+
     scan_id   = str(uuid.uuid4())
     q         = _queue_mod.Queue()
     cancel_ev = threading.Event()
@@ -1862,7 +1924,7 @@ async def batch_scan_run(
             if cancel_ev.is_set():
                 return None
             try:
-                return _batch_scan_one(kali, asset["ip"], asset["port"], rule)
+                return _batch_scan_one(kali, asset["ip"], asset["port"], rule, sudo_nmap)
             except Exception as exc:
                 return {
                     "ip": asset["ip"], "port": asset["port"],
@@ -2059,7 +2121,7 @@ def sweep_run(label: str, body: Optional[SweepRunRequest] = None):
                 continue
             scanner.SEEN_KEYS.add(key)
             is_manual = rule is None
-            job_id = scanner._queue_ticket(ticket, label, source="sweep", manual=is_manual, session=client_session)
+            job_id = scanner._queue_ticket(ticket, label, source="sweep", manual=is_manual, session=client_session, cfg=cfg)
             if is_manual:
                 scanner._app_log(
                     f"Sweep (manual): {key} ({label}) — no matching rule"

@@ -536,7 +536,8 @@ function updateTransitionReadyBtn() {
     if (j.verdict === 'fixed') return true;
     // not_fixed: only tickets that were in the Remediated/retest status get transitioned to Not Fixed
     // (open + not_fixed = no Jira action needed)
-    if (j.verdict === 'not_fixed' && _retestStatus && j.ticket_status === _retestStatus) return true;
+    if (j.verdict === 'not_fixed' && _retestStatus
+        && (j.ticket_status || '').toLowerCase() === _retestStatus.toLowerCase()) return true;
     return false;
   }).length;
   const btn = $('transitionReadyBtn');
@@ -575,13 +576,33 @@ function updateVerdictStats() {
   const inconcl = done.filter(j => j.verdict === 'inconclusive').length;
   const pending = all.filter(j => j.status === 'queued' || j.status === 'scanning').length;
   bar.style.display = '';
+  const nfBtn = nf > 0
+    ? `<button class="btn btn-sm btn-secondary" style="margin-left:8px;font-size:11px;padding:2px 8px"
+         onclick="copyNotFixedKeys()" title="Copy all Not Fixed issue keys">📋 Copy Keys</button>`
+    : '';
   bar.innerHTML =
     `<span class="vs-fixed">✅ ${fixed} Fixed</span>` +
     `<span class="vs-sep">·</span>` +
-    `<span class="vs-nf">❌ ${nf} Not Fixed</span>` +
+    `<span class="vs-nf">❌ ${nf} Not Fixed</span>${nfBtn}` +
     `<span class="vs-sep">·</span>` +
     `<span class="vs-incl">⚠️ ${inconcl} Inconclusive</span>` +
     (pending ? `<span class="vs-sep">·</span><span class="vs-dim">${pending} pending</span>` : '');
+}
+
+async function copyNotFixedKeys(separator = ', ') {
+  try {
+    const res = await fetch('/api/jobs/not-fixed-keys');
+    const data = await res.json();
+    if (!data.keys?.length) {
+      showToast('No Not Fixed scans in the queue', 'info');
+      return;
+    }
+    const text = separator === '\n' ? data.keys.join('\n') : (data.keys_csv || data.keys.join(separator));
+    await navigator.clipboard.writeText(text);
+    showToast(`Copied ${data.count} Not Fixed key${data.count !== 1 ? 's' : ''}`, 'success');
+  } catch (e) {
+    showToast(`Copy failed: ${e.message}`, 'error');
+  }
 }
 
 // ── Scan All ───────────────────────────────────────────────────────────────
@@ -857,13 +878,14 @@ async function scanAll() {
       return;
     }
     const enqueued = data.enqueued || 0;
+    const enqueuedIds = data.enqueued_ids || [];
     // Track bulk scan progress — jobs transition queued→scanning→completed via the worker
-    if (enqueued > 0) {
+    if (enqueued > 0 && enqueuedIds.length) {
       // Optimistically update status so updateBulkProgress doesn't instantly consider them done
-      ids.forEach(id => {
+      enqueuedIds.forEach(id => {
         if (state.jobs[id]) state.jobs[id].status = 'queued';
       });
-      setBulkScan({ total: enqueued, ids: new Set(ids) });
+      setBulkScan({ total: enqueued, ids: new Set(enqueuedIds) });
     }
     showToast(`${enqueued} scan${enqueued !== 1 ? 's' : ''} queued — processing 1 by 1`, 'success');
     renderJobList();
@@ -1324,13 +1346,14 @@ async function scanSelected() {
       return;
     }
     const enqueued = data.enqueued || 0;
-    if (enqueued > 0) {
+    const enqueuedIds = data.enqueued_ids || [];
+    if (enqueued > 0 && enqueuedIds.length) {
       // Optimistically update status so updateBulkProgress doesn't instantly consider them done
-      ids.forEach(id => {
+      enqueuedIds.forEach(id => {
         if (state.jobs[id]) state.jobs[id].status = 'queued';
         state.checkedIds.delete(id);
       });
-      setBulkScan({ total: enqueued, ids: new Set(ids) });
+      setBulkScan({ total: enqueued, ids: new Set(enqueuedIds) });
     }
     showToast(`${enqueued} scan${enqueued !== 1 ? 's' : ''} queued`, 'success');
     renderJobList();
@@ -4007,6 +4030,12 @@ function settingsClientRowHtml(c, session = 'axian') {
           <input type="text" class="text-input set-c-kaliuser" value="${escHtml(c.kali_user || 'kali')}">
         </div>
       </div>
+      <div style="margin:6px 0 10px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer">
+          <input type="checkbox" class="set-c-sudonmap" ${c.sudo_nmap ? 'checked' : ''}>
+          Use <code>sudo nmap</code> for scans (required on some opco Kali boxes)
+        </label>
+      </div>
       <div class="settings-client-row-grid2">
         <div>
           <label>Kali Password ${c.kali_password_set ? '<span style="color:var(--green)">(set)</span>' : '<span style="color:var(--orange)">(not set)</span>'}</label>
@@ -4264,6 +4293,7 @@ async function saveSettings() {
       kali_password: v('.set-c-kalipass') || null,
       nessus_access_key: v('.set-c-nessusaccess') || null,
       nessus_secret_key: v('.set-c-nessussecret') || null,
+      sudo_nmap: !!row.querySelector('.set-c-sudonmap')?.checked,
     };
   });
 
@@ -4278,6 +4308,7 @@ async function saveSettings() {
       kali_password: v('.set-c-kalipass') || null,
       nessus_access_key: v('.set-c-nessusaccess') || null,
       nessus_secret_key: v('.set-c-nessussecret') || null,
+      sudo_nmap: !!row.querySelector('.set-c-sudonmap')?.checked,
     };
   });
 
