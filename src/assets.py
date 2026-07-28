@@ -46,8 +46,14 @@ def save_asset_list(label: str, raw_entries: List[str]) -> int:
         "entries": cleaned,
         "updated_at": datetime.utcnow().isoformat(),
     }
-    with open(_path(label), "w") as f:
+    # Temp file + rename so an interrupted save can't truncate the asset list.
+    path = _path(label)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
     return len(cleaned)
 
 

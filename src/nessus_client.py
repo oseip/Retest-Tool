@@ -6,12 +6,32 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
+# Timeouts scale with scan size — large IPT scans can take 10–20 min to export.
+_LARGE_SCAN_HOSTS = 500
+_HUGE_SCAN_HOSTS = 2000
 
-def _req(conn, method: str, path: str, access_key: str, secret_key: str, body=None) -> Any:
+
+def _scan_timeouts(host_count: Optional[int] = None) -> dict:
+    """Return Nessus export/download timeouts tuned to scan size."""
+    hc = host_count or 0
+    if hc >= _HUGE_SCAN_HOSTS:
+        return {"poll_attempts": 400, "poll_sleep": 3, "download_curl": 900, "exec_extra": 60}
+    if hc >= _LARGE_SCAN_HOSTS:
+        return {"poll_attempts": 200, "poll_sleep": 3, "download_curl": 600, "exec_extra": 30}
+    if hc >= 100:
+        return {"poll_attempts": 120, "poll_sleep": 3, "download_curl": 300, "exec_extra": 15}
+    return {"poll_attempts": 80, "poll_sleep": 3, "download_curl": 120, "exec_extra": 10}
+
+
+def _req(conn, method: str, path: str, access_key: str, secret_key: str,
+         body=None, timeout: int = 60) -> Any:
     """Run a Nessus API request via curl using API key auth."""
     auth = f"accessKey={access_key}; secretKey={secret_key}"
+    # Let curl give up just before the SSH exec does, so a slow Nessus surfaces
+    # as a clean curl timeout rather than a generic SSH read timeout.
+    curl_timeout = max(10, timeout - 5)
     cmd = (
-        f"curl -sk --connect-timeout 10 -m 55 -X {method} "
+        f"curl -sk --connect-timeout 10 -m {curl_timeout} -X {method} "
         f"-H 'X-ApiKeys: {auth}' "
         f"-H 'Accept: application/json'"
     )
@@ -20,7 +40,7 @@ def _req(conn, method: str, path: str, access_key: str, secret_key: str, body=No
         cmd += f" -H 'Content-Type: application/json' -d '{safe}'"
     cmd += f" 'https://localhost:8834{path}'"
 
-    out, err, _code = conn.exec(cmd, timeout=60)
+    out, err, _code = conn.exec(cmd, timeout=timeout)
     text = out.strip()
     log.debug("Nessus %s %s → %d bytes (stderr: %d bytes)", method, path, len(text), len(err.strip()))
     if not text:
@@ -38,15 +58,16 @@ def _req(conn, method: str, path: str, access_key: str, secret_key: str, body=No
         )
 
 
-def _raw_download(conn, path: str, access_key: str, secret_key: str) -> str:
+def _raw_download(conn, path: str, access_key: str, secret_key: str,
+                  curl_timeout: int = 120) -> str:
     """Download raw (non-JSON) content from Nessus — used for CSV exports."""
     auth = f"accessKey={access_key}; secretKey={secret_key}"
     cmd = (
-        f"curl -sk --connect-timeout 10 -m 120 "
+        f"curl -sk --connect-timeout 10 -m {curl_timeout} "
         f"-H 'X-ApiKeys: {auth}' "
         f"'https://localhost:8834{path}'"
     )
-    out, _err, _code = conn.exec(cmd, timeout=130)
+    out, _err, _code = conn.exec(cmd, timeout=curl_timeout + 10)
     return out
 
 
@@ -72,6 +93,7 @@ def get_scans(conn, access_key: str, secret_key: str, folder_id: Optional[int] =
             "name": s.get("name", ""),
             "status": s.get("status", ""),
             "folder_id": s.get("folder_id"),
+            "creation_date": s.get("creation_date"),
             "last_modification_date": s.get("last_modification_date"),
             "total_hosts": s.get("total_hosts"),
         }
@@ -106,15 +128,18 @@ def get_scan_host_count(conn, access_key: str, secret_key: str, scan_id: int) ->
     return info.get("hosts_total") or len(hosts)
 
 
-def get_scan_hosts(conn, access_key: str, secret_key: str, scan_id: int) -> Tuple[List[Dict], Optional[str]]:
+def get_scan_hosts(conn, access_key: str, secret_key: str, scan_id: int,
+                   host_count: Optional[int] = None) -> Tuple[List[Dict], Optional[str]]:
     """Return (hosts, fallback_warning) for a Nessus scan."""
-    data = _req(conn, "GET", f"/scans/{scan_id}", access_key, secret_key)
+    detail_timeout = 180 if (host_count or 0) >= _LARGE_SCAN_HOSTS else 90
+    data = _req(conn, "GET", f"/scans/{scan_id}", access_key, secret_key, timeout=detail_timeout)
     hid = _get_fallback_history_id(data)
     warning = None
     if hid:
         warning = f"Scan {scan_id} was {data.get('info', {}).get('status')}; automatically fell back to last successful run ({hid})"
         log.info(warning)
-        data = _req(conn, "GET", f"/scans/{scan_id}?history_id={hid}", access_key, secret_key)
+        data = _req(conn, "GET", f"/scans/{scan_id}?history_id={hid}", access_key, secret_key,
+                    timeout=detail_timeout)
 
     hosts = data.get("hosts") or []
     return [
@@ -139,7 +164,8 @@ def get_scan_info(conn, access_key: str, secret_key: str, scan_id: int) -> Dict:
 # ── Export ────────────────────────────────────────────────────────────────────
 
 def export_scan_csv(
-    conn, access_key: str, secret_key: str, scan_id: int
+    conn, access_key: str, secret_key: str, scan_id: int,
+    host_count: Optional[int] = None,
 ) -> Tuple[str, str]:
     """
     Export a Nessus scan as CSV.
@@ -149,9 +175,19 @@ def export_scan_csv(
       1. POST /scans/{id}/export  → file_id
       2. Poll /export/{file_id}/status until "ready"
       3. GET  /export/{file_id}/download → CSV text
+
+    *host_count* (if known) scales poll/download timeouts for large scans.
     """
     info = get_scan_info(conn, access_key, secret_key, scan_id)
     scan_name = info["name"]
+    timeouts = _scan_timeouts(host_count)
+    max_wait_min = (timeouts["poll_attempts"] * timeouts["poll_sleep"]) // 60
+
+    if host_count and host_count >= _LARGE_SCAN_HOSTS:
+        log.info(
+            "Large scan export: scan %d ('%s', ~%d hosts) — up to %d min generate, %ds download",
+            scan_id, scan_name, host_count, max_wait_min, timeouts["download_curl"],
+        )
 
     resp = _req(conn, "POST", f"/scans/{scan_id}/export", access_key, secret_key,
                 body={"format": "csv"})
@@ -159,19 +195,28 @@ def export_scan_csv(
     if not file_id:
         raise ValueError(f"Nessus did not return a file ID for scan {scan_id}")
 
-    # Poll until ready (max 4 min)
-    for attempt in range(80):
+    poll_sleep = timeouts["poll_sleep"]
+    for attempt in range(timeouts["poll_attempts"]):
         st = _req(conn, "GET", f"/scans/{scan_id}/export/{file_id}/status",
                   access_key, secret_key)
         if st.get("status") == "ready":
             break
+        if attempt and attempt % 10 == 0:
+            log.info(
+                "Export scan %d ('%s'): still generating… (%ds elapsed)",
+                scan_id, scan_name, attempt * poll_sleep,
+            )
         log.debug("Export scan %s: status=%s (attempt %d)", scan_id, st.get("status"), attempt)
-        time.sleep(3)
+        time.sleep(poll_sleep)
     else:
-        raise ValueError(f"Export for scan '{scan_name}' timed out after 4 minutes")
+        raise ValueError(
+            f"Export for scan '{scan_name}' timed out after {max_wait_min} minutes"
+        )
 
-    csv_text = _raw_download(conn, f"/scans/{scan_id}/export/{file_id}/download",
-                             access_key, secret_key)
+    csv_text = _raw_download(
+        conn, f"/scans/{scan_id}/export/{file_id}/download",
+        access_key, secret_key, curl_timeout=timeouts["download_curl"],
+    )
     if not csv_text.strip():
         raise ValueError(f"Empty CSV downloaded for scan '{scan_name}'")
 

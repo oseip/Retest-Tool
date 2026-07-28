@@ -14,6 +14,27 @@ _PORT_RE = re.compile(r'^\d{2,5}$')
 _CVE_RE = re.compile(r'^CVE-\d{4}-\d+$', re.I)
 
 
+class JiraCreateError(Exception):
+    """Raised when Jira issue creation fails; message includes field-level detail."""
+
+    def __init__(self, message: str, *, status_code: int = 400, errors: Optional[Dict[str, str]] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.errors = errors or {}
+
+
+def _parse_jira_create_error(resp: requests.Response) -> str:
+    """Turn a Jira create-issue error response into a readable message."""
+    try:
+        data = resp.json()
+    except Exception:
+        return (resp.text or resp.reason or "Unknown error")[:800]
+    parts: List[str] = list(data.get("errorMessages") or [])
+    for field_id, msg in (data.get("errors") or {}).items():
+        parts.append(f"{field_id}: {msg}")
+    return "; ".join(parts) or (resp.text or resp.reason or "Unknown error")[:800]
+
+
 def _extract_tester(fields: dict, field_id: Optional[str]) -> Optional[str]:
     """
     Extract the 'tester' custom field value.
@@ -152,7 +173,13 @@ class JiraClient:
         url = f"{self.cfg.url}/rest/api/3/search/jql"
         log.info("JQL → %s", jql)
         fields_str = getattr(self, "_fetch_fields", "*all")
-        fields_list = fields_str.split(",") if fields_str else []
+        if not fields_str or fields_str == "*all":
+            fields_list = ["summary", "status", "priority", "assignee", "reporter",
+                           "updated", "labels", "description"]
+        else:
+            fields_list = [f.strip() for f in fields_str.split(",") if f.strip()]
+            if "status" not in fields_list:
+                fields_list.insert(1, "status")
         all_issues: List[Dict] = []
         next_page_token = None
         
@@ -219,6 +246,26 @@ class JiraClient:
         )
         resp.raise_for_status()
         return self._serialize(resp.json())
+
+    def create_issue(self, fields: Dict[str, Any]) -> str:
+        """Create a Jira issue and return its key."""
+        if not self._fields_loaded:
+            self._load_fields()
+        url = f"{self.cfg.url}/rest/api/3/issue"
+        resp = self._session.post(url, json={"fields": fields}, timeout=60)
+        if not resp.ok:
+            detail = _parse_jira_create_error(resp)
+            log.error("Create issue failed (%s): %s", resp.status_code, detail)
+            err_fields: Dict[str, str] = {}
+            try:
+                err_fields = resp.json().get("errors") or {}
+            except Exception:
+                pass
+            raise JiraCreateError(detail, status_code=resp.status_code, errors=err_fields)
+        key = resp.json().get("key")
+        if not key:
+            raise JiraCreateError("Jira create issue returned no key")
+        return key
 
     def add_comment(self, key: str, body: str):
         self._j.add_comment(key, body)

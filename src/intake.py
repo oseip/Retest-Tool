@@ -12,8 +12,8 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
@@ -34,10 +34,24 @@ _INDEX_LOCK = threading.Lock()
 _CACHE_DIR        = os.path.join("data", "intake_cache")
 _JIRA_CACHE_DIR   = os.path.join(_CACHE_DIR, "jira")
 _NESSUS_CACHE_DIR = os.path.join(_CACHE_DIR, "nessus")
+_INTAKE_DATA_DIR  = os.path.join("data", "intake")
+_IRRELEVANT_PATH  = os.path.join(_INTAKE_DATA_DIR, "irrelevant_vulnerabilities.txt")
+_RECOMMENDATIONS_PATH = os.path.join(_INTAKE_DATA_DIR, "recommendations.csv")
+_SEED_IRRELEVANT  = os.path.join("automation-tool-bright-features", "irrelevant_vulnerabilities.txt")
+_SEED_RECOMMENDATIONS = os.path.join(
+    "automation-tool-bright-features", "Data", "vulnerabilityData.csv",
+)
 
 # How long a cached Jira index is considered "fresh". Older caches still load
 # instantly (so the UI never blocks) but trigger a silent background refresh.
 _JIRA_CACHE_TTL = 12 * 3600   # 12 hours
+_JIRA_CACHE_VERSION = 2       # bump when cache schema changes (v2 adds status)
+
+# Loaded once on first use — OS|Title → custom recommendation text
+_RECOMMENDATION_MAP: Dict[str, str] = {}
+_RECOMMENDATIONS_LOADED = False
+_IRRELEVANT_SET: set = set()
+_IRRELEVANT_LOADED = False
 
 
 def _safe_name(label: str) -> str:
@@ -46,11 +60,106 @@ def _safe_name(label: str) -> str:
 
 
 def _ensure_cache_dirs() -> None:
-    for d in (_JIRA_CACHE_DIR, _NESSUS_CACHE_DIR):
+    for d in (_JIRA_CACHE_DIR, _NESSUS_CACHE_DIR, _INTAKE_DATA_DIR):
         try:
             os.makedirs(d, exist_ok=True)
         except OSError as exc:
             log.warning("Intake cache: could not create %s — %s", d, exc)
+
+
+def _seed_file(dest: str, *sources: str, default_text: str = "") -> None:
+    """Copy the first existing *sources* file to *dest*, or write *default_text*."""
+    if os.path.exists(dest):
+        return
+    _ensure_cache_dirs()
+    for src in sources:
+        if src and os.path.exists(src):
+            try:
+                with open(src, encoding="utf-8", errors="replace") as inf:
+                    data = inf.read()
+                tmp = f"{dest}.tmp"
+                with open(tmp, "w", encoding="utf-8") as outf:
+                    outf.write(data)
+                os.replace(tmp, dest)
+                return
+            except OSError as exc:
+                log.warning("Intake: could not seed %s from %s — %s", dest, src, exc)
+    if default_text:
+        try:
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(default_text)
+        except OSError as exc:
+            log.warning("Intake: could not write default %s — %s", dest, exc)
+
+
+_DEFAULT_IRRELEVANT = "\n".join([
+    "ICMP Timestamp Request Remote Date Disclosure",
+    "SSL Certificate Cannot Be Trusted",
+    "SSL Self-Signed Certificate",
+    "SSL Certificate with Wrong Hostname",
+]) + "\n"
+
+
+def _load_irrelevant() -> set:
+    """Return the set of vulnerability titles to exclude from Intake entirely."""
+    global _IRRELEVANT_SET, _IRRELEVANT_LOADED
+    if _IRRELEVANT_LOADED:
+        return _IRRELEVANT_SET
+    _seed_file(_IRRELEVANT_PATH, _SEED_IRRELEVANT, default_text=_DEFAULT_IRRELEVANT)
+    out: set = set()
+    try:
+        with open(_IRRELEVANT_PATH, encoding="utf-8") as f:
+            for line in f:
+                t = line.strip()
+                if t and not t.startswith("#"):
+                    out.add(t.lower())
+    except OSError as exc:
+        log.warning("Intake: could not read irrelevant list — %s", exc)
+    _IRRELEVANT_SET = out
+    _IRRELEVANT_LOADED = True
+    return out
+
+
+def _load_recommendations() -> Dict[str, str]:
+    """Load OS|Title → recommendation mappings from the local CSV library."""
+    global _RECOMMENDATION_MAP, _RECOMMENDATIONS_LOADED
+    if _RECOMMENDATIONS_LOADED:
+        return _RECOMMENDATION_MAP
+    _seed_file(_RECOMMENDATIONS_PATH, _SEED_RECOMMENDATIONS)
+    out: Dict[str, str] = {}
+    if os.path.exists(_RECOMMENDATIONS_PATH):
+        try:
+            with open(_RECOMMENDATIONS_PATH, encoding="utf-8", errors="replace") as f:
+                for row in csv.DictReader(f):
+                    title = (row.get("Vulnerability_Title") or "").strip()
+                    rec = (row.get("Recommendation") or "").strip()
+                    os_val = (row.get("OS") or "Unknown").strip() or "Unknown"
+                    if title and rec:
+                        out[f"{os_val}|{title}"] = rec
+                        out[f"|{title}"] = rec
+            log.info("Intake: loaded %d custom recommendations", len(out))
+        except OSError as exc:
+            log.warning("Intake: could not read recommendations CSV — %s", exc)
+    _RECOMMENDATION_MAP = out
+    _RECOMMENDATIONS_LOADED = True
+    return out
+
+
+def _sanitize_report_text(text: str) -> str:
+    """Replace scanner-specific wording with mUnit terminology (old automation tool)."""
+    if not text:
+        return ""
+    repl = [
+        (r"(?i)nessus", "mUnit"),
+        (r"(?i)this plugin", "MUNIT"),
+        (r"(?i)tenable", "MUNIT"),
+        (r"(?i)\bplugins\b", "IDs"),
+        (r"(?i)\bplugin\b", "MUNIT"),
+    ]
+    out = text
+    for pat, sub in repl:
+        out = re.sub(pat, sub, out)
+    return out
 
 
 def _atomic_write_json(path: str, data: dict) -> None:
@@ -65,6 +174,7 @@ def _atomic_write_json(path: str, data: dict) -> None:
 
 class PullRequest(BaseModel):
     scan_ids: List[int]
+    scan_host_counts: Dict[int, int] = {}   # scan_id → host count (for large-scan timeouts)
     impact_type: str  = "Internal operations impact"
     actor:       str  = "Unauthenticated user"
     vector:      str  = "Internal network"
@@ -99,6 +209,29 @@ class ExportRequest(BaseModel):
     tester:            str = ""
     date_started:      str = ""
     munit_id:          str = ""
+    export_mode:       str = "new"   # "new" = upload-ready rows only; "all" = incl. duplicates
+
+
+class CreateJiraRequest(BaseModel):
+    findings:          List[dict]
+    create_mode:       str = "new"   # "new" | "selected" — exportable rows only
+    impact_type:       str = "Internal operations impact"
+    actor:             str = "Unauthenticated user"
+    vector:            str = "Internal network"
+    test_type:         str = "IPT"
+    duration:          str = ""
+    project_key:       str = ""
+    customer:          str = ""
+    contact_person:    str = ""
+    technical_contact: str = ""
+    purchaser:         str = ""
+    tester:            str = ""
+    date_started:      str = ""
+    munit_id:          str = ""
+
+
+class IrrelevantConfigRequest(BaseModel):
+    lines: List[str]
 
 
 # ── Nessus CSV → vulnerability normaliser ─────────────────────────────────
@@ -113,9 +246,13 @@ _SERVICES = [
     ("IIS",         ["iis", "internet information"]),
     ("Tomcat",      ["tomcat"]),
     ("OpenSSL",     ["openssl"]),
+    ("OpenSSH",     ["openssh"]),
     ("SSH",         ["ssh"]),
-    ("SSL",         ["ssl certificate", "ssl self-signed", "ssl/tls"]),
-    ("TLS",         ["tls version", "tls 1.", "tls renegotiation"]),
+    ("IPMI",        ["ipmi"]),
+    ("TLS",         ["tls version", "tls 1.0", "tls 1.1", "tls 1.2", "tls deprecated",
+                      "tls protocol detection", "ssl/tls"]),
+    ("SSL",         ["ssl certificate", "ssl self-signed", "ssl medium", "ssl weak",
+                      "ssl cipher", "ssl version", "sweet32"]),
     ("RDP",         ["rdp", "remote desktop protocol", "ms rdp"]),
     ("SMB",         ["smb", "samba", "ms17-010", "eternalblue"]),
     ("FTP",         ["ftp"]),
@@ -132,15 +269,107 @@ _SERVICES = [
     ("LDAP",        ["ldap"]),
     ("NTP",         ["ntp"]),
     ("DNS",         ["dns"]),
+    ("mDNS",        ["mdns", "bonjour", "zeroconf"]),
     ("OpenVPN",     ["openvpn"]),
     ("Cisco",       ["cisco"]),
     ("VMware",      ["vmware"]),
     ("Java",        ["java", "jvm"]),
     ("Kubernetes",  ["kubernetes", "k8s"]),
-    ("Docker",      ["docker"]),
+    ("Docker",        ["docker"]),
+    ("Kibana",        ["kibana"]),
+    ("Grafana",       ["grafana", "grafana labs"]),
+    ("Elasticsearch", ["elasticsearch"]),
+    ("GitLab",        ["gitlab"]),
+    ("Jenkins",       ["jenkins"]),
+    ("MongoDB",       ["mongodb"]),
+    ("Confluence",    ["confluence"]),
+    ("RabbitMQ",      ["rabbitmq"]),
+    ("MariaDB",       ["mariadb"]),
 ]
 
 
+# Products whose Nessus findings merge by (product, IP, port) and dedup against
+# Jira regardless of version strings in the title.  Order matters — more specific
+# patterns (Tomcat) must come before broader ones (Apache).
+_PRODUCT_REGISTRY: List[Tuple[str, str, List[str]]] = [
+    ("tomcat", "Apache Tomcat Multiple Vulnerabilities",
+     [r"(?i)^Apache\s+Tomcat\b"]),
+    ("apache", "Apache HTTP Server Multiple Vulnerabilities",
+     [r"(?i)^Apache(?:\s+HTTP\s+Server)?\b"]),
+    ("kibana", "Kibana Multiple Vulnerabilities",
+     [r"(?i)^Kibana\b"]),
+    ("grafana", "Grafana Multiple Vulnerabilities",
+     [r"(?i)^Grafana(?:\s+Labs)?\b"]),
+    ("elasticsearch", "Elasticsearch Multiple Vulnerabilities",
+     [r"(?i)^Elasticsearch\b"]),
+    ("mongodb", "MongoDB Multiple Vulnerabilities",
+     [r"(?i)^MongoDB\b"]),
+    ("gitlab", "GitLab Multiple Vulnerabilities",
+     [r"(?i)^GitLab\b"]),
+    ("jenkins", "Jenkins Multiple Vulnerabilities",
+     [r"(?i)^Jenkins\b"]),
+    ("nginx", "nginx Multiple Vulnerabilities",
+     [r"(?i)^nginx\b"]),
+    ("openssl", "OpenSSL Multiple Vulnerabilities",
+     [r"(?i)^OpenSSL\b"]),
+    ("openssh", "OpenSSH Multiple Vulnerabilities",
+     [r"(?i)^OpenSSH\b"]),
+    ("php", "PHP Multiple Vulnerabilities",
+     [r"(?i)^PHP\b"]),
+    ("mysql", "MySQL Multiple Vulnerabilities",
+     [r"(?i)^MySQL\b"]),
+    ("mariadb", "MariaDB Multiple Vulnerabilities",
+     [r"(?i)^MariaDB\b"]),
+    ("postgresql", "PostgreSQL Multiple Vulnerabilities",
+     [r"(?i)^PostgreSQL\b"]),
+    ("redis", "Redis Multiple Vulnerabilities",
+     [r"(?i)^Redis\b"]),
+    ("rabbitmq", "RabbitMQ Multiple Vulnerabilities",
+     [r"(?i)^RabbitMQ\b"]),
+    ("confluence", "Confluence Multiple Vulnerabilities",
+     [r"(?i)^Confluence\b"]),
+    ("wordpress", "WordPress Multiple Vulnerabilities",
+     [r"(?i)^WordPress\b"]),
+    ("drupal", "Drupal Multiple Vulnerabilities",
+     [r"(?i)^Drupal\b"]),
+    ("node", "Node.js Multiple Vulnerabilities",
+     [r"(?i)^Node\.js\b"]),
+    ("vmware_esxi", "VMware ESXi Multiple Vulnerabilities",
+     [r"(?i)^VMware\s+ESXi\b"]),
+    ("vmware_vcenter", "VMware vCenter Server Multiple Vulnerabilities",
+     [r"(?i)^VMware\s+vCenter\b"]),
+    ("java", "Oracle Java SE Multiple Vulnerabilities",
+     [r"(?i)^Oracle\s+Java\b"]),
+    ("iis", "Microsoft IIS Multiple Vulnerabilities",
+     [r"(?i)^Microsoft\s+IIS\b"]),
+    ("exchange", "Microsoft Exchange Server Multiple Vulnerabilities",
+     [r"(?i)^Microsoft\s+Exchange\b"]),
+    ("fortios", "FortiOS Multiple Vulnerabilities",
+     [r"(?i)^FortiOS\b"]),
+    ("tls", "TLS Deprecated Protocol",
+     [r"(?i)^TLS\s+Version\s+1\.[01]\b",
+      r"(?i)^TLS\s+1\.[01]\b",
+      r"(?i)^TLS\s+.*Deprecated",
+      r"(?i)TLS.*Protocol\s+Detection"]),
+]
+
+
+# Titles repeat heavily across hosts and each of these walks the whole product
+# registry, so the same strings would otherwise be re-scanned thousands of times
+# per pull (and again for every Jira ticket when building the index).
+@lru_cache(maxsize=8192)
+def _product_slug(title: str) -> Optional[str]:
+    """Return the product slug when *title* is a mergeable version-style finding."""
+    t = (title or "").strip()
+    if not t:
+        return None
+    for slug, _, patterns in _PRODUCT_REGISTRY:
+        if any(re.search(p, t) for p in patterns):
+            return slug
+    return None
+
+
+@lru_cache(maxsize=8192)
 def _service_from_title(title: str) -> str:
     tl = title.lower()
     for svc, patterns in _SERVICES:
@@ -149,16 +378,76 @@ def _service_from_title(title: str) -> str:
     return ""
 
 
-def _technology(title: str, port: str, protocol: str) -> str:
+@lru_cache(maxsize=8192)
+def _product_display_name(title: str) -> str:
+    """Short technology label aligned with the vulnerability family name."""
+    slug = _product_slug(title)
+    if slug:
+        for s, canonical, _ in _PRODUCT_REGISTRY:
+            if s == slug:
+                name = canonical.replace(" Multiple Vulnerabilities", "")
+                if slug == "tls":
+                    return "TLS"
+                if slug == "nginx":
+                    return "nginx"
+                return name
     svc = _service_from_title(title)
-    parts = []
-    if svc:
-        parts.append(svc)
-    elif protocol:
-        parts.append(protocol.upper())
+    return svc
+
+
+# Transport-layer names — never use these as the Technology label.
+_PROTOCOL_NAMES = frozenset({"tcp", "udp", "icmp", "sctp", "dccp"})
+
+
+@lru_cache(maxsize=8192)
+def _technology_label(title: str) -> str:
+    """Derive the technology name from a vulnerability title (never TCP/UDP)."""
+    label = _product_display_name(title)
+    if label:
+        return label
+    t = (title or "").strip()
+    m = re.match(r"^([A-Za-z][A-Za-z0-9.+/-]*)", t)
+    if m:
+        word = m.group(1)
+        if word.lower() not in _PROTOCOL_NAMES:
+            return word
+    return ""
+
+
+def _technology(title: str, port: str, protocol: str) -> str:
+    label = _technology_label(title)
+    if not label:
+        label = "Unknown"
+    parts = [label]
     if port and port not in ("0", ""):
         parts.append(port)
-    return ",".join(parts) if parts else "TCP"
+    return ",".join(parts)
+
+
+def _ports_from_technology(tech: str) -> List[str]:
+    """Extract numeric port tokens from a Technology field."""
+    ports = []
+    for part in (tech or "").split(","):
+        p = part.strip()
+        if p.isdigit():
+            ports.append(p)
+    return ports
+
+
+def _rebuild_technology(finding: dict) -> None:
+    """Rebuild Technology as ``Product,port,port,…`` using the vulnerability family name."""
+    title = finding.get("Vulnerability_Title") or ""
+    label = _technology_label(title) or _technology_label(_normalize_title(title))
+    ports = set(_ports_from_technology(finding.get("Technology", "")))
+    p = str(finding.get("_port") or "").strip()
+    if p and p != "0":
+        ports.add(p)
+    if not label:
+        label = "Unknown"
+    if ports:
+        finding["Technology"] = label + "," + ",".join(sorted(ports, key=lambda x: int(x)))
+    else:
+        finding["Technology"] = label
 
 
 def _col(row: dict, *names: str) -> str:
@@ -180,7 +469,6 @@ _PLUGIN_CACHE = {}
 def _parse_nessus_csv(csv_text: str, vector: str = "", actor: str = "", conn=None, ak=None, sk=None) -> List[dict]:
     """Parse one Nessus CSV export into normalised finding dicts."""
     from . import nessus_client as nc
-    from concurrent.futures import ThreadPoolExecutor
     # Normalise every header to lowercase once so _col() can do O(1) lookups
     # instead of re-lowercasing the whole row on each field access.
     rows = [
@@ -211,28 +499,37 @@ def _parse_nessus_csv(csv_text: str, vector: str = "", actor: str = "", conn=Non
             elif p_out and host not in ip_to_os:
                 ip_to_os[host] = p_out.split("\n")[0].strip()[:50]
 
-    # --- Pass 1.5: Prefetch Plugins ---
+    # --- Pass 1.5: Prefetch Plugins (sequential — parallel SSH corrupts channels) ---
+    # Only fetch when the CSV row lacks a CVSS vector; most Nessus exports include it.
     if conn and ak and sk:
-        needed_plugins = set()
+        needed_plugins: List[int] = []
+        seen: set = set()
         for row in rows:
-            if _col(row, "Risk").lower() in _SKIP_RISKS: continue
+            if _col(row, "Risk").lower() in _SKIP_RISKS:
+                continue
+            if _col(row, "CVSS v3.0 Vector", "CVSS v2.0 Vector", "CVSS Vector"):
+                continue
             pid = _col(row, "Plugin ID")
-            if pid:
-                try:
-                    p = int(pid)
-                    if p not in _PLUGIN_CACHE:
-                        needed_plugins.add(p)
-                except ValueError: pass
-                
+            if not pid:
+                continue
+            try:
+                p = int(pid)
+            except ValueError:
+                continue
+            if p in _PLUGIN_CACHE or p in seen:
+                continue
+            seen.add(p)
+            needed_plugins.append(p)
+
         if needed_plugins:
-            def _fetch_plug(p):
+            log.info("Intake parse: fetching %d plugin detail(s) over SSH (sequential)", len(needed_plugins))
+            for i, p in enumerate(needed_plugins, 1):
                 try:
                     _PLUGIN_CACHE[p] = nc.get_plugin_details(conn, ak, sk, p)
                 except Exception:
                     _PLUGIN_CACHE[p] = {"attributes": []}
-            
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                list(executor.map(_fetch_plug, needed_plugins))
+                if i % 25 == 0 or i == len(needed_plugins):
+                    log.info("Intake parse: plugin details %d/%d", i, len(needed_plugins))
 
     # --- Helpers for CIA & Risk ---
     def get_plugin_attributes(plugin_id: str):
@@ -337,12 +634,16 @@ def _parse_nessus_csv(csv_text: str, vector: str = "", actor: str = "", conn=Non
         if not name or not host:
             continue
 
+        if _is_irrelevant(name):
+            continue
+
         os_val = ip_to_os.get(host, "")
 
-        if desc:
-            desc = re.sub(r"(?i)nessus", "mUnit", desc)
-        if soln:
-            soln = re.sub(r"(?i)nessus", "mUnit", soln)
+        plugin_out = _col(row, "Plugin Output")
+        if plugin_out:
+            desc = f"{desc}\n{plugin_out}" if desc else plugin_out
+        desc = _sanitize_report_text(desc)
+        soln = _enhance_recommendation(name, os_val, soln)
 
         findings.append({
             "Vulnerability_Title":       name,
@@ -370,81 +671,169 @@ def _parse_nessus_csv(csv_text: str, vector: str = "", actor: str = "", conn=Non
 
 
 _NORMALIZATION_PATTERNS = [
-    (re.compile(r"(?i)^Apache(?:\s+HTTP\s+Server)?\s+\d+(?:\.\d+)+.*"), "Apache HTTP Server Multiple Vulnerabilities"),
-    (re.compile(r"(?i)^PHP\s+\d+(?:\.\d+)+.*"), "PHP Multiple Vulnerabilities"),
-    (re.compile(r"(?i)^OpenSSL\s+\d+(?:\.\d+)*[a-z]?\s+.*"), "OpenSSL Multiple Vulnerabilities"),
-    (re.compile(r"(?i)^nginx\s+\d+(?:\.\d+)+.*"), "nginx Multiple Vulnerabilities"),
-    (re.compile(r"(?i)^Apache\s+Tomcat\s+\d+(?:\.\d+)+.*"), "Apache Tomcat Multiple Vulnerabilities"),
-    (re.compile(r"(?i)^Node\.js\s+\d+(?:\.\d+)+.*"), "Node.js Multiple Vulnerabilities"),
-    (re.compile(r"(?i)^MySQL\s+\d+(?:\.\d+)+.*"), "MySQL Multiple Vulnerabilities"),
-    (re.compile(r"(?i)^PostgreSQL\s+\d+(?:\.\d+)+.*"), "PostgreSQL Multiple Vulnerabilities"),
-    (re.compile(r"(?i)^Oracle\s+Java\s+SE\s+\d+.*"), "Oracle Java SE Multiple Vulnerabilities"),
-    (re.compile(r"(?i)^VMware\s+ESXi.*"), "VMware ESXi Multiple Vulnerabilities"),
-    (re.compile(r"(?i)^VMware\s+vCenter\s+Server.*"), "VMware vCenter Server Multiple Vulnerabilities"),
+    (re.compile(r"(?i)Apache(?:\s+HTTP\s+Server)?\s+\d+(?:\.\d+)+"), "Apache HTTP Server Multiple Vulnerabilities"),
+    (re.compile(r"(?i)Apache\s+Tomcat\s+\d+(?:\.\d+)+"), "Apache Tomcat Multiple Vulnerabilities"),
+    (re.compile(r"(?i)PHP\s+\d+(?:\.\d+)+"), "PHP Multiple Vulnerabilities"),
+    (re.compile(r"(?i)OpenSSL\s+\d+(?:\.\d+)*[a-z]?"), "OpenSSL Multiple Vulnerabilities"),
+    (re.compile(r"(?i)OpenSSH\s+(?:<\s*)?\d+(?:\.\d+)*"), "OpenSSH Multiple Vulnerabilities"),
+    (re.compile(r"(?i)nginx\s+\d+(?:\.\d+)+"), "nginx Multiple Vulnerabilities"),
+    (re.compile(r"(?i)Node\.js\s+\d+(?:\.\d+)+"), "Node.js Multiple Vulnerabilities"),
+    (re.compile(r"(?i)MySQL\s+\d+(?:\.\d+)+"), "MySQL Multiple Vulnerabilities"),
+    (re.compile(r"(?i)MariaDB\s+\d+(?:\.\d+)+"), "MariaDB Multiple Vulnerabilities"),
+    (re.compile(r"(?i)PostgreSQL\s+\d+(?:\.\d+)+"), "PostgreSQL Multiple Vulnerabilities"),
+    (re.compile(r"(?i)Oracle\s+Java\s+SE\s+\d+"), "Oracle Java SE Multiple Vulnerabilities"),
+    (re.compile(r"(?i)VMware\s+ESXi"), "VMware ESXi Multiple Vulnerabilities"),
+    (re.compile(r"(?i)VMware\s+vCenter\s+Server"), "VMware vCenter Server Multiple Vulnerabilities"),
 ]
 
 
+@lru_cache(maxsize=8192)
 def _normalize_title(title: str) -> str:
     """Normalize vulnerability titles to group similar version vulnerabilities."""
+    t = (title or "").strip()
+    if not t:
+        return t
+    slug = _product_slug(t)
+    if slug:
+        for s, canonical, _ in _PRODUCT_REGISTRY:
+            if s == slug:
+                return canonical
     for pattern, replacement in _NORMALIZATION_PATTERNS:
-        if pattern.match(title.strip()):
+        if pattern.search(t):
             return replacement
-    return title.strip()
+    return t
+
+
+@lru_cache(maxsize=8192)
+def _family_key(title: str) -> Optional[str]:
+    """Return the canonical family name when *title* is a version-style finding."""
+    slug = _product_slug(title)
+    if slug:
+        return _normalize_title(title).lower()
+    norm = _normalize_title(title)
+    if norm.lower() != (title or "").strip().lower():
+        return norm.lower()
+    return None
+
+
+def _merge_row_into(existing: dict, incoming: dict, severity_map: dict,
+                    cve_seen: Optional[dict] = None) -> None:
+    """Combine *incoming* into *existing* (CVEs, CVSS, rating, ports).
+
+    *cve_seen* is an optional insertion-ordered accumulator of the CVEs already
+    on *existing*. Passing it keeps merging linear; without it every merge
+    re-parses and linearly scans the joined CVE string, which is quadratic for
+    families that collapse hundreds of rows onto one host.
+    """
+    _merge_port(existing, str(incoming.get("_port") or "").strip())
+    if incoming.get("CVE"):
+        if cve_seen is None:
+            cve_seen = dict.fromkeys(
+                c.strip() for c in existing.get("CVE", "").split(",") if c.strip()
+            )
+        for cve in incoming["CVE"].split(","):
+            cve = cve.strip()
+            if cve:
+                cve_seen[cve] = None
+        existing["CVE"] = ",".join(cve_seen)
+    try:
+        e_cvss = float(existing.get("CVSS") or 0.0)
+    except ValueError:
+        e_cvss = 0.0
+    try:
+        f_cvss = float(incoming.get("CVSS") or 0.0)
+    except ValueError:
+        f_cvss = 0.0
+    if f_cvss > e_cvss:
+        existing["CVSS"] = incoming.get("CVSS", "")
+    e_rating = existing.get("Vulnerability_Rating", "Info").capitalize()
+    f_rating = incoming.get("Vulnerability_Rating", "Info").capitalize()
+    if severity_map.get(f_rating, 0) > severity_map.get(e_rating, 0):
+        existing["Vulnerability_Rating"] = f_rating
+    existing["_merged_count"] = int(existing.get("_merged_count") or 1) + 1
+    _rebuild_technology(existing)
+
+
+def _is_irrelevant(title: str) -> bool:
+    """True when *title* (raw or normalised) is on the exclusion list."""
+    if not title:
+        return False
+    irrelevant = _load_irrelevant()
+    raw = title.strip().lower()
+    if raw in irrelevant:
+        return True
+    norm = _normalize_title(title).strip().lower()
+    return norm in irrelevant
+
+
+def _enhance_recommendation(title: str, os_val: str, nessus_solution: str) -> str:
+    """Prefer a curated recommendation; fall back to the Nessus solution text."""
+    lib = _load_recommendations()
+    os_val = (os_val or "Unknown").strip() or "Unknown"
+    norm_title = _normalize_title(title)
+    for key in (f"{os_val}|{norm_title}", f"{os_val}|{title.strip()}",
+                f"|{norm_title}", f"|{title.strip()}"):
+        if key in lib:
+            return _sanitize_report_text(lib[key])
+    return _sanitize_report_text(nessus_solution)
+
+
+def _index_hit(key: str, status: str = "") -> dict:
+    return {"key": key, "status": status or ""}
+
+
+def _resolve_hit(hit) -> Tuple[Optional[str], str]:
+    if not hit:
+        return None, ""
+    if isinstance(hit, str):
+        return hit, ""
+    return hit.get("key"), hit.get("status") or ""
+
+
+def _lookup_hit(index: dict, *keys) -> Tuple[Optional[str], str]:
+    for k in keys:
+        if k in index:
+            return _resolve_hit(index[k])
+    return None, ""
 
 
 def _merge_dedup(all_findings: List[dict]) -> List[dict]:
-    """Deduplicate by (title, IP) — same vuln on multiple ports merges into one
-    row with all ports combined in the Technology field, e.g. SSL,443,8443."""
-    # Ordered dict preserves first-seen order
-    seen: dict = {}   # (title_lower, ip) → index in `out`
+    """Merge findings that share the same product family + IP, or title + IP.
+
+    Version-style products (Kibana, Grafana, nginx, TLS, …) collapse to one row
+    per host regardless of differing Nessus version strings or ports.
+    """
+    seen: dict = {}
     out: List[dict] = []
-    
-    # Rating mapped to severity levels for merging to highest severity
+    # out-index → insertion-ordered CVE accumulator, so repeated merges onto the
+    # same row don't re-parse and re-scan an ever-growing CVE string.
+    cve_acc: Dict[int, dict] = {}
     severity_map = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "None": 0, "Info": 0}
 
     for f in all_findings:
         raw_title = f["Vulnerability_Title"]
         norm_title = _normalize_title(raw_title)
-        
-        # Update title so UI and exported CSV show the grouped family title
         f["Vulnerability_Title"] = norm_title
-        
-        key = (norm_title.lower().strip(), f["_ip"].strip())
-        port = f["_port"].strip()
+        f["_product"] = _product_slug(raw_title) or _product_slug(norm_title) or ""
+
+        ip = f["_ip"].strip()
+        slug = f["_product"]
+        if slug:
+            key = ("product", slug, ip)
+        else:
+            key = ("title", norm_title.lower(), ip)
 
         if key in seen:
-            # Merge port into the existing row's Technology field
-            existing = out[seen[key]]
-            _merge_port(existing, port)
-            
-            # Combine CVEs
-            if f.get("CVE"):
-                existing_cves = [c.strip() for c in existing.get("CVE", "").split(",") if c.strip()]
-                new_cves = [c.strip() for c in f["CVE"].split(",") if c.strip()]
-                for cve in new_cves:
-                    if cve not in existing_cves:
-                        existing_cves.append(cve)
-                existing["CVE"] = ",".join(existing_cves)
-                
-            # Take the highest CVSS
-            try:
-                e_cvss = float(existing.get("CVSS") or 0.0)
-            except ValueError:
-                e_cvss = 0.0
-            try:
-                f_cvss = float(f.get("CVSS") or 0.0)
-            except ValueError:
-                f_cvss = 0.0
-            if f_cvss > e_cvss:
-                existing["CVSS"] = f.get("CVSS", "")
-                
-            # Take highest Rating
-            e_rating = existing.get("Vulnerability_Rating", "Info").capitalize()
-            f_rating = f.get("Vulnerability_Rating", "Info").capitalize()
-            if severity_map.get(f_rating, 0) > severity_map.get(e_rating, 0):
-                existing["Vulnerability_Rating"] = f_rating
+            idx = seen[key]
+            _merge_row_into(out[idx], f, severity_map, cve_acc[idx])
         else:
-            seen[key] = len(out)
+            f["_merged_count"] = 1
+            _rebuild_technology(f)
+            idx = len(out)
+            seen[key] = idx
+            cve_acc[idx] = dict.fromkeys(
+                c.strip() for c in (f.get("CVE") or "").split(",") if c.strip()
+            )
             out.append(f)
 
     return out
@@ -480,51 +869,158 @@ def _match_finding_to_index(
     finding: dict,
     title_index: dict,
     cve_index: dict,
-) -> Tuple[Optional[str], Optional[str]]:
-    """Return (jira_key, match_kind) where match_kind is 'title' or 'cve'."""
-    title = _normalize_title(finding.get("Vulnerability_Title") or "").strip().lower()
+    family_index: dict,
+    product_index: dict,
+) -> Tuple[Optional[str], Optional[str], str]:
+    """Return (jira_key, match_kind, jira_status)."""
+    raw_title = finding.get("Vulnerability_Title") or ""
+    title = _normalize_title(raw_title).strip().lower()
     ip = (finding.get("System_IP") or finding.get("_ip") or "").strip()
     port = str(finding.get("_port") or "").strip()
+    slug = _product_slug(raw_title) or finding.get("_product") or ""
 
-    dup_key = title_index.get((title, ip, port)) or title_index.get((title, ip, ""))
-    if dup_key:
-        return dup_key, "title"
+    # Product + IP + port — any Kibana/Grafana/etc. on this host/port is a dup
+    if slug:
+        key, status = _lookup_hit(
+            product_index,
+            (slug, ip, port),
+            (slug, ip, ""),
+        )
+        if key:
+            return key, "product", status
+
+    key, status = _lookup_hit(
+        title_index,
+        (title, ip, port),
+        (title, ip, ""),
+    )
+    if key:
+        return key, "title", status
+
+    family = _family_key(raw_title)
+    if family:
+        key, status = _lookup_hit(
+            family_index,
+            (family, ip, port),
+            (family, ip, ""),
+        )
+        if key:
+            return key, "family", status
 
     for cve in _parse_cve_list(finding.get("CVE") or ""):
         dup_key = cve_index.get((cve, ip))
         if dup_key:
-            return dup_key, "cve"
-    return None, None
+            k, st = _resolve_hit(dup_key)
+            return k, "cve", st
+    return None, None, ""
+
+
+# Jira statuses meaning "already remediated" — a new scan hit against these is a
+# recurrence (re-open / new upload), not a duplicate of an open backlog item.
+_JIRA_FIXED_STATUSES = frozenset({"fixed", "closed", "done", "resolved"})
+
+
+def _is_fixed_jira_status(status: str) -> bool:
+    return (status or "").strip().lower() in _JIRA_FIXED_STATUSES
+
+
+def _classify_against_jira(
+    dup_key: Optional[str],
+    dup_status: str,
+    match_kind: Optional[str],
+) -> dict:
+    """Map a Jira index hit to intake status fields."""
+    if not dup_key:
+        return {
+            "status": "new",
+            "duplicate_of": None,
+            "duplicate_status": "",
+            "recurrence_of": None,
+            "previous_jira_status": "",
+            "match_kind": match_kind,
+        }
+    if _is_fixed_jira_status(dup_status):
+        return {
+            "status": "recurrence",
+            "duplicate_of": None,
+            "duplicate_status": "",
+            "recurrence_of": dup_key,
+            "previous_jira_status": dup_status,
+            "match_kind": match_kind,
+        }
+    return {
+        "status": "duplicate",
+        "duplicate_of": dup_key,
+        "duplicate_status": dup_status,
+        "recurrence_of": None,
+        "previous_jira_status": "",
+        "match_kind": match_kind,
+    }
 
 
 # ── Jira index builder ──────────────────────────────────────────────────────
 
-def _index_from_tickets(tickets: List[dict]) -> Tuple[dict, dict]:
-    """Build the fast-lookup title/CVE indexes from a list of serialized tickets.
+def _index_from_tickets(tickets: List[dict]) -> Tuple[dict, dict, dict, dict]:
+    """Build lookup indexes from serialized Jira tickets.
 
-    Shared by fresh Jira fetches and disk-cache loads so both produce identical
-    lookup structures.
-      • Title index: (normalised_title, ip, port) → ticket key
-      • CVE index:   (CVE-ID, ip)                 → ticket key
+    Returns (title_index, cve_index, family_index, product_index).
+    Index values are ``{"key": ticket_key, "status": jira_status}``.
     """
     title_index: dict = {}
     cve_index: dict = {}
+    family_index: dict = {}
+    product_index: dict = {}
     for t in tickets:
-        title = _normalize_title(t.get("summary") or "").strip().lower()
+        raw_summary = t.get("summary") or ""
+        title = _normalize_title(raw_summary).strip().lower()
+        family = _family_key(raw_summary)
+        slug = _product_slug(raw_summary)
+        status = t.get("status") or ""
+        hit = _index_hit(t["key"], status)
         ips = [i.strip() for i in (t.get("ips") or []) if i.strip()]
         ports = [str(p).strip() for p in (t.get("ports") or []) if str(p).strip()]
         cves = [c.strip().upper() for c in (t.get("cves") or []) if c.strip()]
 
+        port_list = ports or [""]
         for ip in ips:
-            for port in ports:
-                title_index[(title, ip, port)] = t["key"]
-            title_index.setdefault((title, ip, ""), t["key"])
+            for port in port_list:
+                title_index[(title, ip, port)] = hit
+                if family:
+                    family_index[(family, ip, port)] = hit
+                if slug:
+                    product_index[(slug, ip, port)] = hit
+            title_index.setdefault((title, ip, ""), hit)
+            if family:
+                family_index.setdefault((family, ip, ""), hit)
+            if slug:
+                product_index.setdefault((slug, ip, ""), hit)
             for cve in cves:
-                cve_index.setdefault((cve, ip), t["key"])
+                cve_index.setdefault((cve, ip), hit)
         if not ips:
-            title_index[(title, "", "")] = t["key"]
+            title_index[(title, "", "")] = hit
+            if family:
+                family_index[(family, "", "")] = hit
+            if slug:
+                product_index[(slug, "", "")] = hit
 
-    return title_index, cve_index
+    return title_index, cve_index, family_index, product_index
+
+
+def _key_index_from_tickets(tickets: List[dict]) -> dict:
+    """Map Jira issue key → workflow status (Fixed, Reported, Open, …)."""
+    return {
+        t["key"]: (t.get("status") or "").strip()
+        for t in tickets
+        if t.get("key")
+    }
+
+
+def _cache_has_statuses(tickets: List[dict]) -> bool:
+    """True when cached tickets include at least one non-empty Jira status."""
+    if not tickets:
+        return True
+    sample = tickets[:100]
+    return any((t.get("status") or "").strip() for t in sample)
 
 
 def _jira_cache_path(label: str) -> str:
@@ -539,6 +1035,7 @@ def _save_jira_cache(label: str, tickets: List[dict], jira_url: str,
         {
             "key":     t.get("key"),
             "summary": t.get("summary") or "",
+            "status":  t.get("status") or "",
             "ips":     t.get("ips") or [],
             "ports":   t.get("ports") or [],
             "cves":    t.get("cves") or [],
@@ -547,6 +1044,7 @@ def _save_jira_cache(label: str, tickets: List[dict], jira_url: str,
     ]
     try:
         _atomic_write_json(_jira_cache_path(label), {
+            "cache_version": _JIRA_CACHE_VERSION,
             "label":      label,
             "jira_url":   jira_url,
             "fetched_at": fetched_at,
@@ -575,13 +1073,23 @@ def _load_jira_cache_into_memory(label: str) -> bool:
     data = _read_jira_cache(label)
     if not data:
         return False
+    if data.get("cache_version", 1) < _JIRA_CACHE_VERSION:
+        log.info("Intake: Jira cache '%s' outdated — will rebuild for ticket statuses", label)
+        return False
     tickets = data.get("tickets") or []
-    title_index, cve_index = _index_from_tickets(tickets)
+    if not _cache_has_statuses(tickets):
+        log.info("Intake: Jira cache '%s' missing ticket statuses — will rebuild", label)
+        return False
+    title_index, cve_index, family_index, product_index = _index_from_tickets(tickets)
+    key_index = _key_index_from_tickets(tickets)
     with _INDEX_LOCK:
         _JIRA_INDEXES[label] = {
             "status":     "ready",
             "index":      title_index,
             "cve_index":  cve_index,
+            "family_index": family_index,
+            "product_index": product_index,
+            "key_index":  key_index,
             "count":      data.get("count", len(tickets)),
             "error":      None,
             "jira_url":   data.get("jira_url"),
@@ -608,12 +1116,17 @@ def _build_index(label: str) -> None:
         else:
             _JIRA_INDEXES[label] = {
                 "status": "loading", "index": {}, "cve_index": {},
+                "family_index": {}, "product_index": {},
                 "count": 0, "error": None,
             }
 
     try:
         _, session = m._get_client(label)
         jc = m._jira_for_label(label)
+        try:
+            jc._load_fields()
+        except Exception:
+            pass
 
         if session == "non_axian":
             jql = f'project = {label} ORDER BY created ASC'
@@ -624,7 +1137,8 @@ def _build_index(label: str) -> None:
             )
 
         tickets = jc.search_jql(jql)
-        title_index, cve_index = _index_from_tickets(tickets)
+        title_index, cve_index, family_index, product_index = _index_from_tickets(tickets)
+        key_index = _key_index_from_tickets(tickets)
         jira_url = jc.cfg.url.rstrip("/")
         fetched_at = time.time()
 
@@ -633,6 +1147,9 @@ def _build_index(label: str) -> None:
                 "status": "ready",
                 "index": title_index,
                 "cve_index": cve_index,
+                "family_index": family_index,
+                "product_index": product_index,
+                "key_index": key_index,
                 "count": len(tickets),
                 "error": None,
                 "jira_url": jira_url,
@@ -657,6 +1174,8 @@ def _build_index(label: str) -> None:
                 "status": "error",
                 "index": {},
                 "cve_index": {},
+                "family_index": {},
+                "product_index": {},
                 "count": 0,
                 "error": str(exc),
             }
@@ -845,6 +1364,49 @@ def intake_engagement_defaults(label: str):
     }
 
 
+@router.get("/api/intake/config/irrelevant")
+def intake_get_irrelevant():
+    """Return the list of vulnerability titles excluded from Intake."""
+    _load_irrelevant()
+    try:
+        with open(_IRRELEVANT_PATH, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        text = _DEFAULT_IRRELEVANT
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    return {"lines": lines, "count": len(lines)}
+
+
+@router.put("/api/intake/config/irrelevant")
+def intake_save_irrelevant(req: IrrelevantConfigRequest):
+    """Update the irrelevant-vulnerability exclusion list."""
+    global _IRRELEVANT_SET, _IRRELEVANT_LOADED
+    _ensure_cache_dirs()
+    body = "\n".join(ln.strip() for ln in req.lines if ln.strip()) + "\n"
+    try:
+        tmp = f"{_IRRELEVANT_PATH}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(body)
+        os.replace(tmp, _IRRELEVANT_PATH)
+    except OSError as exc:
+        raise HTTPException(500, f"Could not save irrelevant list: {exc}") from exc
+    _IRRELEVANT_SET = set()
+    _IRRELEVANT_LOADED = False
+    return {"ok": True, "count": len(_load_irrelevant())}
+
+
+@router.get("/api/intake/config/recommendations-status")
+def intake_recommendations_status():
+    """Report whether the curated recommendation library is loaded."""
+    lib = _load_recommendations()
+    return {
+        "loaded": bool(lib),
+        "count": len(lib),
+        "path": _RECOMMENDATIONS_PATH,
+        "seed_available": os.path.exists(_SEED_RECOMMENDATIONS),
+    }
+
+
 @router.post("/api/intake/{label}/pull")
 def intake_pull(label: str, req: PullRequest):
     """Pull selected Nessus scans in parallel, merge, dedup within the set."""
@@ -857,8 +1419,7 @@ def intake_pull(label: str, req: PullRequest):
         raise HTTPException(400, f"Unknown client: {label}")
     if not getattr(client_cfg, "nessus_access_key", None):
         raise HTTPException(400, f"Nessus keys not configured for {label}")
-    conn = conn_mod.get_connection(label)
-    if not conn:
+    if not conn_mod.get_connection(label):
         raise HTTPException(400, f"SSH not connected for '{label}' — connect in the Shell tab first")
 
     ak, sk = client_cfg.nessus_access_key, client_cfg.nessus_secret_key
@@ -867,38 +1428,64 @@ def intake_pull(label: str, req: PullRequest):
     cached_scans = 0
     pulled_scans = 0
 
-    # Sequential export — large Nessus CSV responses can corrupt parallel SSH
-    # channels (same issue as Assets pull). Slower but reliable. Each scan's
-    # parsed findings are cached on disk (keyed by scan + vector/actor) so a
-    # re-pull of the same scan is instant and skips the slow Nessus export.
-    for scan_id in req.scan_ids:
+    def _pull_one(conn, scan_id: int) -> dict:
         cached = None if req.force else _load_nessus_cache(label, scan_id, req.vector, req.actor)
         if cached:
             rows = cached.get("findings") or []
-            all_findings.extend(rows)
-            cached_scans += 1
             log.info("Intake pull: scan %d ('%s') → %d vuln rows (from cache)",
                      scan_id, cached.get("scan_name", ""), len(rows))
+            return {"rows": rows, "cached": True, "scan_name": cached.get("scan_name", "")}
+        log.info("Intake pull: exporting scan %d from Nessus%s…",
+                 scan_id, " (forced)" if req.force else "")
+        host_count = (req.scan_host_counts or {}).get(scan_id) or None
+        csv_text, sname = nc.export_scan_csv(conn, ak, sk, scan_id, host_count=host_count)
+        log.info("Intake pull: parsing scan %d ('%s')…", scan_id, sname)
+        rows = _parse_nessus_csv(
+            csv_text, vector=req.vector, actor=req.actor, conn=conn, ak=ak, sk=sk,
+        )
+        log.info("Intake pull: scan %d ('%s') → %d vuln rows", scan_id, sname, len(rows))
+        _save_nessus_cache(label, scan_id, req.vector, req.actor, sname, rows)
+        return {"rows": rows, "cached": False, "scan_name": sname}
+
+    try:
+        workers = conn_mod.nessus_parallel_workers(req.scan_ids, req.scan_host_counts)
+        if workers < conn_mod.NESSUS_PARALLEL_WORKERS:
+            log.info("Intake pull: large scan(s) detected — using %d parallel worker(s)", workers)
+        results = conn_mod.parallel_nessus_map(
+            m.cfg, label, req.scan_ids, _pull_one, max_workers=workers,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    for scan_id, result, err in results:
+        if err:
+            errors.append(f"Scan {scan_id}: {err}")
             continue
-        try:
-            csv_text, sname = nc.export_scan_csv(conn, ak, sk, scan_id)
-            rows = _parse_nessus_csv(
-                csv_text, vector=req.vector, actor=req.actor, conn=conn, ak=ak, sk=sk,
-            )
-            log.info("Intake pull: scan %d ('%s') → %d vuln rows", scan_id, sname, len(rows))
-            _save_nessus_cache(label, scan_id, req.vector, req.actor, sname, rows)
-            all_findings.extend(rows)
+        if not result:
+            continue
+        all_findings.extend(result["rows"])
+        if result["cached"]:
+            cached_scans += 1
+        else:
             pulled_scans += 1
-        except Exception as exc:
-            errors.append(f"Scan {scan_id}: {exc}")
 
     merged = _merge_dedup(all_findings)
 
-    # Apply engagement-level values
+    # Drop irrelevant titles (covers cached scans parsed before the list was updated)
+    before = len(merged)
+    merged = [f for f in merged if not _is_irrelevant(f.get("Vulnerability_Title", ""))]
+    excluded_irrelevant = before - len(merged)
+
+    # Apply engagement-level values and curated recommendations
     for f in merged:
         f["Impact_Type"] = req.impact_type
         f["Vector"]      = req.vector
         f["Actor"]       = req.actor
+        f["Recommendation"] = _enhance_recommendation(
+            f.get("Vulnerability_Title", ""),
+            f.get("OS", ""),
+            f.get("Recommendation", ""),
+        )
 
     # Add stable IDs and initial UI state
     for i, f in enumerate(merged):
@@ -910,6 +1497,7 @@ def intake_pull(label: str, req: PullRequest):
         "ok":           True,
         "total_raw":    len(all_findings),
         "total_merged": len(merged),
+        "excluded_irrelevant": excluded_irrelevant,
         "errors":       errors,
         "findings":     merged,
         "cached_scans": cached_scans,
@@ -941,38 +1529,48 @@ def intake_check_duplicates(label: str, req: CheckDupRequest):
 
     index = info.get("index") or {}
     cve_index = info.get("cve_index") or {}
+    family_index = info.get("family_index") or {}
+    product_index = info.get("product_index") or {}
+    key_index = info.get("key_index") or {}
     results = []
 
     for f in req.findings:
-        dup_key, match_kind = _match_finding_to_index(f, index, cve_index)
+        dup_key, match_kind, dup_status = _match_finding_to_index(
+            f, index, cve_index, family_index, product_index,
+        )
+        if dup_key and not dup_status:
+            dup_status = key_index.get(dup_key, "")
 
-        results.append({
-            "_id":          f.get("_id"),
-            "status":       "duplicate" if dup_key else "new",
-            "duplicate_of": dup_key,
-            "match_kind":   match_kind,
-        })
+        row = _classify_against_jira(dup_key, dup_status, match_kind)
+        results.append({"_id": f.get("_id"), **row})
 
-    new_ct  = sum(1 for r in results if r["status"] == "new")
-    dup_ct  = sum(1 for r in results if r["status"] == "duplicate")
+    new_ct        = sum(1 for r in results if r["status"] == "new")
+    dup_ct        = sum(1 for r in results if r["status"] == "duplicate")
+    recurrence_ct = sum(1 for r in results if r["status"] == "recurrence")
 
     return {
         "ok":                   True,
         "results":              results,
         "new_count":            new_ct,
         "duplicate_count":      dup_ct,
+        "recurrence_count":     recurrence_ct,
+        "exportable_count":     new_ct + recurrence_ct,
         "jira_tickets_checked": info.get("count", 0),
     }
 
 
 @router.post("/api/intake/export")
 def intake_export(req: ExportRequest):
-    """Export only the NEW (non-duplicate) findings as a properly formatted CSV."""
+    """Export findings as CSV. ``export_mode=new`` skips duplicates; ``all`` includes them."""
 
-    # Only export rows the user has marked as new (not duplicate)
-    to_export = [f for f in req.findings if f.get("_status") != "duplicate"]
+    if req.export_mode == "all":
+        to_export = list(req.findings)
+    elif req.export_mode == "selected":
+        to_export = list(req.findings)
+    else:
+        to_export = [f for f in req.findings if f.get("_status") != "duplicate"]
     if not to_export:
-        raise HTTPException(400, "No new findings to export")
+        raise HTTPException(400, "No findings to export")
 
     COLUMNS = [
         "Attachments", "Vulnerability_Title", "Vulnerability_Description",
@@ -982,7 +1580,11 @@ def intake_export(req: ExportRequest):
         "Risk_Value", "Project_Key", "Testers", "Date_Started", "Duration",
         "Test_Type", "Purchaser", "Customer", "Contact_Person",
         "Technical_Contact", "mUnit_ID",
+        "JIRA_Duplicate", "JIRA_Duplicate_Status",
+        "JIRA_Recurrence_Of", "JIRA_Previous_Status",
     ]
+    if req.export_mode == "all":
+        COLUMNS += ["Intake_Status", "JIRA_Key", "JIRA_Status"]
 
     META_COLS = [
         "Project_Key", "Testers", "Date_Started", "Duration", "Test_Type",
@@ -996,8 +1598,16 @@ def intake_export(req: ExportRequest):
     for idx, f in enumerate(to_export):
         row = {col: f.get(col, "") for col in COLUMNS}
         row["Attachments"] = ""
+        is_dup = f.get("_status") == "duplicate"
+        row["Intake_Status"] = f.get("_status") or "pending"
+        row["JIRA_Key"] = f.get("_duplicate_of") or ""
+        row["JIRA_Status"] = f.get("_duplicate_status") or ""
+        row["JIRA_Duplicate"] = "Yes" if is_dup else "No"
+        row["JIRA_Duplicate_Status"] = f.get("_duplicate_status") or ""
+        row["JIRA_Recurrence_Of"] = f.get("_recurrence_of") or ""
+        row["JIRA_Previous_Status"] = f.get("_previous_jira_status") or ""
 
-        if idx == 0:
+        if idx == 0 and req.export_mode not in ("all", "selected"):
             # First row carries all engagement metadata
             row["Project_Key"]       = req.project_key
             row["Testers"]           = req.tester
@@ -1009,16 +1619,118 @@ def intake_export(req: ExportRequest):
             row["Contact_Person"]    = req.contact_person
             row["Technical_Contact"] = req.technical_contact
             row["mUnit_ID"]          = req.munit_id
-        else:
+        elif req.export_mode not in ("all", "selected"):
             for col in META_COLS:
                 row[col] = ""
 
         writer.writerow(row)
 
     buf.seek(0)
-    fname = f"intake_{date.today().isoformat()}.csv"
+    suffix = {"all": "full", "selected": "selected"}.get(req.export_mode, "new")
+    fname = f"intake_{suffix}_{date.today().isoformat()}.csv"
     return StreamingResponse(
         io.BytesIO(buf.getvalue().encode("utf-8-sig")),   # UTF-8 BOM for Excel
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={fname}"},
     )
+
+
+def _intake_exportable(f: dict) -> bool:
+    """Rows we can upload or create in Jira (same rule as CSV export, minus already created)."""
+    if f.get("_jira_key"):
+        return False
+    return f.get("_status") != "duplicate"
+
+
+def _intake_pick_for_create(findings: List[dict], mode: str) -> List[dict]:
+    if mode == "selected":
+        pool = list(findings)
+    else:
+        pool = [f for f in findings if _intake_exportable(f)]
+    return [f for f in pool if _intake_exportable(f)]
+
+
+@router.post("/api/intake/{label}/create-jira")
+def intake_create_jira(label: str, req: CreateJiraRequest):
+    """Create Jira issues directly from Intake findings (NEW + REOPEN only)."""
+    from . import main as m
+    from .intake_jira import build_intake_issue_fields
+
+    if not m.cfg:
+        raise HTTPException(400, "App not configured yet")
+    client_cfg = m._find_client(label)
+    if not client_cfg:
+        raise HTTPException(400, f"Unknown client: {label}")
+
+    to_create = _intake_pick_for_create(req.findings, req.create_mode)
+    if not to_create:
+        raise HTTPException(400, "No exportable findings to create in Jira")
+
+    jira_client = m._jira_for_label(label)
+    _, session = m._get_client(label)
+    is_v3 = session == "axian"
+    default_project = label if session == "non_axian" else m.cfg.jira.project
+    project_key = (req.project_key or default_project).strip()
+    if not project_key:
+        raise HTTPException(400, "Project key is required")
+
+    engagement = {
+        "test_type": req.test_type,
+        "duration": req.duration,
+        "tester": req.tester,
+        "date_started": req.date_started,
+        "purchaser": req.purchaser,
+        "customer": req.customer or client_cfg.name,
+        "contact_person": req.contact_person,
+        "technical_contact": req.technical_contact,
+        "munit_id": req.munit_id or label,
+    }
+
+    jira_url = jira_client.cfg.url.rstrip("/")
+    results: List[dict] = []
+    created = 0
+    failed = 0
+
+    for f in to_create:
+        fid = f.get("_id")
+        try:
+            row = dict(f)
+            row.setdefault("Impact_Type", req.impact_type)
+            row.setdefault("Vector", req.vector)
+            row.setdefault("Actor", req.actor)
+            row["Recommendation"] = _enhance_recommendation(
+                row.get("Vulnerability_Title", ""),
+                row.get("OS", ""),
+                row.get("Recommendation", ""),
+            )
+            fields = build_intake_issue_fields(
+                jira_client,
+                row,
+                engagement,
+                project_key=project_key,
+                client_label=label,
+                tag_client_label=is_v3,
+                is_v3=is_v3,
+            )
+            key = jira_client.create_issue(fields)
+            created += 1
+            results.append({
+                "_id": fid,
+                "ok": True,
+                "jira_key": key,
+                "jira_url": f"{jira_url}/browse/{key}",
+                "recurrence_of": row.get("_recurrence_of"),
+            })
+        except Exception as exc:
+            failed += 1
+            log.warning("Intake create-jira failed for _id=%s: %s", fid, exc)
+            results.append({"_id": fid, "ok": False, "error": str(exc)})
+
+    return {
+        "ok": created > 0 or failed == 0,
+        "created": created,
+        "failed": failed,
+        "results": results,
+        "jira_url": jira_url,
+        "project_key": project_key,
+    }

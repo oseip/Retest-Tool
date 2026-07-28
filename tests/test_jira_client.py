@@ -413,3 +413,20 @@ class TestSeverityJqlField:
     def test_is_consistent_regardless_of_loaded_fields(self):
         client = make_client(fields={"severity": "customfield_10050"})
         assert client.severity_jql_field == 'cf[10050]'
+
+
+class TestCreateIssue:
+    def test_create_issue_returns_key(self):
+        client = make_client()
+        mock_resp = MagicMock()
+        mock_resp.ok = True
+        mock_resp.json.return_value = {"key": "TEST-999"}
+        client._session.post.return_value = mock_resp
+
+        key = client.create_issue({"project": {"key": "TEST"}, "summary": "Foo"})
+
+        assert key == "TEST-999"
+        client._session.post.assert_called_once()
+        args, kwargs = client._session.post.call_args
+        assert args[0].endswith("/rest/api/3/issue")
+        assert kwargs["json"]["fields"]["summary"] == "Foo"

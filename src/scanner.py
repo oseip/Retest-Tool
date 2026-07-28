@@ -93,7 +93,21 @@ def _client_sudo_nmap(cfg: Optional[Config], client_label: str) -> bool:
 
 
 def _nmap_cmd_prefix(rule, sudo_nmap: bool) -> str:
-    return "sudo nmap" if (rule.requires_root or sudo_nmap) else "nmap"
+    # Kali nmap is typically setuid — UDP scans work without sudo. Only prepend
+    # sudo when the client opts in; sudo -n avoids hanging on a password prompt
+    # in non-interactive SSH sessions.
+    if sudo_nmap:
+        return "sudo -n nmap"
+    return "nmap"
+
+
+def _insert_nmap_pn_flag(command: str) -> str:
+    """Insert -Pn immediately after the nmap binary in a scan command."""
+    for binary in ("sudo -n nmap", "sudo nmap", "nmap"):
+        token = binary + " "
+        if command.startswith(token):
+            return f"{binary} -Pn " + command[len(token):]
+    return command
 
 
 def _build_triage_command(
@@ -344,7 +358,12 @@ def _local_exec_stream(command: str, emit, timeout: int = 600, stop_event=None) 
 
 def run_scan(job_id: str, cfg: Config):
     """Run a single scan job. Called sequentially by the per-client worker."""
-    job = JOBS[job_id]
+    with _lock:
+        job = JOBS.get(job_id)
+    if job is None:
+        # Removed while queued (transitioned in Jira, deleted, or stop-all).
+        log.info("Scan skipped: job %s no longer exists", job_id)
+        return
     client_label = job["client_label"]
     all_clients = list(cfg.clients) + list(cfg.clients_secondary or [])
     client_cfg = next((c for c in all_clients if c.label == client_label), None)
@@ -480,12 +499,7 @@ def run_scan(job_id: str, cfg: Config):
                 emit("")
                 emit("[NMAP] ⚠  Host appears to be blocking ICMP ping — retrying with -Pn ...")
                 emit("")
-                # Insert -Pn immediately after the nmap binary name
-                _orig = job["nmap_command"]
-                if _orig.startswith("sudo nmap "):
-                    _pn_cmd = "sudo nmap -Pn " + _orig[len("sudo nmap "):]
-                else:
-                    _pn_cmd = "nmap -Pn " + _orig[len("nmap "):]
+                _pn_cmd = _insert_nmap_pn_flag(job["nmap_command"])
 
                 # Reset XML collector so the retry result is clean
                 _collecting_xml[0] = False
@@ -520,6 +534,29 @@ def run_scan(job_id: str, cfg: Config):
         _sep = "─" * 70
         _parts = all_lines.split(_sep, 1)
         text_output = _parts[1].strip() if len(_parts) > 1 else all_lines
+
+        _scan_lower = text_output.lower()
+        if any(p in _scan_lower for p in (
+            "password is required",
+            "a terminal is required to read the password",
+            "sorry, a password is required",
+        )):
+            verdict, reason = (
+                "inconclusive",
+                "sudo password required on Kali — configure passwordless sudo for nmap "
+                "or disable 'sudo nmap' in client settings (setuid nmap usually works)",
+            )
+            emit("")
+            emit("─" * 70)
+            emit(f"[VERDICT] {verdict.upper().replace('_', ' ')}")
+            emit(f"[REASON]  {reason}")
+            with _lock:
+                JOBS[job_id]["verdict"] = verdict
+                JOBS[job_id]["verdict_reason"] = reason
+                JOBS[job_id]["status"] = "completed"
+                JOBS[job_id]["completed_at"] = datetime.utcnow().isoformat()
+            _app_log(f"Scan complete: {job['ticket_key']} → {verdict} ({reason})")
+            return
 
         if rule and rule.parse:
             ticket_desc = job.get("ticket_description", "")
@@ -569,7 +606,11 @@ def run_triage(job_id: str, cfg: Config):
     vulnerable port still looks open before committing to a full scan. Lets a
     sweep surface likely-already-fixed tickets in seconds instead of minutes,
     without needing the post-scan PTY cooldown."""
-    job = JOBS[job_id]
+    with _lock:
+        job = JOBS.get(job_id)
+    if job is None:
+        log.info("Triage skipped: job %s no longer exists", job_id)
+        return
     client_label = job["client_label"]
     cmd = job.get("triage_command")
     if cfg:
@@ -667,7 +708,13 @@ def _scan_worker(client_label: str, scan_q: _queue.Queue, triage_q: _queue.Queue
                 run_scan(job_id, cfg)
                 did_scan = True
         except Exception:
-            pass
+            # run_scan/run_triage record their own failures, so reaching here
+            # means something escaped them — never let it vanish silently.
+            log.exception("Scan worker crashed handling job %s (%s)", job_id, kind)
+            with _lock:
+                if job_id in JOBS:
+                    JOBS[job_id]["status"] = "error"
+                    JOBS[job_id].setdefault("error", "Internal scan worker error")
         finally:
             (scan_q if kind == "scan" else triage_q).task_done()
         if did_scan:
@@ -747,12 +794,13 @@ def _sweep_driver(client_label: str, cfg: Config, stop_event: threading.Event):
         _app_log(f"[Sweep Driver] {client_label}: Waiting for job {job_id} to finish...")
         # Wait for this job to finish before queuing the next.
         while True:
-            if stop_event.is_set():
-                break
-            time.sleep(1)
             with _lock:
                 status = JOBS.get(job_id, {}).get("status")
             if status not in ("queued", "scanning"):
+                break
+            # Check before sleeping (a fast job shouldn't cost a full second)
+            # and wait on the event so "Stop Sweep" takes effect immediately.
+            if stop_event.wait(0.25):
                 break
         _app_log(f"[Sweep Driver] {client_label}: Job {job_id} finished with status {status}")
 

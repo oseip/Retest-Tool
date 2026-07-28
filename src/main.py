@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from .config import load_config
 from .jira_client import JiraClient
@@ -731,8 +732,11 @@ async def transition_ticket(
     try:
         # Transition first, then comment — so we never leave a "verified fixed"
         # comment on a ticket whose transition actually failed.
-        jira_client.transition(ticket_key, to_status)
-        _apply_transition_comment(
+        # Both are blocking HTTP calls; off the event loop so they don't stall
+        # live scan streams and every other request for seconds.
+        await run_in_threadpool(jira_client.transition, ticket_key, to_status)
+        await run_in_threadpool(
+            _apply_transition_comment,
             jira_client, ticket_key, comment,
             screenshot_bytes, screenshot_name, screenshot_mime,
         )
@@ -796,8 +800,13 @@ async def fast_track_ticket(
     effective_target = target if at_remediated else retest_status
 
     try:
-        completed = jira_client.fast_track(ticket_key, effective_target, comment="")
-        _apply_transition_comment(
+        # fast_track walks a transition chain (4-8 sequential HTTP round trips);
+        # keep it off the event loop.
+        completed = await run_in_threadpool(
+            jira_client.fast_track, ticket_key, effective_target, "",
+        )
+        await run_in_threadpool(
+            _apply_transition_comment,
             jira_client, ticket_key, comment,
             screenshot_bytes, screenshot_name, screenshot_mime,
         )
@@ -1137,6 +1146,26 @@ def transition_bulk():
 # ── Monthly Report ─────────────────────────────────────────────────────────
 
 _report_cache: dict = {}   # (client, month) → result; past months never change
+_REPORT_CACHE_MAX = 64
+
+
+def _report_is_complete(results: dict, *sections: dict) -> bool:
+    """True only if every JQL count and section succeeded.
+
+    A failed count comes back as -1. Since past periods are cached forever, a
+    single transient Jira failure would otherwise pin wrong numbers in place
+    until the process restarts.
+    """
+    if any(v == -1 for v in results.values()):
+        return False
+    return not any(section.get("error") for section in sections)
+
+
+def _cache_report(cache: dict, key, report: dict) -> None:
+    """Store a report, evicting the oldest entry once the cache is full."""
+    if key not in cache and len(cache) >= _REPORT_CACHE_MAX:
+        cache.pop(next(iter(cache)), None)
+    cache[key] = report
 
 
 # Jira statuses that mean the vulnerability is resolved/fixed.
@@ -1313,7 +1342,8 @@ def generate_report(client: str, month: str):
         },
         "total_fixed_to_date": results["total_fixed"],
     }
-    _report_cache[cache_key] = report
+    if _report_is_complete(results, new_vulnerabilities, os_breakdown):
+        _cache_report(_report_cache, cache_key, report)
     return report
 
 
@@ -1462,11 +1492,31 @@ def generate_weekly_report(client: str, day: str):
         },
         "total_fixed_to_date": results["total_fixed"],
     }
-    _weekly_report_cache[cache_key] = report
+    if _report_is_complete(results, new_vulnerabilities, os_breakdown):
+        _cache_report(_weekly_report_cache, cache_key, report)
     return report
 
 
 # ── Duplicate ticket detection ─────────────────────────────────────────────
+
+_DUP_SKIP_AFFECTED_TESTTYPES = frozenset({"IPT", "SCN", "EPT"})
+
+
+def _duplicate_group_key(t: dict) -> Optional[tuple]:
+    """Return grouping key for duplicate detection, or None if not groupable."""
+    ip = (t.get("ips") or [""])[0].strip()
+    port = (t.get("ports") or [""])[0].strip()
+    summary = (t.get("summary") or "").strip().lower()
+    if not ip or not summary:
+        return None
+    testtype = (t.get("testtype") or "").strip().upper()
+    # Network scans (IPT/SCN/EPT) — and legacy scan tickets missing TestType but
+    # carrying a port label — match on IP + title + port only.
+    if testtype in _DUP_SKIP_AFFECTED_TESTTYPES or (not testtype and port):
+        return (ip, summary, port, "")
+    affected = (t.get("affected_system") or "").strip().lower()
+    return (ip, summary, port, affected)
+
 
 def _key_num(key: str) -> int:
     """Extract numeric part of a Jira key for chronological sorting."""
@@ -1518,9 +1568,11 @@ def debug_jira_fields(client: str, ticket: str = ""):
 @app.get("/api/duplicates")
 def find_duplicates(client: str):
     """
-    Fetch all active (non-closed) tickets for a client and group by
-    (first_ip, summary, first_port).  Returns only groups with 2+ tickets.
-    Within each group the lowest-numbered key is the recommended keep.
+    Fetch all tickets for a client (any status) and group by IP + summary + port.
+    Affected System is included in the key for non-network TestTypes only (WEB,
+    API, etc.). IPT, SCN, and EPT (plus legacy scan tickets with a port label
+    but no TestType) ignore Affected System because it is often blank on re-uploads.
+    Returns only groups with 2+ tickets.  Lowest-numbered key = recommended keep.
     """
     from collections import defaultdict
 
@@ -1528,15 +1580,10 @@ def find_duplicates(client: str):
     jira_client = _jira_for_label(client)
 
     if client_session == "non_axian":
-        jql = (
-            f'project = {client} '
-            f'AND status NOT IN (Fixed, "Risk Accepted", Closed, Done) '
-            f'ORDER BY created ASC'
-        )
+        jql = f'project = {client} ORDER BY created ASC'
     else:
         jql = (
             f'project = {cfg.jira.project} AND labels = "{client}" '
-            f'AND status NOT IN (Fixed, "Risk Accepted", Closed, Done) '
             f'ORDER BY created ASC'
         )
 
@@ -1545,21 +1592,18 @@ def find_duplicates(client: str):
     except Exception as exc:
         raise HTTPException(500, f"Failed to fetch tickets: {exc}")
 
-    # Group by (first IP, normalised summary, first port, affected_system)
+    # Group by IP + summary + port (+ affected system for non-scan TestTypes)
     groups: dict = defaultdict(list)
     for t in tickets:
-        ip      = (t.get("ips")   or [""])[0].strip()
-        port    = (t.get("ports") or [""])[0].strip()
-        summary = (t.get("summary") or "").strip().lower()
-        affected_system = (t.get("affected_system") or "").strip()
-        if not ip or not summary:
-            continue   # can't reliably detect duplicates without at least IP + name
-        groups[(ip, summary, port, affected_system)].append(t)
+        key = _duplicate_group_key(t)
+        if key is None:
+            continue
+        groups[key].append(t)
 
     jira_base_url = jira_client.cfg.url.rstrip("/")
 
     duplicate_groups = []
-    for (ip, summary, port, affected_system), members in groups.items():
+    for (ip, summary, port, _affected), members in groups.items():
         if len(members) < 2:
             continue
         # Oldest key first = recommended keep
@@ -1611,10 +1655,11 @@ def export_duplicates_excel(req: ExportDuplicatesRequest):
     ws.title = "Duplicates"
 
     headers = [
-        "Summary", "IP Address", 
-        "Issue Key (New)", "Issue Key (old)", 
-        "Status (New)", "Status (Old)", 
-        "Technology (New)", "Technology (Old)", 
+        "Summary", "IP Address",
+        "Issue Key (New)", "Issue Key (old)",
+        "Status (New)", "Status (Old)",
+        "Affected System (New)", "Affected System (Old)",
+        "Technology (New)", "Technology (Old)",
         "Port(New)", "Port (Old)"
     ]
     ws.append(headers)
@@ -1643,6 +1688,8 @@ def export_duplicates_excel(req: ExportDuplicatesRequest):
                 old_t.get("key", ""),
                 _get(t, "status"),
                 _get(old_t, "status"),
+                _get(t, "affected_system"),
+                _get(old_t, "affected_system"),
                 _get(t, "technology"),
                 _get(old_t, "technology"),
                 _get(t, "ports"),
@@ -2119,7 +2166,12 @@ def sweep_run(label: str, body: Optional[SweepRunRequest] = None):
             # Apply rule filter (only relevant to auto-scan tickets)
             if filter_set and rule and rule.name not in filter_set:
                 continue
-            scanner.SEEN_KEYS.add(key)
+            # Claim the key atomically — the poller mutates SEEN_KEYS from its
+            # own thread, so an unlocked check-then-add can queue a duplicate.
+            with scanner._lock:
+                if key in scanner.SEEN_KEYS:
+                    continue
+                scanner.SEEN_KEYS.add(key)
             is_manual = rule is None
             job_id = scanner._queue_ticket(ticket, label, source="sweep", manual=is_manual, session=client_session, cfg=cfg)
             if is_manual:
@@ -2258,6 +2310,7 @@ def save_assets(label: str, req: AssetListRequest):
 
 class NessusPullRequest(BaseModel):
     scan_ids: List[int]
+    scan_host_counts: Dict[int, int] = {}
 
 
 class NessusFetchKeysRequest(BaseModel):
@@ -2331,18 +2384,24 @@ def nessus_host_count(label: str, req: NessusPullRequest):
     client_cfg = _find_client(label)
     if not client_cfg:
         raise HTTPException(400, f"Unknown client: {label}")
-    conn = connections.get_connection(label)
-    if not conn:
+    if not connections.get_connection(label):
         raise HTTPException(400, f"SSH not connected for '{label}'")
     from . import nessus_client as nc
-    total = 0
-    for scan_id in req.scan_ids:
-        try:
-            total += nc.get_scan_host_count(
-                conn, client_cfg.nessus_access_key, client_cfg.nessus_secret_key, scan_id
-            )
-        except Exception:
-            pass
+
+    ak, sk = client_cfg.nessus_access_key, client_cfg.nessus_secret_key
+
+    def _count_one(conn, scan_id: int) -> int:
+        return nc.get_scan_host_count(conn, ak, sk, scan_id)
+
+    try:
+        workers = connections.nessus_parallel_workers(req.scan_ids, req.scan_host_counts)
+        results = connections.parallel_nessus_map(
+            cfg, label, req.scan_ids, _count_one, max_workers=workers,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    total = sum((result or 0) for _scan_id, result, err in results if not err)
     return {"total_hosts": total}
 
 
@@ -2354,27 +2413,38 @@ def nessus_pull(label: str, req: NessusPullRequest):
         raise HTTPException(400, f"Unknown client: {label}")
     if not getattr(client_cfg, "nessus_access_key", None):
         raise HTTPException(400, f"Nessus API keys not configured for {label}")
-    conn = connections.get_connection(label)
-    if not conn:
+    if not connections.get_connection(label):
         raise HTTPException(400, f"SSH not connected for '{label}' — connect in the SSH panel first")
     from . import nessus_client as nc, assets as assets_mod
 
+    ak, sk = client_cfg.nessus_access_key, client_cfg.nessus_secret_key
     all_hosts: list = []
     errors: list = []
 
-    # Sequential fetch: large Nessus scan responses (1 MB+) can cause one channel
-    # to flood the SSH transport, corrupting a parallel channel's data stream.
-    # Sequential is slower but eliminates that interference entirely.
-    for scan_id in req.scan_ids:
-        try:
-            hosts, warning = nc.get_scan_hosts(
-                conn, client_cfg.nessus_access_key, client_cfg.nessus_secret_key, scan_id
-            )
-            all_hosts.extend(hosts)
-            if warning:
-                errors.append(warning)
-        except Exception as exc:
-            errors.append(f"Scan {scan_id}: {exc}")
+    def _pull_hosts(conn, scan_id: int):
+        host_count = (req.scan_host_counts or {}).get(scan_id) or None
+        return nc.get_scan_hosts(conn, ak, sk, scan_id, host_count=host_count)
+
+    try:
+        workers = connections.nessus_parallel_workers(req.scan_ids, req.scan_host_counts)
+        if workers < connections.NESSUS_PARALLEL_WORKERS:
+            log.info("Assets pull: large scan(s) detected — using %d parallel worker(s)", workers)
+        results = connections.parallel_nessus_map(
+            cfg, label, req.scan_ids, _pull_hosts, max_workers=workers,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    for scan_id, result, err in results:
+        if err:
+            errors.append(f"Scan {scan_id}: {err}")
+            continue
+        if not result:
+            continue
+        hosts, warning = result
+        all_hosts.extend(hosts)
+        if warning:
+            errors.append(warning)
 
     asset_data = assets_mod.load_asset_list(label)
     result = assets_mod.cross_reference(asset_data["entries"], all_hosts)
@@ -2408,27 +2478,37 @@ def nessus_export(label: str, req: NessusExportRequest):
         raise HTTPException(400, f"Unknown client: {label}")
     if not getattr(client_cfg, "nessus_access_key", None):
         raise HTTPException(400, f"Nessus API keys not configured for {label}")
-    conn = connections.get_connection(label)
-    if not conn:
+    if not connections.get_connection(label):
         raise HTTPException(400, f"SSH not connected for '{label}' — connect in the SSH panel first")
     from . import nessus_client as nc
+
+    ak, sk = client_cfg.nessus_access_key, client_cfg.nessus_secret_key
+
+    def _export_one(conn_for_worker, scan_id: int):
+        return nc.export_scan_csv(conn_for_worker, ak, sk, scan_id)
+
+    try:
+        workers = connections.nessus_parallel_workers(req.scan_ids)
+        results = connections.parallel_nessus_map(
+            cfg, label, req.scan_ids, _export_one, max_workers=workers,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     zip_buf = io.BytesIO()
     errors = []
     succeeded = 0
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for scan_id in req.scan_ids:
-            try:
-                csv_text, scan_name = nc.export_scan_csv(
-                    conn, client_cfg.nessus_access_key, client_cfg.nessus_secret_key, scan_id
-                )
-                safe_name = re.sub(r"[^\w\s\-]", "_", scan_name).strip() or f"scan_{scan_id}"
-                zf.writestr(f"{safe_name}_{scan_id}.csv", csv_text.encode("utf-8"))
-                scanner._app_log(f"[Export] {label}: exported '{scan_name}' (scan {scan_id})")
-                succeeded += 1
-            except Exception as exc:
-                errors.append(f"Scan {scan_id}: {exc}")
-                log.warning("CSV export failed for scan %s: %s", scan_id, exc)
+        for scan_id, result, err in results:
+            if err or not result:
+                errors.append(f"Scan {scan_id}: {err or 'no data returned'}")
+                log.warning("CSV export failed for scan %s: %s", scan_id, err)
+                continue
+            csv_text, scan_name = result
+            safe_name = re.sub(r"[^\w\s\-]", "_", scan_name).strip() or f"scan_{scan_id}"
+            zf.writestr(f"{safe_name}_{scan_id}.csv", csv_text.encode("utf-8"))
+            scanner._app_log(f"[Export] {label}: exported '{scan_name}' (scan {scan_id})")
+            succeeded += 1
 
     # Even an empty ZipFile has a non-zero EOCD record, so tell()==0 never fires.
     # Check the actual count of exported files instead.

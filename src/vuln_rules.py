@@ -11,6 +11,7 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime
+from functools import lru_cache
 from typing import Callable, List, Optional, Tuple
 
 Verdict = str
@@ -2172,6 +2173,24 @@ def _parse_dns_cache(text: str, xml: str, description: str = "") -> Tuple[Verdic
     return "inconclusive", "DNS port closed/filtered or not detected"
 
 
+def _parse_mdns(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
+    """Retest Nessus mDNS / Bonjour / ZeroConf findings on UDP 5353."""
+    if _host_down(text):
+        return "inconclusive", "Host unreachable"
+    if _port_closed(text, 5353):
+        return "fixed", "mDNS port 5353 closed or filtered"
+    low = text.lower()
+    if "5353/udp closed" in low or "5353/udp filtered" in low:
+        return "fixed", "UDP 5353 closed or filtered"
+    if "dns-service-discovery" in low:
+        if ".local" in low or "._tcp" in low or "._udp" in low or "mdns hostname" in low:
+            return "not_fixed", "mDNS/Bonjour still responding — restrict UDP 5353 if not required"
+        return "fixed", "UDP 5353 open but no mDNS service records discovered"
+    if "5353/udp open" in low or "zeroconf" in low or "mdns" in low or "bonjour" in low:
+        return "not_fixed", "mDNS service still detected on UDP 5353"
+    return "inconclusive", "Could not determine mDNS status — verify UDP 5353 manually"
+
+
 def _parse_ntp(text: str, xml: str, description: str = "") -> Tuple[Verdict, str]:
     if _host_down(text):
         return "inconclusive", "Host unreachable"
@@ -4045,6 +4064,20 @@ RULES: List[VulnRule] = [
         default_port=5672,
         parse=_parse_amqp,
     ),
+    VulnRule(
+        name="mDNS Detection (Remote Network)",
+        patterns=[
+            r"mdns detection",
+            r"mdns.*remote network",
+            r"bonjour.*zero",
+            r"zeroconf.*protocol",
+        ],
+        nmap_script="dns-service-discovery",
+        extra_args="-sU -Pn -T4 --max-retries 1 --host-timeout 30s --script-timeout 20s",
+        default_port=5353,
+        parse=_parse_mdns,
+        requires_root=True,
+    ),
     # Disabled: overlaps MANUAL_ONLY_RULES — dns-cache-snoop is slow/unreliable on UDP 53.
     # VulnRule(
     #     name="DNS Server Cache Snooping",
@@ -4537,17 +4570,33 @@ MANUAL_ONLY_RULES = [
     r"zookeeper",          # requires 4lw (`echo stat | nc host 2181`) over raw TCP
 ]
 
+def _compile_alternation(patterns: List[str]) -> "re.Pattern":
+    """Combine patterns into one regex. Each is wrapped so its own alternation,
+    anchors and quantifiers stay scoped to that pattern."""
+    return re.compile("|".join(f"(?:{p})" for p in patterns))
+
+
+# Compiled once at import. The rules table holds 550+ distinct patterns, which is
+# more than re's internal cache (512), so matching with raw strings recompiled
+# almost every pattern on every call.
+_MANUAL_ONLY_RE = _compile_alternation(MANUAL_ONLY_RULES)
+_COMPILED_RULES: List[Tuple["re.Pattern", VulnRule]] = [
+    (_compile_alternation(rule.patterns), rule) for rule in RULES if rule.patterns
+]
+
+
+@lru_cache(maxsize=4096)
+def _match_lowered(low: str) -> Optional[VulnRule]:
+    # Fast-fail for explicitly manual rules
+    if _MANUAL_ONLY_RE.search(low):
+        return None
+
+    for regex, rule in _COMPILED_RULES:
+        if regex.search(low):
+            return rule
+    return None
+
+
 def match_rule(summary: str) -> Optional[VulnRule]:
     """Return the first matching VulnRule for a given ticket summary."""
-    low = summary.lower()
-    
-    # Fast-fail for explicitly manual rules
-    for pattern in MANUAL_ONLY_RULES:
-        if re.search(pattern, low):
-            return None
-
-    for rule in RULES:
-        for pattern in rule.patterns:
-            if re.search(pattern, low):
-                return rule
-    return None
+    return _match_lowered(summary.lower())

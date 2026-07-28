@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Nemesis</title>
-  <link rel="stylesheet" href="/static/style.css?v=19">
+  <link rel="stylesheet" href="/static/style.css?v=26">
   <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
 </head>
 <body>
@@ -353,26 +353,30 @@
   </div>
 
   <!-- INTAKE VIEW -->
-  <div id="intakeView" style="display:none;flex:1;overflow-y:auto;padding:24px 32px;background:var(--bg);flex-direction:column;">
+  <div id="intakeView" class="intake-view" style="display:none">
 
-    <!-- Row 1: Client + Jira status -->
-    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:18px">
+    <div class="intake-page-head">
+      <h2 class="intake-page-title">Intake Pipeline</h2>
+      <p class="intake-page-desc">Pull Nessus scans, deduplicate against Jira, export upload-ready CSV.</p>
+    </div>
+
+    <!-- Client + Jira status -->
+    <div class="intake-top-row">
       <div>
         <label class="report-label">Client</label>
         <select id="intakeClient" class="report-select" onchange="onIntakeClientChange()"></select>
       </div>
-      <div id="intakeJiraBar" style="display:flex;align-items:center;gap:6px;font-size:12px;padding-top:18px">
+      <div id="intakeJiraBar" class="intake-jira-bar">
         <span id="intakeJiraIcon"></span>
-        <span id="intakeJiraTxt" style="color:var(--text-dim)"></span>
+        <span id="intakeJiraTxt"></span>
         <button type="button" id="intakeJiraRefreshBtn" onclick="intakeRefreshJira()"
-          title="Fetch the latest tickets from Jira now"
-          style="display:none;margin-left:6px;background:none;border:none;color:var(--blue);cursor:pointer;font-size:12px;padding:0">↻ Refresh</button>
+          title="Fetch the latest tickets from Jira now" class="intake-link-btn">↻ Refresh</button>
       </div>
     </div>
 
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+    <div class="intake-main-grid">
 
-      <!-- LEFT: Engagement settings -->
+      <!-- Engagement settings -->
       <div class="report-card" style="padding:16px">
         <div class="report-card-header">Engagement Settings</div>
         <div class="report-card-body" style="padding-top:12px;display:flex;flex-direction:column;gap:10px">
@@ -444,28 +448,25 @@
         </div>
       </div>
 
-      <!-- RIGHT: Nessus scan picker -->
+      <!-- Nessus scan picker -->
       <div class="report-card" style="padding:16px">
         <div class="report-card-header">Nessus Scans</div>
         <div class="report-card-body" style="padding-top:10px">
           <p style="font-size:11px;color:var(--text-dim);margin-bottom:8px">
-            SSH must be connected for this client. Tick folders to expand their scans, then tick the scans to pull.
+            SSH must be connected. Tick folders to expand their scans, then tick the scans to pull.
           </p>
           <div style="margin-bottom:8px">
             <button class="btn btn-secondary btn-sm" onclick="_intakeLoadFolders()">↻ Load Folders</button>
           </div>
-          <div id="intakeFolderList"
-            style="max-height:120px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:6px;background:var(--bg3);font-size:12px;margin-bottom:8px">
-            <span style="color:var(--text-dim)">Click "Load Folders" to begin</span>
+          <div id="intakeFolderList" class="intake-picker-list">
+            <span class="intake-placeholder">Click "Load Folders" to begin</span>
           </div>
-          <div id="intakeScanList"
-            style="max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:6px;background:var(--bg3);font-size:11px;margin-bottom:12px">
-            <span style="color:var(--text-dim)">Check a folder to see its scans</span>
+          <div id="intakeScanList" class="intake-picker-list intake-scan-list">
+            <span class="intake-placeholder">Check a folder to see its scans</span>
           </div>
-          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:4px">
             <button class="btn btn-primary btn-sm" id="intakePullBtn" onclick="intakePull()" disabled>⬇ Pull Scan</button>
             <button class="btn btn-secondary btn-sm" id="intakeCheckBtn" onclick="intakeCheckDuplicates()" disabled>🔍 Check Jira</button>
-            <button class="btn btn-primary btn-sm" id="intakeExportBtn" onclick="intakeExport()" disabled>⬇ Export New Findings</button>
           </div>
           <label style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:11px;color:var(--text-dim);cursor:pointer">
             <input type="checkbox" id="intakeForcePull">
@@ -476,34 +477,103 @@
 
     </div>
 
-    <!-- Status + summary bar -->
+    <!-- Excluded vulnerabilities -->
+    <div class="report-card" style="padding:16px;margin-top:16px">
+      <div class="report-card-header">Excluded Vulnerabilities</div>
+      <div class="report-card-body" style="padding-top:10px">
+        <p style="font-size:11px;color:var(--text-dim);margin:0 0 8px">
+          One title per line — findings matching these names are dropped during pull and never exported.
+        </p>
+        <textarea id="intakeIrrelevantList" rows="5" class="text-input"
+          style="width:100%;font-size:11px;font-family:var(--mono);resize:vertical"></textarea>
+        <div style="margin-top:8px">
+          <button type="button" class="btn btn-secondary btn-sm" onclick="intakeSaveIrrelevant()">Save Exclusion List</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Status + summary -->
     <div style="margin-top:14px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">
       <span id="intakeStatus" style="font-size:12px;color:var(--text-dim)"></span>
       <span id="intakeSummaryBar" style="font-size:12px;font-weight:600;color:var(--text)"></span>
     </div>
 
-    <!-- Filter + search (shown once findings are loaded) -->
+    <!-- Hidden stat hooks for JS counters -->
+    <span id="intakeStatTotal" style="display:none"></span>
+    <span id="intakeStatNew" style="display:none"></span>
+    <span id="intakeStatDup" style="display:none"></span>
+    <span id="intakeStatSelected" style="display:none"></span>
+
+    <!-- Filter + search -->
     <div id="intakeFilterBar" class="intake-filter-bar" style="display:none;margin-top:12px">
       <div class="intake-filter-group">
         <button type="button" class="intake-filter-pill active" data-filter="all" onclick="setIntakeFilter('all')">All <span class="intake-pill-count">0</span></button>
         <button type="button" class="intake-filter-pill" data-filter="new" onclick="setIntakeFilter('new')">New <span class="intake-pill-count">0</span></button>
+        <button type="button" class="intake-filter-pill" data-filter="recurrence" onclick="setIntakeFilter('recurrence')">Reopen <span class="intake-pill-count">0</span></button>
         <button type="button" class="intake-filter-pill" data-filter="duplicate" onclick="setIntakeFilter('duplicate')">Duplicate <span class="intake-pill-count">0</span></button>
         <button type="button" class="intake-filter-pill" data-filter="pending" onclick="setIntakeFilter('pending')">Unchecked <span class="intake-pill-count">0</span></button>
       </div>
       <div class="intake-filter-search">
         <input type="text" id="intakeSearchInput" placeholder="Search title, IP, CVE…" oninput="setIntakeSearch(this.value)">
       </div>
-      <button type="button" class="btn btn-secondary btn-sm" onclick="intakeMarkVisibleNew()">Mark visible as NEW</button>
+    </div>
+
+    <!-- Export / Jira actions -->
+    <div id="intakeExportBar" class="intake-export-bar" style="display:none;margin-top:10px">
+      <button class="btn btn-accent btn-sm" id="intakeCreateSelectedBtn" onclick="intakeCreateJira('selected')" disabled>
+        🎫 Create Selected in Jira (<span id="intakeCreateSelectedCount">0</span>)
+      </button>
+      <button class="btn btn-accent btn-sm" id="intakeCreateBtn" onclick="intakeCreateJira('new')" disabled>🎫 Create All in Jira</button>
+      <span class="intake-export-sep" aria-hidden="true"></span>
+      <button class="btn btn-primary btn-sm" id="intakeExportSelectedBtn" onclick="intakeExport('selected')" disabled>
+        ⬇ Export Selected (<span id="intakeExportSelectedCount">0</span>)
+      </button>
+      <button class="btn btn-primary btn-sm" id="intakeExportBtn" onclick="intakeExport('new')" disabled>⬇ Export New Findings</button>
+      <button class="btn btn-secondary btn-sm" id="intakeExportAllBtn" onclick="intakeExport('all')" disabled>⬇ Export Full Report</button>
     </div>
 
     <!-- Findings table -->
-    <div id="intakeTableWrap" style="margin-top:12px;overflow-x:auto"></div>
+    <div id="intakeTableWrap" class="intake-table-wrap"></div>
 
     <!-- Pagination -->
     <div id="intakePageCtrl" style="display:none;align-items:center;gap:10px;margin-top:10px">
       <button class="btn btn-secondary btn-sm" id="intakePagePrev" onclick="intakePagePrev()">◀ Prev</button>
       <span id="intakePageInfo" style="font-size:12px;color:var(--text-dim)"></span>
       <button class="btn btn-secondary btn-sm" id="intakePageNext" onclick="intakePageNext()">Next ▶</button>
+    </div>
+
+    <!-- Edit finding before Jira create / export -->
+    <div class="modal-overlay" id="intakeEditModal" style="display:none" onclick="if(event.target===this)intakeCloseEdit()">
+      <div class="modal intake-edit-modal" role="dialog" aria-labelledby="intakeEditTitleLabel">
+        <h3>Edit finding</h3>
+        <p id="intakeEditSubtitle" class="modal-subtitle"></p>
+        <div class="form-group">
+          <label id="intakeEditTitleLabel" for="intakeEditTitle">Vulnerability title</label>
+          <input type="text" id="intakeEditTitle" class="text-input">
+        </div>
+        <div class="form-group">
+          <label for="intakeEditRating">Vulnerability rating</label>
+          <select id="intakeEditRating" class="text-input">
+            <option value="Critical">Critical</option>
+            <option value="High">High</option>
+            <option value="Medium">Medium</option>
+            <option value="Low">Low</option>
+            <option value="Info">Info</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="intakeEditDescription">Description</label>
+          <textarea id="intakeEditDescription" rows="8" placeholder="Vulnerability description…"></textarea>
+        </div>
+        <div class="form-group" style="margin-bottom:20px">
+          <label for="intakeEditRecommendation">Recommendation</label>
+          <textarea id="intakeEditRecommendation" rows="6" placeholder="Remediation steps…"></textarea>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" onclick="intakeCloseEdit()">Cancel</button>
+          <button type="button" class="btn btn-primary" onclick="intakeSaveEdit()">Save changes</button>
+        </div>
+      </div>
     </div>
 
   </div>
@@ -747,7 +817,7 @@
   <div id="toastContainer" class="toast-container"></div>
   <script src="/static/vendor/xterm/xterm.js"></script>
   <script src="/static/vendor/xterm/xterm-addon-fit.js"></script>
-  <script src="/static/intake.js?v=7"></script>
-  <script src="/static/app.js?v=25"></script>
+  <script src="/static/intake.js?v=24"></script>
+  <script src="/static/app.js?v=27"></script>
 </body>
 </html>

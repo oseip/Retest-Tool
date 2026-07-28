@@ -108,7 +108,7 @@ class TestQueueTicket:
         assert cmd.startswith("nmap ")
         assert "sudo" not in cmd
 
-    def test_udp_rule_uses_sudo(self):
+    def test_udp_rule_uses_nmap_without_sudo_by_default(self):
         ticket = make_ticket(
             summary="Portable SDK for UPnP Devices (libupnp)",
             ips=["10.0.0.1"],
@@ -116,7 +116,21 @@ class TestQueueTicket:
         )
         job_id = scanner._queue_ticket(ticket, "TestClient")
         cmd = scanner.JOBS[job_id]["nmap_command"]
-        assert cmd.startswith("sudo nmap ")
+        assert cmd.startswith("nmap ")
+        assert "sudo" not in cmd
+
+    def test_udp_rule_uses_sudo_when_client_requires_it(self):
+        from tests.conftest import make_test_config
+        cfg = make_test_config()
+        cfg.clients[0].sudo_nmap = True
+        ticket = make_ticket(
+            summary="Portable SDK for UPnP Devices (libupnp)",
+            ips=["10.0.0.1"],
+            ports=["1900"],
+        )
+        job_id = scanner._queue_ticket(ticket, "TestClient", cfg=cfg)
+        cmd = scanner.JOBS[job_id]["nmap_command"]
+        assert cmd.startswith("sudo -n nmap ")
 
     def test_nmap_command_contains_xml_sentinel(self):
         # The sentinel must be embedded so the emit() function collects XML inline
@@ -584,7 +598,7 @@ class TestBuildTriageCommand:
         assert "10.0.0.1" in cmd
         assert "--script" not in cmd  # triage skips version-detection scripts
 
-    def test_udp_rule_triage_uses_sudo_and_su(self):
+    def test_udp_rule_triage_uses_su_without_sudo_by_default(self):
         ticket = make_ticket(
             summary="Portable SDK for UPnP Devices (libupnp)",
             ips=["10.0.0.1"],
@@ -592,8 +606,9 @@ class TestBuildTriageCommand:
         )
         job_id = scanner._queue_ticket(ticket, "TestClient")
         cmd = scanner.JOBS[job_id]["triage_command"]
-        assert cmd.startswith("sudo nmap ")
+        assert cmd.startswith("nmap ")
         assert "-sU" in cmd
+        assert "sudo" not in cmd
 
     def test_no_rule_or_no_ip_returns_none(self):
         assert scanner._build_triage_command(None, "10.0.0.1", 443) is None
@@ -809,7 +824,7 @@ class TestSudoNmap:
         ticket = make_ticket(summary="SSL Certificate Expiry on 10.0.0.1")
         job_id = scanner._queue_ticket(ticket, "TestClient", cfg=cfg)
         cmd = scanner.JOBS[job_id]["nmap_command"]
-        assert cmd.startswith("sudo nmap")
+        assert cmd.startswith("sudo -n nmap")
 
     def test_no_sudo_by_default(self):
         ticket = make_ticket(summary="SSL Certificate Expiry on 10.0.0.1")

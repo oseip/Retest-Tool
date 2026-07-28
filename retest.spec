@@ -55,7 +55,8 @@ a = Analysis(
         # ── App modules ─────────────────────────────────────────────────────
         "src.main", "src.config", "src.jira_client", "src.jira_client_v2",
         "src.scanner", "src.vuln_rules", "src.assets", "src.nessus_client",
-        "src.connections", "src.setup", "src.settings_api",
+        "src.connections", "src.setup", "src.settings_api", "src.intake",
+        "src.intake_jira",
         "src.shell_ws", "src.ssh_exec", "src.tunnel_api", "src.port_forward",
         # ── Uvicorn internals ───────────────────────────────────────────────
         "uvicorn.logging", "uvicorn.loops", "uvicorn.loops.auto",

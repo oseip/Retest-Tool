@@ -138,6 +138,10 @@ function _syncClientDropdowns(clients) {
 }
 
 async function fetchLogs() {
+  // The logs bar starts collapsed and the toggle re-fetches on expand, so
+  // there's no reason to pull and re-render 100 rows into a hidden panel.
+  const bar = $('logsBar');
+  if (bar && !bar.classList.contains('expanded')) return;
   try {
     const res = await fetch('/api/logs');
     const logs = await res.json();
@@ -216,6 +220,17 @@ function renderJobCard(j) {
     </div>`;
 }
 
+// Last HTML written to #jobList. The 5s poll usually produces byte-identical
+// markup, and re-writing innerHTML tears down and rebuilds every card, which
+// costs layout, GC and scroll/focus churn for no visible change.
+let _lastJobListHtml = null;
+
+function _commitJobList(list, html) {
+  if (html === _lastJobListHtml) return false;
+  _lastJobListHtml = html;
+  return true;
+}
+
 function renderJobList() {
   const list = $('jobList');
   const jobs = filteredJobs();
@@ -225,9 +240,10 @@ function renderJobList() {
   const sweepJobs  = jobs.filter(j => j.source === 'sweep');
 
   if (!jobs.length) {
-    list.innerHTML = `<div style="padding:24px;text-align:center;color:var(--text-dim);font-size:12px;">
+    const emptyHtml = `<div style="padding:24px;text-align:center;color:var(--text-dim);font-size:12px;">
       No tickets found.<br>Waiting for Jira poll…
     </div>`;
+    if (_commitJobList(list, emptyHtml)) list.innerHTML = emptyHtml;
     updateScanSelectedBtn();
     return;
   }
@@ -390,6 +406,14 @@ function renderJobList() {
     } else {
       html += `<div style="padding:14px;text-align:center;color:var(--text-dim);font-size:11px">No sweep tickets match the current filter</div>`;
     }
+  }
+
+  if (!_commitJobList(list, html)) {
+    // Nothing changed — leave the existing DOM (and its scroll, focus and
+    // sentinel observer) exactly as it is.
+    updateScanSelectedBtn();
+    updateScanAllBtn();
+    return;
   }
 
   // Capture focus state before replacing DOM
@@ -1899,6 +1923,8 @@ async function fetchSshStatus() {
   } catch (e) { /* ignore */ }
 }
 
+let _lastSshPanelHtml = null;
+
 function renderSshPanel(status) {
   const body = $('sshPanelBody');
   if (!body) return;
@@ -1930,7 +1956,12 @@ function renderSshPanel(status) {
       </div>`;
   }).join('');
 
-  body.innerHTML = rows || '<div style="padding:8px 12px;font-size:11px;color:var(--text-dim)">No clients configured</div>';
+  const html = rows || '<div style="padding:8px 12px;font-size:11px;color:var(--text-dim)">No clients configured</div>';
+  // Polled every 3s — only touch the DOM on a real status change, otherwise the
+  // Connect/Disconnect buttons are destroyed 20x a minute under the cursor.
+  if (html === _lastSshPanelHtml) return;
+  _lastSshPanelHtml = html;
+  body.innerHTML = html;
 }
 
 const _sshConnectPolls = {};
@@ -2356,8 +2387,7 @@ function switchTab(tab) {
   // Intake view
   const iv = $('intakeView');
   if (iv) {
-    iv.style.display = isIntake ? 'block' : 'none';
-    iv.style.flexDirection = 'column';
+    iv.style.display = isIntake ? 'flex' : 'none';
   }
 
   if (isReport) initReportControls();
@@ -2396,12 +2426,16 @@ async function loadAssetsForClient(label) {
   try {
     const res  = await fetch(`/api/assets/${encodeURIComponent(label)}`);
     const data = await res.json();
+    // The user may have switched clients while this was in flight — don't
+    // paint one client's asset list under another client's name.
+    if (_assetsCurrentLabel !== label) return;
     $('assetsTextarea').value = (data.entries || []).join('\n');
     const count = (data.entries || []).length;
     $('assetsSaveStatus').textContent = data.updated_at
       ? `${count} entries · saved ${data.updated_at.slice(0, 10)}`
       : 'No asset list saved yet';
   } catch (e) {
+    if (_assetsCurrentLabel !== label) return;
     $('assetsSaveStatus').textContent = 'Failed to load';
   }
 }
@@ -2695,19 +2729,24 @@ async function pullNessus() {
 
   const checked = [...document.querySelectorAll('.nessus-scan-check:checked')];
   const scanIds = checked.map(cb => parseInt(cb.value, 10));
+  const scanHostCounts = {};
+  checked.forEach(cb => { scanHostCounts[parseInt(cb.value, 10)] = parseInt(cb.getAttribute('data-hosts') || '0', 10); });
+  const maxHosts = Math.max(0, ...Object.values(scanHostCounts));
   if (!scanIds.length) { showToast('No scans selected', 'warn'); return; }
 
   const btn    = $('nessusPullBtn');
   const status = $('nessusPullStatus');
   btn.disabled    = true;
   btn.textContent = 'Pulling…';
-  status.textContent = `Fetching hosts from ${scanIds.length} scan(s)…`;
+  status.textContent = maxHosts >= 500
+    ? `Fetching hosts from ${scanIds.length} large scan(s)… this may take several minutes`
+    : `Fetching hosts from ${scanIds.length} scan(s)…`;
 
   try {
     const res = await fetch(`/api/nessus/${encodeURIComponent(label)}/pull`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scan_ids: scanIds }),
+      body: JSON.stringify({ scan_ids: scanIds, scan_host_counts: scanHostCounts }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -2860,6 +2899,9 @@ function initReportControls() {
   if (!inp.value) inp.value = maxVal;
 }
 
+// Bumped on each request so a slow earlier report can't paint over a newer one.
+let _reportReqSeq = 0;
+
 async function generateReport() {
   const client = $('reportClient').value;
   const month  = $('reportMonth').value;
@@ -2867,6 +2909,7 @@ async function generateReport() {
   if (!client) { showToast('Please select a client', 'warn'); return; }
   if (!month)  { showToast('Please select a month', 'warn');  return; }
 
+  const seq = ++_reportReqSeq;
   const btn = $('reportGenBtn');
   btn.disabled = true;
   btn.textContent = 'Loading…';
@@ -2875,16 +2918,20 @@ async function generateReport() {
   try {
     const res = await fetch(`/api/report?client=${encodeURIComponent(client)}&month=${encodeURIComponent(month)}`);
     const data = await res.json();
+    if (seq !== _reportReqSeq) return;   // superseded by a newer request
     if (!res.ok) {
       $('reportResults').innerHTML = `<div class="report-error">⚠️ ${escHtml(data.detail || 'Unknown error')}</div>`;
       return;
     }
     renderReport(data);
   } catch (e) {
+    if (seq !== _reportReqSeq) return;
     $('reportResults').innerHTML = `<div class="report-error">⚠️ Request failed: ${escHtml(e.message)}</div>`;
   } finally {
-    btn.disabled = false;
-    btn.textContent = 'Generate Report';
+    if (seq === _reportReqSeq) {
+      btn.disabled = false;
+      btn.textContent = 'Generate Report';
+    }
   }
 }
 
@@ -3036,6 +3083,8 @@ function initWeeklyReportControls() {
   if (!inp.value) inp.value = maxDate;
 }
 
+let _weeklyReqSeq = 0;
+
 async function generateWeeklyReport() {
   const client = $('weeklyClient').value;
   const day    = $('weeklyWeek').value;
@@ -3043,6 +3092,7 @@ async function generateWeeklyReport() {
   if (!client) { showToast('Please select a client', 'warn'); return; }
   if (!day)    { showToast('Please select a date',   'warn'); return; }
 
+  const seq = ++_weeklyReqSeq;
   const btn = $('weeklyGenBtn');
   btn.disabled = true;
   btn.textContent = 'Loading…';
@@ -3051,16 +3101,20 @@ async function generateWeeklyReport() {
   try {
     const res = await fetch(`/api/report/weekly?client=${encodeURIComponent(client)}&day=${encodeURIComponent(day)}`);
     const data = await res.json();
+    if (seq !== _weeklyReqSeq) return;   // superseded by a newer request
     if (!res.ok) {
       $('weeklyResults').innerHTML = `<div class="report-error">⚠️ ${escHtml(data.detail || 'Unknown error')}</div>`;
       return;
     }
     renderWeeklyReport(data);
   } catch (e) {
+    if (seq !== _weeklyReqSeq) return;
     $('weeklyResults').innerHTML = `<div class="report-error">⚠️ Request failed: ${escHtml(e.message)}</div>`;
   } finally {
-    btn.disabled = false;
-    btn.textContent = 'Generate Report';
+    if (seq === _weeklyReqSeq) {
+      btn.disabled = false;
+      btn.textContent = 'Generate Report';
+    }
   }
 }
 
@@ -3332,7 +3386,8 @@ function renderDuplicates(data) {
           <a class="dup-key" href="${escHtml(t.jira_url)}" target="_blank" rel="noopener"
              title="Open in Jira">${escHtml(t.key)} ↗</a>
           <span class="dup-status">${escHtml(t.status || '—')}</span>
-          ${(t.tester || t.reporter) ? `<span style="font-size:11px;color:var(--text-dim)">by ${escHtml(t.tester || t.reporter)}</span>` : ''}
+          <span class="dup-affected" title="Affected System">${escHtml(t.affected_system || '—')}</span>
+          ${(t.tester || t.reporter) ? `<span class="dup-tester">by ${escHtml(t.tester || t.reporter)}</span>` : ''}
           ${isKeep
             ? '<span class="dup-badge dup-badge-keep">keep</span>'
             : '<span class="dup-badge dup-badge-dup">duplicate</span>'}
@@ -3342,7 +3397,16 @@ function renderDuplicates(data) {
     return `
       <div class="report-card dup-group" style="margin-bottom:16px">
         <div class="report-card-header">${escHtml(g.vuln_name)}</div>
-        <div class="report-card-body" style="padding-top:10px">${ticketsHtml}</div>
+        <div class="report-card-body" style="padding-top:10px">
+          <div class="dup-ticket-row dup-ticket-head">
+            <span class="dup-key">Ticket</span>
+            <span class="dup-status">Status</span>
+            <span class="dup-affected">Affected System</span>
+            <span class="dup-tester">Tester</span>
+            <span class="dup-badge" style="visibility:hidden">tag</span>
+          </div>
+          ${ticketsHtml}
+        </div>
       </div>`;
   }).join('');
 
@@ -3869,7 +3933,10 @@ let _tunnelPollTimer = null;
 function startTunnelPolling() {
   if (_tunnelPollTimer) return;
   refreshTunnels();
-  _tunnelPollTimer = setInterval(refreshTunnels, 2000);
+  // Skip the 2s SSH round trip while the tab is backgrounded.
+  _tunnelPollTimer = setInterval(() => {
+    if (!document.hidden) refreshTunnels();
+  }, 2000);
 }
 
 function stopTunnelPolling() {
@@ -4267,11 +4334,13 @@ async function switchSession(session) {
       return;
     }
     _applySessionUI(session, true);
-    // Refresh everything for the new session
-    await fetchClients();
-    await fetchSshStatus();
-    await fetchJobs();
-    await fetchConfig();
+    // Refresh everything for the new session — these are independent.
+    await Promise.all([
+      fetchClients(),
+      fetchSshStatus(),
+      fetchJobs(),
+      fetchConfig(),
+    ]);
     showToast(
       session === 'axian' ? 'Switched to Axian Jira' : 'Switched to Non-Axian Jira',
       'success', 3000
@@ -4386,12 +4455,16 @@ async function saveSettings() {
     $('themeBtn').textContent = '☀️';
   }
 
+  // Session must resolve first (it decides which clients/jobs apply); the rest
+  // are independent, so run them together instead of as a 5-request waterfall.
   await initSessionBar();
-  await fetchConfig();
-  await fetchClients();
-  await fetchJobs();
-  await fetchLogs();
-  await fetchSshStatus();
+  await Promise.all([
+    fetchConfig(),
+    fetchClients(),
+    fetchJobs(),
+    fetchLogs(),
+    fetchSshStatus(),
+  ]);
 
   // Poll jobs every 5s, SSH status every 3s, logs every 15s.
   // Skip work while the tab is backgrounded (document.hidden) so we don't burn

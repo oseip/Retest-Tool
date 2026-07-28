@@ -538,7 +538,7 @@ class TestBatchScanHelpers:
                 return ("nmap done\n###XML###\n<xml/>", "", 0)
 
         _batch_scan_one(FakeKali(), "10.0.0.1", 443, rule, sudo_nmap=True)
-        assert captured["cmd"].startswith("sudo nmap ")
+        assert captured["cmd"].startswith("sudo -n nmap ")
         assert "10.0.0.1" in captured["cmd"]
         assert captured["timeout"] == 600
 

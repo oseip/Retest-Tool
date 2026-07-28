@@ -16,6 +16,10 @@ let _intakePage       = 0;
 let _intakeFilter     = 'all';       // all | new | duplicate | pending
 let _intakeSearch     = '';
 let _intakePendingAutoCheck = false; // auto-run Check Jira when index becomes ready
+let _intakeSelectedIds  = new Set(); // finding _id values ticked for export
+let _intakeEditId       = null;      // finding open in edit modal
+
+const _INTAKE_RATINGS = ['Critical', 'High', 'Medium', 'Low', 'Info'];
 const _INTAKE_PAGE_SIZE = 100;
 
 // ── Init ──────────────────────────────────────────────────────────────────
@@ -32,6 +36,41 @@ function initIntakeTab() {
 
   // Load Nessus folders if SSH connected
   _intakeLoadFolders();
+
+  _intakeLoadIrrelevantConfig();
+}
+
+async function _intakeLoadIrrelevantConfig() {
+  const ta = $('intakeIrrelevantList');
+  if (!ta) return;
+  try {
+    const r = await fetch('/api/intake/config/irrelevant');
+    if (!r.ok) return;
+    const d = await r.json();
+    ta.value = (d.lines || []).join('\n');
+  } catch (_) {}
+}
+
+async function intakeSaveIrrelevant() {
+  const ta = $('intakeIrrelevantList');
+  if (!ta) return;
+  const lines = ta.value.split('\n').map(l => l.trim()).filter(Boolean);
+  try {
+    const r = await fetch('/api/intake/config/irrelevant', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lines }),
+    });
+    if (!r.ok) {
+      const e = await r.json();
+      showToast(e.detail || 'Could not save exclusion list', 'error');
+      return;
+    }
+    const d = await r.json();
+    showToast(`Saved ${d.count} excluded vulnerability title(s)`, 'success');
+  } catch (e) {
+    showToast('Could not save exclusion list: ' + e.message, 'error');
+  }
 }
 
 async function _intakeLoadDefaults(label) {
@@ -56,6 +95,7 @@ function onIntakeClientChange() {
   const label = $('intakeClient').value;
   if (!label) return;
   _intakeFindings = [];
+  _intakeSelectedIds = new Set();
   _intakePage = 0;
   _intakeFilter = 'all';
   _intakeSearch = '';
@@ -116,10 +156,12 @@ function _intakeStartJiraPoll(label) {
   if (_intakeJiraTimer) clearInterval(_intakeJiraTimer);
   _intakeJiraPollCount = 0;
 
-  // Check once immediately so a cached index (disk or RAM) shows up instantly.
-  _intakeCheckJiraStatus(label);
-
-  _intakeJiraTimer = setInterval(async () => {
+  // One shared implementation: _intakeCheckJiraStatus already owns clearing the
+  // timer once the index is ready, so the tick just handles the attempt cap.
+  const tick = () => {
+    // Don't spend requests on a backgrounded tab, and don't let hidden ticks
+    // burn through the attempt budget either.
+    if (document.hidden) return;
     _intakeJiraPollCount++;
     if (_intakeJiraPollCount > 120) { // ~3 minutes for large clients
       clearInterval(_intakeJiraTimer);
@@ -130,34 +172,13 @@ function _intakeStartJiraPoll(label) {
       }
       return;
     }
+    _intakeCheckJiraStatus(label);
+  };
 
-    try {
-      const r = await fetch(`/api/intake/${label}/jira-index-status`);
-      if (!r.ok) return;
-      const d = await r.json();
-      _intakeJiraStatus  = (d.status === 'cached') ? 'ready' : d.status;
-      _intakeJiraCount   = d.count || 0;
-      _intakeJiraAge     = d.age_seconds;
-      _intakeJiraRefreshing = !!d.refreshing;
-      if (d.jira_url) _intakeJiraUrl = d.jira_url;
-      _intakeUpdateJiraBar();
-      if (d.status === 'ready' || d.status === 'cached' || d.status === 'error') {
-        // Keep polling while a background refresh of a cached index is running
-        // so the count/age update live when fresh data lands.
-        if (!d.refreshing) {
-          clearInterval(_intakeJiraTimer);
-          _intakeJiraTimer = null;
-        }
-        if ((d.status === 'ready' || d.status === 'cached') && _intakeFindings.length > 0) {
-          $('intakeCheckBtn').disabled = false;
-          if (_intakePendingAutoCheck) {
-            _intakePendingAutoCheck = false;
-            intakeCheckDuplicates(true);
-          }
-        }
-      }
-    } catch (_) {}
-  }, 1500);
+  // Create the timer before the first check so that check can clear it if the
+  // index is already cached.
+  _intakeJiraTimer = setInterval(tick, 1500);
+  _intakeCheckJiraStatus(label);
 }
 
 function _intakeFmtAge(seconds) {
@@ -191,7 +212,7 @@ function _intakeUpdateJiraBar(isTimeout = false) {
     if (_intakeJiraRefreshing) msg += ' — refreshing…';
     txt.textContent  = msg;
     bar.style.color  = 'var(--green)';
-    if (refreshBtn && !_intakeJiraRefreshing) refreshBtn.style.display = '';
+    if (refreshBtn && !_intakeJiraRefreshing) refreshBtn.style.display = 'inline';
   } else if (_intakeJiraStatus === 'error') {
     icon.textContent = '⚠️';
     txt.textContent  = isTimeout ? 'Jira index timed out — check connection' : 'Jira index failed — check connection';
@@ -229,8 +250,26 @@ function _intakeResetJiraBar() {
   _intakeUpdateJiraBar();
 }
 
-// ── Nessus folder/scan picker ─────────────────────────────────────────────
+function _intakeJiraStatusStyle(status) {
+  const s = (status || '').toLowerCase();
+  if (s === 'fixed') return 'color:var(--green);font-weight:600';
+  if (s.includes('not fixed')) return 'color:var(--red);font-weight:600';
+  if (s === 'reported' || s === 'open' || s === 'in progress') return 'color:var(--yellow);font-weight:600';
+  if (s === 'remediated') return 'color:var(--cyan);font-weight:600';
+  return 'color:var(--text);font-weight:600';
+}
+
+function _intakeFmtJiraStatus(status) {
+  return (status || '').trim() || '—';
+}
 let _intakeFolderScans = {};   // folder_id → [scan, ...]
+
+function _intakeFmtScanTime(unixSec) {
+  if (!unixSec) return '';
+  const d = new Date(Number(unixSec) * 1000);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+}
 
 async function _intakeLoadFolders() {
   const label = $('intakeClient').value;
@@ -239,9 +278,8 @@ async function _intakeLoadFolders() {
   const scanList    = $('intakeScanList');
   if (!folderList) return;
   folderList.textContent = 'Loading…';
-  folderList.style.color = 'var(--text-dim)';
-  scanList.textContent   = 'Check a folder to see its scans';
-  scanList.style.color   = 'var(--text-dim)';
+  folderList.className = 'intake-picker-list intake-folder-list';
+  scanList.innerHTML = '<span class="intake-placeholder">Check a folder to see its scans</span>';
   _intakeFolderScans = {};
   try {
     const r = await fetch(`/api/nessus/${label}/folders`);
@@ -288,7 +326,7 @@ async function _intakeFolderToggled(cb, folderId, folderName, label) {
     document.querySelectorAll(`[data-folder-src="${folderId}"]`).forEach(el => el.remove());
     delete _intakeFolderScans[folderId];
     if (!scanList.querySelector('label')) {
-      scanList.innerHTML = '<span style="color:var(--text-dim)">Check a folder to see its scans</span>';
+      scanList.innerHTML = '<span class="intake-placeholder">Check a folder to see its scans</span>';
     }
     _intakeUpdatePullBtn();
     return;
@@ -307,21 +345,36 @@ async function _intakeFolderToggled(cb, folderId, folderName, label) {
     const ph = scanList.querySelector('span');
     if (ph) ph.remove();
 
+    scans.sort((a, b) => (b.last_modification_date || 0) - (a.last_modification_date || 0));
+
     scans.forEach(s => {
       const statusText = s.status === 'completed' ? '' : ` [${s.status}]`;
+      const hostHint = (s.total_hosts != null && s.total_hosts > 0)
+        ? ` (${s.total_hosts} hosts)`
+        : '';
+      const runAt = _intakeFmtScanTime(s.last_modification_date);
       const row = document.createElement('label');
       row.dataset.folderSrc = folderId;
-      row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:2px 4px;cursor:pointer;font-size:11px';
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:3px 4px;cursor:pointer;font-size:11px';
       const cb2 = document.createElement('input');
       cb2.type = 'checkbox';
       cb2.value = s.id;
       cb2.dataset.scanName = s.name;
+      cb2.dataset.hosts = s.total_hosts || 0;
       cb2.onchange = _intakeUpdatePullBtn;
-      // We intentionally do NOT disable the checkbox for canceled/incomplete scans,
-      // as the backend automatically falls back to the previous completed run.
-      // if (s.status !== 'completed') cb2.disabled = true;
       row.appendChild(cb2);
-      row.appendChild(document.createTextNode(`${s.name}${statusText}`));
+      const nameSpan = document.createElement('span');
+      nameSpan.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+      nameSpan.textContent = `${s.name}${hostHint}${statusText}`;
+      nameSpan.title = s.name;
+      row.appendChild(nameSpan);
+      if (runAt) {
+        const dtSpan = document.createElement('span');
+        dtSpan.style.cssText = 'flex-shrink:0;font-size:10px;color:var(--text-dim);white-space:nowrap';
+        dtSpan.textContent = runAt;
+        dtSpan.title = 'Last scan run';
+        row.appendChild(dtSpan);
+      }
       scanList.appendChild(row);
     });
 
@@ -354,6 +407,9 @@ async function intakePull() {
   if (!checked.length) return;
 
   const scanIds = checked.map(c => parseInt(c.value));
+  const scanHostCounts = {};
+  checked.forEach(c => { scanHostCounts[parseInt(c.value, 10)] = parseInt(c.dataset.hosts || '0', 10); });
+  const maxHosts = Math.max(0, ...Object.values(scanHostCounts));
   const engagement = _intakeReadEngagement();
   const force = !!($('intakeForcePull') && $('intakeForcePull').checked);
 
@@ -361,16 +417,32 @@ async function intakePull() {
   $('intakePullBtn').textContent = '⏳ Pulling…';
   $('intakeCheckBtn').disabled = true;
   $('intakeExportBtn').disabled = true;
+  if ($('intakeExportAllBtn')) $('intakeExportAllBtn').disabled = true;
+  if ($('intakeExportSelectedBtn')) $('intakeExportSelectedBtn').disabled = true;
+  if ($('intakeCreateBtn')) $('intakeCreateBtn').disabled = true;
+  if ($('intakeCreateSelectedBtn')) $('intakeCreateSelectedBtn').disabled = true;
+  _intakeSelectedIds = new Set();
   $('intakeTableWrap').innerHTML = '';
-  _intakeSetStatus(force
-    ? 'Pulling scans from Nessus (forced)… this may take a minute per scan.'
-    : 'Pulling scans… cached scans load instantly; new ones take a minute while Nessus generates the export.');
+  const baseStatus = force
+    ? (maxHosts >= 500
+      ? 'Pulling large scan(s) from Nessus (forced)… export can take 10–20 min per scan.'
+      : 'Pulling scans from Nessus (forced)… export can take 1–4 min per scan.')
+    : (maxHosts >= 500
+      ? 'Pulling large scan(s)… cached scans load instantly; fresh exports can take 10–20 min.'
+      : 'Pulling scans… cached scans load instantly; new ones take 1–4 min while Nessus generates the export.');
+  _intakeSetStatus(baseStatus);
+
+  const pullStarted = Date.now();
+  const tick = setInterval(() => {
+    const sec = Math.round((Date.now() - pullStarted) / 1000);
+    _intakeSetStatus(`${baseStatus} (${sec}s elapsed)`);
+  }, 5000);
 
   try {
     const r = await fetch(`/api/intake/${label}/pull`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scan_ids: scanIds, force, ...engagement }),
+      body: JSON.stringify({ scan_ids: scanIds, scan_host_counts: scanHostCounts, force, ...engagement }),
     });
 
     if (!r.ok) {
@@ -381,11 +453,15 @@ async function intakePull() {
 
     const d = await r.json();
     _intakeFindings = d.findings || [];
+    _intakeSelectedIds = new Set();
     _intakePage = 0;
 
     let msg = `✅ Pulled ${_intakeFindings.length.toLocaleString()} findings`;
     if (d.total_raw > d.total_merged) {
       msg += ` (${(d.total_raw - d.total_merged).toLocaleString()} duplicates within scans removed)`;
+    }
+    if (d.excluded_irrelevant) {
+      msg += ` — ${d.excluded_irrelevant.toLocaleString()} irrelevant excluded`;
     }
     if (d.cached_scans) {
       msg += ` — ${d.cached_scans} scan(s) from cache`
@@ -398,9 +474,9 @@ async function intakePull() {
 
     _intakeRenderTable();
 
-    // Auto-check against Jira as soon as the index is ready (core workflow step).
+    // Duplicate check runs in background so Pull is not blocked on Jira.
     if (_intakeJiraStatus === 'ready') {
-      await intakeCheckDuplicates(true);
+      intakeCheckDuplicates(true);
     } else {
       _intakePendingAutoCheck = true;
       _intakeSetStatus(msg + ' — waiting for Jira index, will auto-check duplicates…');
@@ -409,6 +485,7 @@ async function intakePull() {
   } catch (e) {
     _intakeSetStatus(`❌ ${e.message}`, true);
   } finally {
+    clearInterval(tick);
     _intakeUpdatePullBtn();
     $('intakePullBtn').textContent = '⬇ Pull Scan';
   }
@@ -451,6 +528,9 @@ async function intakeCheckDuplicates(silent = false) {
       if (res) {
         f._status       = res.status;
         f._duplicate_of = res.duplicate_of;
+        f._duplicate_status = res.duplicate_status;
+        f._recurrence_of = res.recurrence_of || null;
+        f._previous_jira_status = res.previous_jira_status || '';
         f._match_kind   = res.match_kind;
       }
     });
@@ -459,12 +539,16 @@ async function intakeCheckDuplicates(silent = false) {
     _intakeRenderTable();
 
     const cveMatches = (d.results || []).filter(x => x.match_kind === 'cve').length;
+    const familyMatches = (d.results || []).filter(x => x.match_kind === 'family').length;
     const msg = `🔍 Checked ${_intakeFindings.length} findings against ${(d.jira_tickets_checked || 0).toLocaleString()} Jira tickets — `
-              + `${d.new_count} NEW, ${d.duplicate_count} DUPLICATE`
-              + (cveMatches ? ` (${cveMatches} matched by CVE)` : '');
+              + `${d.new_count} NEW`
+              + (d.recurrence_count ? `, ${d.recurrence_count} REOPEN` : '')
+              + `, ${d.duplicate_count} DUPLICATE`
+              + (familyMatches ? ` (${familyMatches} version-family match)` : '')
+              + (cveMatches ? ` (${cveMatches} CVE match)` : '');
     _intakeSetStatus(msg);
 
-    $('intakeExportBtn').disabled = d.new_count === 0;
+    _intakeUpdateExportButtons(d.exportable_count != null ? d.exportable_count : d.new_count);
 
   } catch (e) {
     if (!silent) _intakeSetStatus(`❌ ${e.message}`, true);
@@ -474,22 +558,49 @@ async function intakeCheckDuplicates(silent = false) {
   }
 }
 
+function _intakeIsExportable(f) {
+  if (f._jira_key) return false;
+  return f._status !== 'duplicate';
+}
+
+function _intakeSelectedExportable() {
+  return _intakeFindings.filter(f => _intakeSelectedIds.has(f._id) && _intakeIsExportable(f));
+}
+
 // ── Export ────────────────────────────────────────────────────────────────
-async function intakeExport() {
-  const newCount = _intakeFindings.filter(f => f._status !== 'duplicate').length;
-  if (!newCount) { _intakeSetStatus('No new findings to export', true); return; }
+async function intakeExport(mode = 'new') {
+  const allRows = mode === 'all';
+  const selected = mode === 'selected';
+  const newCount = _intakeFindings.filter(_intakeIsExportable).length;
+  const selectedList = _intakeFindings.filter(f => _intakeSelectedIds.has(f._id));
+
+  if (selected && !selectedList.length) {
+    _intakeSetStatus('Select at least one finding to export', true);
+    return;
+  }
+  if (!selected && !allRows && !newCount) {
+    _intakeSetStatus('No new findings to export', true);
+    return;
+  }
+  if (allRows && !_intakeFindings.length) {
+    _intakeSetStatus('No findings to export', true);
+    return;
+  }
 
   const engagement = _intakeReadEngagement();
+  const btn = selected ? $('intakeExportSelectedBtn')
+    : allRows ? $('intakeExportAllBtn') : $('intakeExportBtn');
+  const exportFindings = selected ? selectedList : _intakeFindings;
 
-  $('intakeExportBtn').disabled   = true;
-  $('intakeExportBtn').textContent = '⏳ Exporting…';
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Exporting…'; }
 
   try {
     const r = await fetch('/api/intake/export', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        findings: _intakeFindings,
+        findings: exportFindings,
+        export_mode: mode,
         munit_id: $('intakeClient').value || '',
         ...engagement,
       }),
@@ -505,17 +616,131 @@ async function intakeExport() {
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
     const cd   = r.headers.get('Content-Disposition') || '';
-    const fnm  = cd.match(/filename=([^\s;]+)/)?.[1] || 'intake.csv';
+    const fnm  = cd.match(/filename=([^\s;]+)/)?.[1]
+      || (selected ? 'intake_selected.csv' : allRows ? 'intake_full.csv' : 'intake.csv');
     a.href = url; a.download = fnm; a.click();
     URL.revokeObjectURL(url);
-    _intakeSetStatus(`✅ Exported ${newCount} new findings`);
+    const count = selected ? selectedList.length : allRows ? _intakeFindings.length : newCount;
+    const label = selected ? 'selected' : allRows ? 'full report' : 'new';
+    _intakeSetStatus(`✅ Exported ${count} finding${count !== 1 ? 's' : ''} (${label})`);
 
   } catch (e) {
     _intakeSetStatus(`❌ ${e.message}`, true);
   } finally {
-    $('intakeExportBtn').disabled   = false;
-    $('intakeExportBtn').textContent = '⬇ Export New Findings';
+    _intakeUpdateExportButtons();
   }
+}
+
+// ── Create in Jira ────────────────────────────────────────────────────────
+async function intakeCreateJira(mode = 'new') {
+  const label = $('intakeClient').value;
+  const selected = mode === 'selected';
+  const exportableCount = _intakeFindings.filter(_intakeIsExportable).length;
+  const selectedList = _intakeSelectedExportable();
+
+  if (selected && !selectedList.length) {
+    _intakeSetStatus('Select at least one exportable finding to create in Jira', true);
+    return;
+  }
+  if (!selected && !exportableCount) {
+    _intakeSetStatus('No exportable findings to create in Jira', true);
+    return;
+  }
+
+  const count = selected ? selectedList.length : exportableCount;
+  const noun = count === 1 ? 'ticket' : 'tickets';
+  if (!confirm(`Create ${count} new Jira ${noun} for ${label}? REOPEN rows become new issues (old tickets are not reopened).`)) {
+    return;
+  }
+
+  const engagement = _intakeReadEngagement();
+  const btn = selected ? $('intakeCreateSelectedBtn') : $('intakeCreateBtn');
+  const createFindings = selected ? selectedList : _intakeFindings;
+
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Creating…'; }
+
+  try {
+    const r = await fetch(`/api/intake/${label}/create-jira`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        findings: createFindings,
+        create_mode: mode,
+        munit_id: label,
+        ...engagement,
+      }),
+    });
+
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      _intakeSetStatus(`❌ Jira create failed: ${d.detail || d.error || 'Unknown error'}`, true);
+      return;
+    }
+
+    const byId = new Map((d.results || []).map(x => [x._id, x]));
+    for (const f of _intakeFindings) {
+      const res = byId.get(f._id);
+      if (res && res.ok && res.jira_key) {
+        f._jira_key = res.jira_key;
+        f._jira_url = res.jira_url || `${d.jira_url}/browse/${res.jira_key}`;
+      }
+    }
+
+    const created = d.created || 0;
+    const failed = d.failed || 0;
+    let msg = `✅ Created ${created} Jira ticket${created !== 1 ? 's' : ''}`;
+    if (failed) msg += ` — ${failed} failed`;
+    if (failed && d.results) {
+      const err = d.results.find(x => !x.ok);
+      if (err && err.error) msg += `: ${err.error.slice(0, 240)}`;
+    }
+    _intakeSetStatus(msg, failed > 0 && created === 0);
+    _intakeRenderTable();
+  } catch (e) {
+    _intakeSetStatus(`❌ ${e.message}`, true);
+  } finally {
+    _intakeUpdateExportButtons();
+  }
+}
+
+function _intakeUpdateExportButtons(newCountOverride, counts) {
+  const c = counts || _intakeCounts();
+  const newCount = newCountOverride != null ? newCountOverride : c.exportable;
+  const selCount = c.selected;
+  const selExportable = _intakeSelectedExportable().length;
+  const exportBtn = $('intakeExportBtn');
+  const exportAllBtn = $('intakeExportAllBtn');
+  const exportSelBtn = $('intakeExportSelectedBtn');
+  const exportSelCount = $('intakeExportSelectedCount');
+  const createBtn = $('intakeCreateBtn');
+  const createSelBtn = $('intakeCreateSelectedBtn');
+  const createSelCount = $('intakeCreateSelectedCount');
+
+  if (exportBtn) {
+    exportBtn.disabled = newCount === 0;
+    exportBtn.textContent = '⬇ Export New Findings';
+  }
+  if (exportAllBtn) {
+    exportAllBtn.disabled = !_intakeFindings.length;
+    exportAllBtn.textContent = '⬇ Export Full Report';
+  }
+  if (exportSelBtn) {
+    exportSelBtn.disabled = selCount === 0;
+    exportSelBtn.innerHTML = `⬇ Export Selected (<span id="intakeExportSelectedCount">${selCount}</span>)`;
+  } else if (exportSelCount) {
+    exportSelCount.textContent = selCount;
+  }
+  if (createBtn) {
+    createBtn.disabled = newCount === 0;
+    createBtn.textContent = '🎫 Create All in Jira';
+  }
+  if (createSelBtn) {
+    createSelBtn.disabled = selExportable === 0;
+    createSelBtn.innerHTML = `🎫 Create Selected in Jira (<span id="intakeCreateSelectedCount">${selExportable}</span>)`;
+  } else if (createSelCount) {
+    createSelCount.textContent = selExportable;
+  }
+  _intakeUpdateSummaryBar(c);
 }
 
 // ── Engagement settings reader ─────────────────────────────────────────────
@@ -536,11 +761,36 @@ function _intakeReadEngagement() {
   };
 }
 
+// One pass over the findings, shared by the summary bar, filter pills and
+// export buttons — each of those used to re-scan the whole list separately,
+// so a single render walked the dataset around seven times.
+function _intakeCounts() {
+  let newCt = 0, dupCt = 0, pendCt = 0, recurrenceCt = 0;
+  for (const f of _intakeFindings) {
+    if (f._status === 'new') newCt++;
+    else if (f._status === 'duplicate') dupCt++;
+    else if (f._status === 'pending') pendCt++;
+    else if (f._status === 'recurrence') recurrenceCt++;
+  }
+  return {
+    total: _intakeFindings.length,
+    new: newCt,
+    duplicate: dupCt,
+    pending: pendCt,
+    recurrence: recurrenceCt,
+    exportable: _intakeFindings.filter(_intakeIsExportable).length,
+    created: _intakeFindings.filter(f => f._jira_key).length,
+    nonDuplicate: _intakeFindings.length - dupCt,
+    selected: _intakeSelectedIds.size,
+  };
+}
+
 // ── Filter / search ───────────────────────────────────────────────────────
 function _intakeFilteredFindings() {
   const q = _intakeSearch.trim().toLowerCase();
   return _intakeFindings.filter(f => {
     if (_intakeFilter === 'new' && f._status !== 'new') return false;
+    if (_intakeFilter === 'recurrence' && f._status !== 'recurrence') return false;
     if (_intakeFilter === 'duplicate' && f._status !== 'duplicate') return false;
     if (_intakeFilter === 'pending' && f._status !== 'pending') return false;
     if (!q) return true;
@@ -561,10 +811,18 @@ function setIntakeFilter(filter) {
   _intakeRenderTable();
 }
 
+let _intakeSearchTimer = null;
+
 function setIntakeSearch(val) {
   _intakeSearch = val;
   _intakePage = 0;
-  _intakeRenderTable();
+  // Debounce: without this every keystroke re-filters the whole finding list
+  // and rebuilds the table, which lags badly on large intakes.
+  if (_intakeSearchTimer) clearTimeout(_intakeSearchTimer);
+  _intakeSearchTimer = setTimeout(() => {
+    _intakeSearchTimer = null;
+    _intakeRenderTable();
+  }, 180);
 }
 
 function intakeMarkVisibleNew() {
@@ -574,30 +832,74 @@ function intakeMarkVisibleNew() {
     f._match_kind = null;
   });
   _intakeRenderTable();
-  const newCount = _intakeFindings.filter(x => x._status !== 'duplicate').length;
-  $('intakeExportBtn').disabled = newCount === 0;
-  showToast(`Marked visible rows as NEW (${newCount} total new)`, 'success');
+  _intakeUpdateExportButtons();
+  showToast('Marked visible rows as NEW', 'success');
+}
+
+// ── Row selection ─────────────────────────────────────────────────────────
+function _intakeCanSelect(f) {
+  return _intakeIsExportable(f);
+}
+
+function intakeToggleSelect(id, checked) {
+  const f = _intakeFindings.find(x => x._id === id);
+  if (f && !_intakeCanSelect(f)) return;
+  if (checked) _intakeSelectedIds.add(id);
+  else _intakeSelectedIds.delete(id);
+  const row = document.querySelector(`[data-fid="${id}"]`);
+  if (row) row.classList.toggle('intake-row-selected', checked);
+  _intakeUpdateExportButtons();
+}
+
+function intakeToggleSelectPage(checked) {
+  _intakeFilteredFindings()
+    .slice(_intakePage * _INTAKE_PAGE_SIZE, (_intakePage + 1) * _INTAKE_PAGE_SIZE)
+    .forEach(f => {
+      if (!_intakeCanSelect(f)) return;
+      if (checked) _intakeSelectedIds.add(f._id);
+      else _intakeSelectedIds.delete(f._id);
+    });
+  _intakeRenderTable();
+}
+
+function _intakePageAllSelected(page) {
+  const selectable = page.filter(_intakeCanSelect);
+  return selectable.length > 0 && selectable.every(f => _intakeSelectedIds.has(f._id));
+}
+
+function _intakePageSomeSelected(page) {
+  return page.some(f => _intakeCanSelect(f) && _intakeSelectedIds.has(f._id));
 }
 
 // ── Table render ──────────────────────────────────────────────────────────
 function _intakeRenderTable() {
   const wrap = $('intakeTableWrap');
+  const filterBar = $('intakeFilterBar');
+  const exportBar = $('intakeExportBar');
   if (!wrap) return;
 
   if (!_intakeFindings.length) {
     wrap.innerHTML = '';
+    if (filterBar) filterBar.style.display = 'none';
+    if (exportBar) exportBar.style.display = 'none';
     _intakeUpdatePageControls();
-    _intakeUpdateFilterBar();
+    if ($('intakeSummaryBar')) $('intakeSummaryBar').textContent = '';
     return;
   }
+
+  if (filterBar) filterBar.style.display = 'flex';
+  if (exportBar) exportBar.style.display = 'flex';
+  const counts = _intakeCounts();
+  _intakeUpdateFilterBar(counts);
 
   const filtered = _intakeFilteredFindings();
   const total = filtered.length;
   const start = _intakePage * _INTAKE_PAGE_SIZE;
   const end   = Math.min(start + _INTAKE_PAGE_SIZE, total);
   const page  = filtered.slice(start, end);
+  const pageAllSelected = _intakePageAllSelected(page);
+  const pageSomeSelected = !pageAllSelected && _intakePageSomeSelected(page);
 
-  // Rating → colour
   const RC = {
     critical: 'var(--red)',
     high:     '#e65c00',
@@ -606,18 +908,25 @@ function _intakeRenderTable() {
   };
 
   let html = `
-  <table style="width:100%;border-collapse:collapse;font-size:11px">
+  <table class="intake-table">
     <thead>
-      <tr style="background:var(--bg3);border-bottom:1px solid var(--border)">
-        <th style="padding:6px 8px;text-align:left;white-space:nowrap">Status</th>
-        <th style="padding:6px 8px;text-align:left">Vulnerability Title</th>
-        <th style="padding:6px 8px;white-space:nowrap">IP</th>
-        <th style="padding:6px 8px;white-space:nowrap">Technology</th>
-        <th style="padding:6px 8px;white-space:nowrap">Rating</th>
-        <th style="padding:6px 8px;white-space:nowrap">CVSS</th>
-        <th style="padding:6px 8px;white-space:nowrap">CVE</th>
-        <th style="padding:6px 8px;white-space:nowrap">CIA Damage</th>
-        <th style="padding:6px 8px;white-space:nowrap">Risk Value</th>
+      <tr>
+        <th class="intake-check-col">
+          <input type="checkbox" title="Select all on this page"
+            ${pageAllSelected ? 'checked' : ''}
+            ${pageSomeSelected ? 'style="opacity:0.6"' : ''}
+            onchange="intakeToggleSelectPage(this.checked)">
+        </th>
+        <th>Status</th>
+        <th>Jira</th>
+        <th>Vulnerability</th>
+        <th>IP</th>
+        <th>Tech</th>
+        <th>Rating</th>
+        <th>CVSS</th>
+        <th>CVE</th>
+        <th class="intake-cia-col" title="Impact on Confidentiality / Integrity / Availability — click a letter to toggle">CIA Impact</th>
+        <th class="intake-risk-col" title="Calculated risk value">Risk</th>
       </tr>
     </thead>
     <tbody>`;
@@ -625,83 +934,113 @@ function _intakeRenderTable() {
   page.forEach(f => {
     const rating = (f.Vulnerability_Rating || '').toLowerCase();
     const col    = RC[rating] || 'var(--text-dim)';
+    const isCreated = !!f._jira_key;
     const isDup  = f._status === 'duplicate';
+    const isRec  = f._status === 'recurrence';
     const isPend = f._status === 'pending';
-    const rowStyle = isDup ? 'opacity:0.4' : '';
+    const isSel  = _intakeSelectedIds.has(f._id);
+    const rowCls = (isSel ? 'intake-row-selected ' : '')
+      + (isDup ? 'intake-row-dup' : isRec ? 'intake-row-recurrence' : '');
 
-    const badgeCol  = isDup  ? '#666'               :
-                      isPend ? 'var(--text-dim)'     : 'var(--green)';
-    const badgeBg   = isDup  ? 'rgba(100,100,100,.15)' :
-                      isPend ? 'rgba(150,150,150,.1)'  : 'rgba(0,200,100,.12)';
-    const badgeTxt  = isDup  ? 'DUPLICATE' : isPend ? 'PENDING' : 'NEW';
+    const badgeCls = isCreated ? 'intake-badge-created'
+      : isDup ? 'intake-badge-dup'
+      : isRec ? 'intake-badge-recurrence'
+      : isPend ? 'intake-badge-pend'
+      : 'intake-badge-new';
+    const badgeTxt = isCreated ? 'CREATED'
+      : isDup ? 'DUPLICATE' : isRec ? 'REOPEN' : isPend ? 'PENDING' : 'NEW';
 
     const dupHint = isDup && f._duplicate_of
-      ? `title="Exists in Jira as ${f._duplicate_of}${f._match_kind === 'cve' ? ' (CVE match)' : ''}"`
+      ? `title="${_esc('Jira: ' + f._duplicate_of + (f._duplicate_status ? ' (' + f._duplicate_status + ')' : ''))}"`
+      : isRec && f._recurrence_of
+        ? `title="${_esc('Previously ' + f._recurrence_of + ' (' + (f._previous_jira_status || 'Fixed') + ') — upload as new ticket')}"`
+        : isCreated
+          ? `title="${_esc('Created in Jira: ' + f._jira_key)}"`
+          : '';
+
+    const jiraBase = f._jira_url ? f._jira_url.replace(/\/browse\/[^/]+$/, '') : _intakeJiraUrl;
+    const jiraKey = isCreated ? f._jira_key : (isDup ? f._duplicate_of : (isRec ? f._recurrence_of : null));
+    const jiraCell = jiraKey
+      ? (jiraBase
+          ? `<a class="intake-jira-key" href="${_esc(jiraBase)}/browse/${_esc(jiraKey)}" target="_blank" rel="noopener">${_esc(jiraKey)}</a>`
+          : `<span class="intake-jira-key">${_esc(jiraKey)}</span>`)
       : '';
 
-    const dupCell = isDup && f._duplicate_of
-      ? (_intakeJiraUrl
-          ? `<a href="${_esc(_intakeJiraUrl)}/browse/${_esc(f._duplicate_of)}" target="_blank" rel="noopener"
-                style="color:var(--blue);font-size:10px;margin-left:4px">${_esc(f._duplicate_of)}</a>`
-          : `<span style="color:var(--text-dim);font-size:10px;margin-left:4px">${_esc(f._duplicate_of)}</span>`)
-      : '';
+    const jiraStatusCell = isCreated
+      ? 'Created'
+      : isDup
+        ? _intakeFmtJiraStatus(f._duplicate_status)
+        : isRec
+          ? `was ${_intakeFmtJiraStatus(f._previous_jira_status || 'Fixed')}`
+          : '';
 
     html += `
-      <tr style="border-bottom:1px solid var(--border);${rowStyle}" data-fid="${f._id}">
-        <td style="padding:5px 8px;white-space:nowrap">
-          <span onclick="intakeToggleStatus(${f._id})" ${dupHint}
-            style="cursor:pointer;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:600;
-                   color:${badgeCol};background:${badgeBg};border:1px solid ${badgeCol};
-                   white-space:nowrap">
-            ${badgeTxt}
-          </span>${dupCell}
+      <tr class="${rowCls.trim()}" data-fid="${f._id}">
+        <td class="intake-check-col">
+          <input type="checkbox" ${isSel ? 'checked' : ''} ${(!isCreated && _intakeCanSelect(f)) ? '' : 'disabled'} onchange="intakeToggleSelect(${f._id}, this.checked)">
         </td>
-        <td style="padding:5px 8px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-            title="${_esc(f.Vulnerability_Title)}">${_esc(f.Vulnerability_Title)}</td>
-        <td style="padding:5px 8px;font-family:monospace">${_esc(f.System_IP)}</td>
-        <td style="padding:5px 8px;font-family:monospace">${_esc(f.Technology)}</td>
-        <td style="padding:5px 8px;color:${col};font-weight:600">${_esc(f.Vulnerability_Rating)}</td>
-        <td style="padding:5px 8px">${_esc(f.CVSS)}</td>
-        <td style="padding:5px 8px;font-size:10px">${_esc(f.CVE)}</td>
-        <td style="padding:5px 8px">
-          <input type="text" value="${_esc(f.CIA_Damage)}"
-            onchange="_intakeFieldEdit(${f._id},'CIA_Damage',this.value)"
-            style="width:100px;background:var(--bg3);border:1px solid var(--border);
-                   border-radius:3px;color:var(--text);font-size:11px;padding:2px 4px">
+        <td>
+          <span class="intake-badge ${badgeCls}" ${isCreated ? '' : `onclick="intakeToggleStatus(${f._id})"`} ${dupHint}>${badgeTxt}</span>${(isDup || isCreated) ? jiraCell : ''}
         </td>
-        <td style="padding:5px 8px">
-          <input type="text" value="${_esc(f.Risk_Value)}"
-            onchange="_intakeFieldEdit(${f._id},'Risk_Value',this.value)"
-            style="width:72px;background:var(--bg3);border:1px solid var(--border);
-                   border-radius:3px;color:var(--text);font-size:11px;padding:2px 4px">
+        <td style="${_intakeJiraStatusStyle(isCreated ? 'Created' : (isDup ? f._duplicate_status : (isRec ? f._previous_jira_status : '')))}">${isRec ? `${_esc(jiraStatusCell)} ${jiraCell}` : (isCreated ? jiraCell : _esc(jiraStatusCell))}</td>
+        <td class="intake-cell-title">
+          <div class="intake-cell-title-wrap">
+            <button type="button" class="intake-edit-btn" title="Edit title, description &amp; recommendation before Jira upload"
+              ${(isCreated || isDup) ? 'disabled' : ''} onclick="event.stopPropagation(); intakeOpenEdit(${f._id})">✎</button>
+            <span class="intake-cell-title-text${f._edited ? ' edited' : ''}" title="${_esc(f.Vulnerability_Title)}${_esc(f._edited ? ' (edited)' : '')}">${_esc(f.Vulnerability_Title)}</span>
+          </div>
         </td>
+        <td class="intake-cell-mono">${_esc(f.System_IP)}</td>
+        <td class="intake-cell-mono">${_esc(f.Technology)}</td>
+        <td style="color:${col};font-weight:600">${_esc(f.Vulnerability_Rating)}</td>
+        <td>${_esc(f.CVSS)}</td>
+        <td class="intake-cell-cve">${_esc(f.CVE)}</td>
+        <td class="intake-cia-col">${_intakeCiaChips(f)}</td>
+        <td class="intake-risk-col">
+          <input class="intake-cell-input risk" value="${_esc(f.Risk_Value)}"
+            style="${_intakeRiskStyle(f.Risk_Value)}"
+            title="Risk value (editable)"
+            onchange="_intakeRiskEdit(${f._id}, this)"></td>
       </tr>`;
   });
 
   html += '</tbody></table>';
   wrap.innerHTML = html;
   _intakeUpdatePageControls(filtered.length);
-  _intakeUpdateSummaryBar();
-  _intakeUpdateFilterBar();
+  _intakeUpdateExportButtons(null, counts);   // also refreshes the summary bar
 }
 
-function _intakeUpdateFilterBar() {
+function _intakeUpdateSummaryBar(counts) {
+  const bar = $('intakeSummaryBar');
+  if (!bar || !_intakeFindings.length) { if (bar) bar.textContent = ''; return; }
+  const c = counts || _intakeCounts();
+  let msg = `Total: ${c.total.toLocaleString()} | ✅ New: ${c.new.toLocaleString()}`;
+  if (c.recurrence) msg += ` | 🔁 Reopen: ${c.recurrence.toLocaleString()}`;
+  msg += ` | ⚫ Duplicate: ${c.duplicate.toLocaleString()}`;
+  if (c.pending) msg += ` | ⏳ Unchecked: ${c.pending.toLocaleString()}`;
+  if (c.created) msg += ` | 🎫 In Jira: ${c.created.toLocaleString()}`;
+  if (c.selected) msg += ` | ☑ Selected: ${c.selected.toLocaleString()}`;
+  bar.textContent = msg;
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set('intakeStatTotal', c.total);
+  set('intakeStatNew', c.new);
+  set('intakeStatDup', c.duplicate);
+  set('intakeStatSelected', c.selected);
+}
+
+function _intakeUpdateFilterBar(counts) {
   const bar = $('intakeFilterBar');
   if (!bar || !_intakeFindings.length) {
     if (bar) bar.style.display = 'none';
     return;
   }
   bar.style.display = 'flex';
-  const all = _intakeFindings.length;
-  const newCt = _intakeFindings.filter(f => f._status === 'new').length;
-  const dupCt = _intakeFindings.filter(f => f._status === 'duplicate').length;
-  const pendCt = _intakeFindings.filter(f => f._status === 'pending').length;
+  const c = counts || _intakeCounts();
+  const pillCounts = { all: c.total, new: c.new, recurrence: c.recurrence, duplicate: c.duplicate, pending: c.pending };
   bar.querySelectorAll('.intake-filter-pill').forEach(el => {
     const f = el.dataset.filter;
-    const counts = { all, new: newCt, duplicate: dupCt, pending: pendCt };
-    const cnt = counts[f];
     const cntEl = el.querySelector('.intake-pill-count');
-    if (cntEl) cntEl.textContent = cnt;
+    if (cntEl) cntEl.textContent = pillCounts[f];
     el.classList.toggle('active', f === _intakeFilter);
   });
 }
@@ -718,50 +1057,145 @@ function _intakeFieldEdit(id, field, val) {
   if (f) f[field] = val;
 }
 
+function _intakeCanEdit(f) {
+  return f && !f._jira_key && f._status !== 'duplicate';
+}
+
+function intakeOpenEdit(id) {
+  const f = _intakeFindings.find(x => x._id === id);
+  if (!f || !_intakeCanEdit(f)) return;
+  _intakeEditId = id;
+  const sub = $('intakeEditSubtitle');
+  if (sub) {
+    sub.textContent = `${f.System_IP || '—'} · ${f.Technology || '—'} · ${(f._status || 'pending').toUpperCase()}`;
+  }
+  const titleEl = $('intakeEditTitle');
+  const descEl = $('intakeEditDescription');
+  const recEl = $('intakeEditRecommendation');
+  if (titleEl) titleEl.value = f.Vulnerability_Title || '';
+  const ratingEl = $('intakeEditRating');
+  if (ratingEl) {
+    const r = (f.Vulnerability_Rating || 'Info').trim();
+    const match = _INTAKE_RATINGS.find(x => x.toLowerCase() === r.toLowerCase());
+    ratingEl.value = match || 'Info';
+  }
+  if (descEl) descEl.value = f.Vulnerability_Description || '';
+  if (recEl) recEl.value = f.Recommendation || '';
+  const modal = $('intakeEditModal');
+  if (modal) modal.style.display = 'flex';
+  if (titleEl) titleEl.focus();
+}
+
+function intakeCloseEdit() {
+  _intakeEditId = null;
+  const modal = $('intakeEditModal');
+  if (modal) modal.style.display = 'none';
+}
+
+function intakeSaveEdit() {
+  if (_intakeEditId == null) return;
+  const f = _intakeFindings.find(x => x._id === _intakeEditId);
+  if (!f) { intakeCloseEdit(); return; }
+  const title = ($('intakeEditTitle')?.value || '').trim();
+  if (!title) {
+    showToast('Title is required', 'warn');
+    $('intakeEditTitle')?.focus();
+    return;
+  }
+  f.Vulnerability_Title = title;
+  f.Vulnerability_Description = ($('intakeEditDescription')?.value || '').trim();
+  f.Recommendation = ($('intakeEditRecommendation')?.value || '').trim();
+  const rating = ($('intakeEditRating')?.value || '').trim();
+  if (rating) f.Vulnerability_Rating = rating;
+  f._edited = true;
+  intakeCloseEdit();
+  _intakeRenderTable();
+  showToast('Finding updated — changes apply to export & Jira create', 'success');
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if ($('intakeEditModal')?.style.display === 'flex') intakeCloseEdit();
+});
+
+const _INTAKE_CIA_PARTS = [
+  ['C', 'Confidentiality'],
+  ['I', 'Integrity'],
+  ['A', 'Availability'],
+];
+
+function _intakeCiaSet(f) {
+  return new Set(
+    String(f.CIA_Damage || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+  );
+}
+
+function _intakeCiaChips(f) {
+  const active = _intakeCiaSet(f);
+  const chips = _INTAKE_CIA_PARTS.map(([letter, full]) => {
+    const on = active.has(full.toLowerCase());
+    return `<button type="button" class="intake-cia-chip${on ? ' on' : ''}"
+      title="${full}: ${on ? 'affected' : 'not affected'} — click to toggle"
+      onclick="intakeToggleCia(${f._id},'${full}',this)">${letter}</button>`;
+  }).join('');
+  const label = _INTAKE_CIA_PARTS
+    .filter(([, full]) => active.has(full.toLowerCase()))
+    .map(([, full]) => full)
+    .join(', ');
+  return `<div class="intake-cia-chips" title="${_esc(label || 'No CIA impact recorded')}">${chips}</div>`;
+}
+
+function intakeToggleCia(id, part, btn) {
+  const f = _intakeFindings.find(x => x._id === id);
+  if (!f) return;
+  const active = _intakeCiaSet(f);
+  const key = part.toLowerCase();
+  if (active.has(key)) active.delete(key); else active.add(key);
+  f.CIA_Damage = _INTAKE_CIA_PARTS
+    .filter(([, full]) => active.has(full.toLowerCase()))
+    .map(([, full]) => full)
+    .join(',');
+  if (btn) {
+    btn.classList.toggle('on');
+    const cell = btn.closest('.intake-cia-chips');
+    if (cell) cell.title = f.CIA_Damage.split(',').join(', ') || 'No CIA impact recorded';
+  }
+}
+
+function _intakeRiskStyle(val) {
+  const n = parseFloat(val);
+  if (isNaN(n)) return '';
+  let colour = 'var(--cyan)';
+  if (n >= 8) colour = 'var(--red)';
+  else if (n >= 6) colour = '#e65c00';
+  else if (n >= 4) colour = 'var(--yellow)';
+  return `color:${colour}`;
+}
+
+function _intakeRiskEdit(id, input) {
+  _intakeFieldEdit(id, 'Risk_Value', input.value);
+  input.setAttribute('style', _intakeRiskStyle(input.value));
+}
+
 function intakeToggleStatus(id) {
   const f = _intakeFindings.find(x => x._id === id);
   if (!f) return;
   if (f._status === 'duplicate') {
     f._status = 'new';
     f._duplicate_of = null;
+    f._duplicate_status = '';
+  } else if (f._status === 'recurrence') {
+    f._status = 'duplicate';
+    f._duplicate_of = f._recurrence_of;
+    f._duplicate_status = f._previous_jira_status || 'Fixed';
+    f._recurrence_of = null;
+    f._previous_jira_status = '';
   } else if (f._status === 'new') {
     f._status = 'duplicate';
   } else {
-    // pending — flip to new
     f._status = 'new';
   }
-  // Re-render only the badge for this row (fast)
-  const row = document.querySelector(`[data-fid="${id}"]`);
-  if (row) {
-    const isDup  = f._status === 'duplicate';
-    const isPend = f._status === 'pending';
-    const badgeCol = isDup  ? '#666'               :
-                     isPend ? 'var(--text-dim)'     : 'var(--green)';
-    const badgeBg  = isDup  ? 'rgba(100,100,100,.15)' :
-                     isPend ? 'rgba(150,150,150,.1)'  : 'rgba(0,200,100,.12)';
-    const badgeTxt = isDup  ? 'DUPLICATE' : isPend ? 'PENDING' : 'NEW';
-    const badge = row.querySelector('span');
-    if (badge) {
-      badge.style.color      = badgeCol;
-      badge.style.background = badgeBg;
-      badge.style.borderColor = badgeCol;
-      badge.textContent      = badgeTxt;
-    }
-    row.style.opacity = isDup ? '0.4' : '';
-  }
-  _intakeUpdateSummaryBar();
-  const newCount = _intakeFindings.filter(x => x._status !== 'duplicate').length;
-  $('intakeExportBtn').disabled = newCount === 0;
-}
-
-function _intakeUpdateSummaryBar() {
-  const bar = $('intakeSummaryBar');
-  if (!bar || !_intakeFindings.length) { if (bar) bar.textContent = ''; return; }
-  const newCt  = _intakeFindings.filter(f => f._status !== 'duplicate').length;
-  const dupCt  = _intakeFindings.filter(f => f._status === 'duplicate').length;
-  const pendCt = _intakeFindings.filter(f => f._status === 'pending').length;
-  bar.textContent = `Total: ${_intakeFindings.length} | ✅ New: ${newCt} | ⚫ Duplicate: ${dupCt}`
-    + (pendCt ? ` | ⏳ Unchecked: ${pendCt}` : '');
+  _intakeRenderTable();
 }
 
 // ── Pagination ────────────────────────────────────────────────────────────

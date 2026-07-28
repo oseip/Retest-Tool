@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from .config import JiraSecondaryConfig
-from .jira_client import _extract_tester
+from .jira_client import _extract_tester, JiraCreateError, _parse_jira_create_error
 
 log = logging.getLogger(__name__)
 
@@ -129,7 +129,13 @@ class JiraClientV2:
         url = f"{self.cfg.url}/rest/api/2/search"
         log.info("JQL → %s", jql)
         fields_str = getattr(self, "_fetch_fields", "*all")
-        fields_list = fields_str.split(",") if fields_str else []
+        if not fields_str or fields_str == "*all":
+            fields_list = ["summary", "status", "priority", "assignee", "reporter",
+                           "updated", "labels", "description"]
+        else:
+            fields_list = [f.strip() for f in fields_str.split(",") if f.strip()]
+            if "status" not in fields_list:
+                fields_list.insert(1, "status")
         all_issues: List[Dict] = []
         start_at = 0
         
@@ -316,6 +322,26 @@ class JiraClientV2:
             self.add_comment(key, comment)
 
         return completed
+
+    def create_issue(self, fields: Dict[str, Any]) -> str:
+        """Create a Jira issue and return its key."""
+        if not self._fields_loaded:
+            self._load_fields()
+        url = f"{self.cfg.url}/rest/api/2/issue"
+        resp = self._session.post(url, json={"fields": fields}, timeout=60)
+        if not resp.ok:
+            detail = _parse_jira_create_error(resp)
+            log.error("Secondary Jira create issue failed (%s): %s", resp.status_code, detail)
+            err_fields: Dict[str, str] = {}
+            try:
+                err_fields = resp.json().get("errors") or {}
+            except Exception:
+                pass
+            raise JiraCreateError(detail, status_code=resp.status_code, errors=err_fields)
+        key = resp.json().get("key")
+        if not key:
+            raise JiraCreateError("Jira create issue returned no key")
+        return key
 
     def add_comment(self, key: str, body: str):
         """Add a plain-text comment (v2 uses plain text, not ADF)."""

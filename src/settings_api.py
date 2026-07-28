@@ -265,8 +265,15 @@ def update_settings(req: SettingsUpdate):
     if "app" in existing:
         config["app"] = existing["app"]
 
-    with open(CONFIG_PATH, "w") as f:
+    # Write via a temp file and rename: config.yaml holds every Jira/SSH
+    # credential, and a truncate-then-write that dies midway leaves it corrupt
+    # and the app unable to start.
+    tmp_path = f"{CONFIG_PATH}.tmp"
+    with open(tmp_path, "w") as f:
         yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, CONFIG_PATH)
 
     log.info("Settings updated via UI — %d client(s) configured.", len(merged_clients))
 

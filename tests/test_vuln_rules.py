@@ -18,6 +18,7 @@ from src.vuln_rules import (
     _parse_ssl_wrong_hostname,
     _parse_ssl_weak_hash,
     _parse_ssh_proto_v1,
+    _parse_mdns,
 )
 
 
@@ -152,6 +153,44 @@ class TestSshProtoV1FalsePositive:
     def test_ssh_20_banner_is_fixed(self):
         verdict, _ = _parse_ssh_proto_v1("SSH-2.0-OpenSSH_8.9", "")
         assert verdict == "fixed"
+
+
+class TestMdnsRule:
+    def test_matches_nessus_title(self):
+        rule = match_rule("mDNS Detection (Remote Network)")
+        assert rule is not None
+        assert rule.name == "mDNS Detection (Remote Network)"
+        assert rule.nmap_script == "dns-service-discovery"
+        assert rule.default_port == 5353
+        assert rule.requires_root is True
+
+    def test_closed_port_is_fixed(self):
+        verdict, _ = _parse_mdns("5353/udp closed", "")
+        assert verdict == "fixed"
+
+    def test_discovery_records_not_fixed(self):
+        text = (
+            "5353/udp open zeroconf\n"
+            "| dns-service-discovery:\n"
+            "|   _http._tcp.local"
+        )
+        verdict, _ = _parse_mdns(text, "")
+        assert verdict == "not_fixed"
+
+    def test_open_port_without_records_is_not_fixed(self):
+        verdict, _ = _parse_mdns("5353/udp open zeroconf", "")
+        assert verdict == "not_fixed"
+
+    def test_scan_command_includes_udp_timeouts(self):
+        from src.scanner import _build_scan_command
+        rule = match_rule("mDNS Detection (Remote Network)")
+        cmd = _build_scan_command(rule, "10.222.130.80", 5353)
+        assert cmd.startswith("nmap ")
+        assert "-sU" in cmd
+        assert "--host-timeout 30s" in cmd
+        assert "--script-timeout 20s" in cmd
+        assert "dns-service-discovery" in cmd
+        assert "sudo" not in cmd
 
 
 # ---------------------------------------------------------------------------
