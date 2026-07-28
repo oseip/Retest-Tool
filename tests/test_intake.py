@@ -18,7 +18,19 @@ from src.intake import (
     _is_fixed_jira_status,
     _intake_exportable,
     _intake_pick_for_create,
+    _should_fetch_plugin_details,
 )
+
+
+class TestPluginFetchPolicy:
+    def test_skips_large_host_scans(self):
+        assert _should_fetch_plugin_details(1000, 400, 400) is False
+
+    def test_skips_large_row_counts(self):
+        assert _should_fetch_plugin_details(5000, 50, 50) is False
+
+    def test_fetches_for_small_scans(self):
+        assert _should_fetch_plugin_details(500, 20, 20) is True
 
 
 class TestNormalizeTitle:

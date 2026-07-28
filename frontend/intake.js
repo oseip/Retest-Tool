@@ -429,7 +429,9 @@ async function intakePull() {
       : 'Pulling scans from Nessus (forced)… export can take 1–4 min per scan.')
     : (maxHosts >= 500
       ? 'Pulling large scan(s)… cached scans load instantly; fresh exports can take 10–20 min.'
-      : 'Pulling scans… cached scans load instantly; new ones take 1–4 min while Nessus generates the export.');
+      : (maxHosts >= 100
+        ? 'Pulling scan(s)… first export can take several minutes; repeats use cache and skip slow plugin lookups.'
+        : 'Pulling scans… cached scans load instantly; new ones take 1–4 min while Nessus generates the export.'));
   _intakeSetStatus(baseStatus);
 
   const pullStarted = Date.now();

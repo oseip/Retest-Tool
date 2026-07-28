@@ -34,10 +34,15 @@ _INDEX_LOCK = threading.Lock()
 _CACHE_DIR        = os.path.join("data", "intake_cache")
 _JIRA_CACHE_DIR   = os.path.join(_CACHE_DIR, "jira")
 _NESSUS_CACHE_DIR = os.path.join(_CACHE_DIR, "nessus")
+_PLUGIN_CACHE_DIR   = os.path.join(_CACHE_DIR, "plugins")
 _INTAKE_DATA_DIR  = os.path.join("data", "intake")
 _IRRELEVANT_PATH  = os.path.join(_INTAKE_DATA_DIR, "irrelevant_vulnerabilities.txt")
 _RECOMMENDATIONS_PATH = os.path.join(_INTAKE_DATA_DIR, "recommendations.csv")
 _SEED_IRRELEVANT  = os.path.join("automation-tool-bright-features", "irrelevant_vulnerabilities.txt")
+_SEED_IRRELEVANT_ALT = (
+    os.path.join("config", "intake", "irrelevant_vulnerabilities.txt"),
+    os.path.join("config", "intake_irrelevant_vulnerabilities.txt"),
+)
 _SEED_RECOMMENDATIONS = os.path.join(
     "automation-tool-bright-features", "Data", "vulnerabilityData.csv",
 )
@@ -60,7 +65,7 @@ def _safe_name(label: str) -> str:
 
 
 def _ensure_cache_dirs() -> None:
-    for d in (_JIRA_CACHE_DIR, _NESSUS_CACHE_DIR, _INTAKE_DATA_DIR):
+    for d in (_JIRA_CACHE_DIR, _NESSUS_CACHE_DIR, _PLUGIN_CACHE_DIR, _INTAKE_DATA_DIR):
         try:
             os.makedirs(d, exist_ok=True)
         except OSError as exc:
@@ -105,7 +110,7 @@ def _load_irrelevant() -> set:
     global _IRRELEVANT_SET, _IRRELEVANT_LOADED
     if _IRRELEVANT_LOADED:
         return _IRRELEVANT_SET
-    _seed_file(_IRRELEVANT_PATH, _SEED_IRRELEVANT, default_text=_DEFAULT_IRRELEVANT)
+    _seed_file(_IRRELEVANT_PATH, *_SEED_IRRELEVANT_ALT, _SEED_IRRELEVANT, default_text=_DEFAULT_IRRELEVANT)
     out: set = set()
     try:
         with open(_IRRELEVANT_PATH, encoding="utf-8") as f:
@@ -465,10 +470,96 @@ def _col(row: dict, *names: str) -> str:
 
 _PLUGIN_CACHE = {}
 
+# Large scans: Nessus CSV already has ratings/CVSS scores — per-plugin API calls
+# over SSH dominate pull time (minutes for 400+ hosts).
+_SKIP_PLUGIN_FETCH_MIN_HOSTS = 100
+_SKIP_PLUGIN_FETCH_MIN_ROWS = 3000
+_PLUGIN_FETCH_WORKERS = 4
 
-def _parse_nessus_csv(csv_text: str, vector: str = "", actor: str = "", conn=None, ak=None, sk=None) -> List[dict]:
+
+def _count_csv_hosts(rows: List[dict]) -> int:
+    return len({_col(row, "Host") for row in rows if _col(row, "Host")})
+
+
+def _should_fetch_plugin_details(
+    row_count: int, host_count: Optional[int], csv_hosts: int,
+) -> bool:
+    hosts = max(host_count or 0, csv_hosts)
+    if hosts >= _SKIP_PLUGIN_FETCH_MIN_HOSTS:
+        return False
+    if row_count >= _SKIP_PLUGIN_FETCH_MIN_ROWS:
+        return False
+    return True
+
+
+def _load_plugin_disk_cache(plugin_id: int) -> Optional[dict]:
+    path = os.path.join(_PLUGIN_CACHE_DIR, f"{plugin_id}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _save_plugin_disk_cache(plugin_id: int, data: dict) -> None:
+    _ensure_cache_dirs()
+    try:
+        _atomic_write_json(os.path.join(_PLUGIN_CACHE_DIR, f"{plugin_id}.json"), data)
+    except OSError as exc:
+        log.warning("Intake: could not cache plugin %s — %s", plugin_id, exc)
+
+
+def _prefetch_plugin_details(
+    cfg, label: str, ak: str, sk: str, plugin_ids: List[int],
+) -> None:
+    """Fetch Nessus plugin metadata in parallel (disk + memory cached)."""
+    from . import connections as conn_mod, nessus_client as nc
+
+    pending: List[int] = []
+    for pid in plugin_ids:
+        if pid in _PLUGIN_CACHE:
+            continue
+        cached = _load_plugin_disk_cache(pid)
+        if cached is not None:
+            _PLUGIN_CACHE[pid] = cached
+        else:
+            pending.append(pid)
+
+    if not pending:
+        return
+
+    log.info(
+        "Intake parse: fetching %d plugin detail(s) in parallel (%d cached)",
+        len(pending), len(plugin_ids) - len(pending),
+    )
+
+    def _fetch_one(conn, pid: int) -> dict:
+        try:
+            data = nc.get_plugin_details(conn, ak, sk, pid)
+        except Exception:
+            data = {"attributes": []}
+        _PLUGIN_CACHE[pid] = data
+        _save_plugin_disk_cache(pid, data)
+        return data
+
+    workers = min(_PLUGIN_FETCH_WORKERS, len(pending))
+    conn_mod.parallel_nessus_map(cfg, label, pending, _fetch_one, max_workers=workers)
+
+
+def _parse_nessus_csv(
+    csv_text: str,
+    vector: str = "",
+    actor: str = "",
+    conn=None,
+    ak=None,
+    sk=None,
+    cfg=None,
+    label: str = "",
+    host_count: Optional[int] = None,
+) -> List[dict]:
     """Parse one Nessus CSV export into normalised finding dicts."""
-    from . import nessus_client as nc
     # Normalise every header to lowercase once so _col() can do O(1) lookups
     # instead of re-lowercasing the whole row on each field access.
     rows = [
@@ -499,9 +590,19 @@ def _parse_nessus_csv(csv_text: str, vector: str = "", actor: str = "", conn=Non
             elif p_out and host not in ip_to_os:
                 ip_to_os[host] = p_out.split("\n")[0].strip()[:50]
 
-    # --- Pass 1.5: Prefetch Plugins (sequential — parallel SSH corrupts channels) ---
-    # Only fetch when the CSV row lacks a CVSS vector; most Nessus exports include it.
-    if conn and ak and sk:
+    # --- Pass 1.5: Plugin metadata (optional — skipped on large scans) ---
+    csv_hosts = len(ip_to_os) or _count_csv_hosts(rows)
+    fetch_plugins = (
+        conn and ak and sk and cfg and label
+        and _should_fetch_plugin_details(len(rows), host_count, csv_hosts)
+    )
+    if not fetch_plugins and conn and ak and sk:
+        log.info(
+            "Intake parse: %d rows, ~%d hosts — using CSV data only (skipping plugin API)",
+            len(rows), max(host_count or 0, csv_hosts),
+        )
+
+    if fetch_plugins:
         needed_plugins: List[int] = []
         seen: set = set()
         for row in rows:
@@ -522,14 +623,7 @@ def _parse_nessus_csv(csv_text: str, vector: str = "", actor: str = "", conn=Non
             needed_plugins.append(p)
 
         if needed_plugins:
-            log.info("Intake parse: fetching %d plugin detail(s) over SSH (sequential)", len(needed_plugins))
-            for i, p in enumerate(needed_plugins, 1):
-                try:
-                    _PLUGIN_CACHE[p] = nc.get_plugin_details(conn, ak, sk, p)
-                except Exception:
-                    _PLUGIN_CACHE[p] = {"attributes": []}
-                if i % 25 == 0 or i == len(needed_plugins):
-                    log.info("Intake parse: plugin details %d/%d", i, len(needed_plugins))
+            _prefetch_plugin_details(cfg, label, ak, sk, needed_plugins)
 
     # --- Helpers for CIA & Risk ---
     def get_plugin_attributes(plugin_id: str):
@@ -1198,6 +1292,47 @@ def _nessus_cache_path(label: str, scan_id: int, vector: str, actor: str) -> str
     return os.path.join(_NESSUS_CACHE_DIR, f"{key}.json")
 
 
+def _nessus_raw_csv_path(label: str, scan_id: int) -> str:
+    return os.path.join(_NESSUS_CACHE_DIR, f"{_safe_name(label)}_{scan_id}_raw.csv")
+
+
+def _load_nessus_raw_csv(label: str, scan_id: int) -> Optional[dict]:
+    """Return cached Nessus CSV export metadata, or None."""
+    path = _nessus_raw_csv_path(label, scan_id)
+    meta_path = path + ".meta.json"
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            csv_text = f.read()
+        scan_name = f"Scan {scan_id}"
+        if os.path.exists(meta_path):
+            with open(meta_path, encoding="utf-8") as f:
+                scan_name = json.load(f).get("scan_name") or scan_name
+        return {"csv": csv_text, "scan_name": scan_name}
+    except OSError as exc:
+        log.warning("Intake: ignoring corrupt raw CSV cache for scan %s — %s", scan_id, exc)
+        return None
+
+
+def _save_nessus_raw_csv(label: str, scan_id: int, scan_name: str, csv_text: str) -> None:
+    _ensure_cache_dirs()
+    path = _nessus_raw_csv_path(label, scan_id)
+    try:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(csv_text)
+        os.replace(tmp, path)
+        _atomic_write_json(path + ".meta.json", {
+            "scan_id": scan_id,
+            "scan_name": scan_name,
+            "fetched_at": time.time(),
+            "bytes": len(csv_text.encode("utf-8")),
+        })
+    except OSError as exc:
+        log.warning("Intake: could not write raw CSV cache for scan %s — %s", scan_id, exc)
+
+
 def _load_nessus_cache(label: str, scan_id: int, vector: str, actor: str) -> Optional[dict]:
     path = _nessus_cache_path(label, scan_id, vector, actor)
     if not os.path.exists(path):
@@ -1438,10 +1573,34 @@ def intake_pull(label: str, req: PullRequest):
         log.info("Intake pull: exporting scan %d from Nessus%s…",
                  scan_id, " (forced)" if req.force else "")
         host_count = (req.scan_host_counts or {}).get(scan_id) or None
-        csv_text, sname = nc.export_scan_csv(conn, ak, sk, scan_id, host_count=host_count)
+        csv_text: Optional[str] = None
+        sname = f"Scan {scan_id}"
+
+        if not req.force:
+            raw = _load_nessus_raw_csv(label, scan_id)
+            if raw:
+                csv_text = raw["csv"]
+                sname = raw.get("scan_name") or sname
+                log.info(
+                    "Intake pull: scan %d ('%s') — reusing cached CSV export (%d bytes)",
+                    scan_id, sname, len(csv_text),
+                )
+
+        if csv_text is None:
+            csv_text, sname = nc.export_scan_csv(conn, ak, sk, scan_id, host_count=host_count)
+            _save_nessus_raw_csv(label, scan_id, sname, csv_text)
+
         log.info("Intake pull: parsing scan %d ('%s')…", scan_id, sname)
         rows = _parse_nessus_csv(
-            csv_text, vector=req.vector, actor=req.actor, conn=conn, ak=ak, sk=sk,
+            csv_text,
+            vector=req.vector,
+            actor=req.actor,
+            conn=conn,
+            ak=ak,
+            sk=sk,
+            cfg=m.cfg,
+            label=label,
+            host_count=host_count,
         )
         log.info("Intake pull: scan %d ('%s') → %d vuln rows", scan_id, sname, len(rows))
         _save_nessus_cache(label, scan_id, req.vector, req.actor, sname, rows)
