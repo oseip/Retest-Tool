@@ -470,26 +470,28 @@ def _col(row: dict, *names: str) -> str:
 
 _PLUGIN_CACHE = {}
 
-# Large scans: Nessus CSV already has ratings/CVSS scores — per-plugin API calls
-# over SSH dominate pull time (minutes for 400+ hosts).
-_SKIP_PLUGIN_FETCH_MIN_HOSTS = 100
-_SKIP_PLUGIN_FETCH_MIN_ROWS = 3000
+# Nessus CSV exports include CVSS scores but not CVSS vectors — CIA impact and
+# risk values need plugin metadata. Use parallel fetch + disk cache; scale
+# workers on large scans (many unique plugins).
 _PLUGIN_FETCH_WORKERS = 4
+_PLUGIN_FETCH_WORKERS_LARGE = 8
+_LARGE_SCAN_MIN_ROWS = 3000
+_LARGE_SCAN_MIN_HOSTS = 100
 
 
 def _count_csv_hosts(rows: List[dict]) -> int:
     return len({_col(row, "Host") for row in rows if _col(row, "Host")})
 
 
-def _should_fetch_plugin_details(
-    row_count: int, host_count: Optional[int], csv_hosts: int,
-) -> bool:
+def _plugin_fetch_workers(
+    pending_count: int, row_count: int, host_count: Optional[int], csv_hosts: int,
+) -> int:
     hosts = max(host_count or 0, csv_hosts)
-    if hosts >= _SKIP_PLUGIN_FETCH_MIN_HOSTS:
-        return False
-    if row_count >= _SKIP_PLUGIN_FETCH_MIN_ROWS:
-        return False
-    return True
+    large = row_count >= _LARGE_SCAN_MIN_ROWS or hosts >= _LARGE_SCAN_MIN_HOSTS
+    cap = _PLUGIN_FETCH_WORKERS_LARGE if large else _PLUGIN_FETCH_WORKERS
+    if pending_count <= 0:
+        return cap
+    return min(cap, max(_PLUGIN_FETCH_WORKERS, (pending_count + 24) // 25))
 
 
 def _load_plugin_disk_cache(plugin_id: int) -> Optional[dict]:
@@ -513,6 +515,7 @@ def _save_plugin_disk_cache(plugin_id: int, data: dict) -> None:
 
 def _prefetch_plugin_details(
     cfg, label: str, ak: str, sk: str, plugin_ids: List[int],
+    *, row_count: int = 0, host_count: Optional[int] = None, csv_hosts: int = 0,
 ) -> None:
     """Fetch Nessus plugin metadata in parallel (disk + memory cached)."""
     from . import connections as conn_mod, nessus_client as nc
@@ -544,7 +547,7 @@ def _prefetch_plugin_details(
         _save_plugin_disk_cache(pid, data)
         return data
 
-    workers = min(_PLUGIN_FETCH_WORKERS, len(pending))
+    workers = _plugin_fetch_workers(len(pending), row_count, host_count, csv_hosts)
     conn_mod.parallel_nessus_map(cfg, label, pending, _fetch_one, max_workers=workers)
 
 
@@ -592,15 +595,8 @@ def _parse_nessus_csv(
 
     # --- Pass 1.5: Plugin metadata (optional — skipped on large scans) ---
     csv_hosts = len(ip_to_os) or _count_csv_hosts(rows)
-    fetch_plugins = (
-        conn and ak and sk and cfg and label
-        and _should_fetch_plugin_details(len(rows), host_count, csv_hosts)
-    )
-    if not fetch_plugins and conn and ak and sk:
-        log.info(
-            "Intake parse: %d rows, ~%d hosts — using CSV data only (skipping plugin API)",
-            len(rows), max(host_count or 0, csv_hosts),
-        )
+    fetch_plugins = bool(conn and ak and sk and cfg and label)
+    csv_hosts = _count_csv_hosts(rows)
 
     if fetch_plugins:
         needed_plugins: List[int] = []
@@ -623,7 +619,10 @@ def _parse_nessus_csv(
             needed_plugins.append(p)
 
         if needed_plugins:
-            _prefetch_plugin_details(cfg, label, ak, sk, needed_plugins)
+            _prefetch_plugin_details(
+                cfg, label, ak, sk, needed_plugins,
+                row_count=len(rows), host_count=host_count, csv_hosts=csv_hosts,
+            )
 
     # --- Helpers for CIA & Risk ---
     def get_plugin_attributes(plugin_id: str):

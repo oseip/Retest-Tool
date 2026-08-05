@@ -18,19 +18,47 @@ from src.intake import (
     _is_fixed_jira_status,
     _intake_exportable,
     _intake_pick_for_create,
-    _should_fetch_plugin_details,
+    _plugin_fetch_workers,
+    _parse_nessus_csv,
 )
 
 
-class TestPluginFetchPolicy:
-    def test_skips_large_host_scans(self):
-        assert _should_fetch_plugin_details(1000, 400, 400) is False
+class TestPluginFetchWorkers:
+    def test_scales_up_for_large_scans(self):
+        assert _plugin_fetch_workers(200, 5000, 400, 400) == 8
 
-    def test_skips_large_row_counts(self):
-        assert _should_fetch_plugin_details(5000, 50, 50) is False
+    def test_caps_at_large_worker_count(self):
+        assert _plugin_fetch_workers(1000, 5000, 400, 400) == 8
 
-    def test_fetches_for_small_scans(self):
-        assert _should_fetch_plugin_details(500, 20, 20) is True
+    def test_small_scan_uses_default_workers(self):
+        assert _plugin_fetch_workers(10, 500, 20, 20) == 4
+
+
+class TestLargeScanCiaRisk:
+    def test_uses_plugin_cache_even_for_large_host_count(self):
+        intake._PLUGIN_CACHE.clear()
+        intake._PLUGIN_CACHE[12345] = {
+            "attributes": [
+                {
+                    "attribute_name": "cvss3_vector",
+                    "attribute_value": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+                },
+            ],
+        }
+        csv_text = (
+            "Host,Risk,Name,Plugin ID,CVSS v3.0 Base Score\n"
+            "10.0.0.1,High,Test Vuln,12345,7.5\n"
+        )
+        findings = _parse_nessus_csv(
+            csv_text,
+            vector="Internal network",
+            actor="Unauthenticated user",
+            host_count=500,
+        )
+        assert len(findings) == 1
+        assert findings[0]["CIA_Damage"] == "Confidentiality,Integrity"
+        assert findings[0]["Risk_Value"] != ""
+        intake._PLUGIN_CACHE.clear()
 
 
 class TestNormalizeTitle:

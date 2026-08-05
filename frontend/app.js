@@ -2819,7 +2819,7 @@ function renderAssetsResults(data) {
       <div class="report-card" style="padding:14px">
         <div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Reachable (In Scope)</div>
         <div style="font-size:32px;font-weight:700;color:var(--green)">${c.reachable || 0}</div>
-        <div style="font-size:11px;color:var(--text-dim)">in-scope hosts found by Nessus</div>
+        <div style="font-size:11px;color:var(--text-dim)">in-scope hosts found by Nessus (individual IPs)</div>
       </div>
       <div class="report-card" style="padding:14px">
         <div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Not Reachable (In Scope)</div>

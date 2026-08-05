@@ -10,10 +10,6 @@ log = logging.getLogger(__name__)
 
 ASSETS_DIR = "data/assets"
 
-# Subnets larger than this are not enumerated for the "missed" list — the
-# number of individual IPs would be impractical to report.
-_ENUM_LIMIT = 65536
-
 
 def _path(label: str) -> str:
     return os.path.join(ASSETS_DIR, f"{label}.json")
@@ -104,8 +100,9 @@ def cross_reference(asset_entries: List[str], scan_hosts: List[Dict]) -> Dict:
     Cross-reference the client asset list (scope) against Nessus scan hosts.
 
     Buckets returned:
-      reachable     — Nessus host IPs that fall inside a scope entry
-      not_reachable — scope entries (IP/subnet) where Nessus found no host
+      reachable     — individual Nessus host IPs that fall inside a scope entry
+      not_reachable — scope entries (IP or subnet as saved in the asset list)
+                      where Nessus found no host
       out_of_scope  — Nessus host IPs that are not in any scope entry
       unresolved    — scanned host identifiers that are NOT valid IPs (e.g. a
                       DNS/NetBIOS name Nessus reported instead of an address).
@@ -113,7 +110,7 @@ def cross_reference(asset_entries: List[str], scan_hosts: List[Dict]) -> Dict:
                       surfaced explicitly rather than silently dropped.
 
     Count invariant: total_scanned == reachable + out_of_scope + unresolved.
-    Scope coverage:  total_scope   == reachable_scope + not_reachable.
+    Scope coverage:  total_scope == reachable_scope + not_reachable.
     """
     # De-duplicate scanned host identifiers, then split into real IPs vs.
     # anything that can't be parsed as an IP (so nothing disappears silently).
@@ -163,7 +160,6 @@ def cross_reference(asset_entries: List[str], scan_hosts: List[Dict]) -> Dict:
                 matched = True
         (reachable if matched else out_of_scope).append(ip)
 
-    # Scope entries with no host found, sorted numerically by network address.
     not_reachable_pairs = [
         (label, net) for idx, (label, net) in enumerate(scope) if not entry_hit[idx]
     ]
